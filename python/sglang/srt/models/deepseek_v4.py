@@ -1987,10 +1987,7 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 
 def build_mega_moe_experts_weights(experts) -> None:
-    from deep_gemm import (
-        transform_sf_into_required_layout,
-        transform_weights_for_mega_moe,
-    )
+    from deep_gemm import transform_sf_into_required_layout, transform_weights_for_mega_moe
     from deep_gemm.mega import _interleave_l1_weights, _transpose_sf_for_utccp
 
     if getattr(experts, "_mega_moe_weights_built", False):
@@ -2002,28 +1999,57 @@ def build_mega_moe_experts_weights(experts) -> None:
     w2_sf_fp32 = experts.w2_weight_scale_inv.data
 
     num_groups, n1, half_k1 = w13.shape
-    k1 = half_k1 * 2
     _, n2, half_k2 = w2.shape
-    k2 = half_k2 * 2
+
+    use_sm90_fp8_mega = (
+        deepseek_v2._device_sm == 90
+        and w13.dtype == torch.float8_e4m3fn
+        and w2.dtype == torch.float8_e4m3fn
+    )
+    # FP4 weights (packed as int8) have last dim = K//2; FP8 weights have last dim = K.
+    if use_sm90_fp8_mega:
+        k1 = half_k1  # FP8: 1 byte per element, last dim == K
+        k2 = half_k2
+    else:
+        k1 = half_k1 * 2  # FP4 packed into int8: 2 values per byte, last dim == K//2
+        k2 = half_k2 * 2
+
+    recipe = (1, 128) if use_sm90_fp8_mega else (1, 32)
+    disable_ue8m0_cast = use_sm90_fp8_mega
+
+    scale_group_k = recipe[1]
+    assert k1 % scale_group_k == 0 and k2 % scale_group_k == 0, (
+        f"invalid mega-moe K/group_size: k1={k1}, k2={k2}, group_k={scale_group_k}"
+    )
+    expected_k_groups_1 = k1 // scale_group_k
+    expected_k_groups_2 = k2 // scale_group_k
+    assert w13_sf_fp32.shape[2] == expected_k_groups_1, (
+        f"w13 scale K groups mismatch: got {w13_sf_fp32.shape[2]}, "
+        f"expected {expected_k_groups_1} (k1={k1}, group_k={scale_group_k})"
+    )
+    assert w2_sf_fp32.shape[2] == expected_k_groups_2, (
+        f"w2 scale K groups mismatch: got {w2_sf_fp32.shape[2]}, "
+        f"expected {expected_k_groups_2} (k2={k2}, group_k={scale_group_k})"
+    )
 
     w13_sf = transform_sf_into_required_layout(
         w13_sf_fp32,
         mn=n1,
         k=k1,
-        recipe=(1, 32),
+        recipe=recipe,
         num_groups=num_groups,
-        disable_ue8m0_cast=False,
+        disable_ue8m0_cast=disable_ue8m0_cast,
     )
     w2_sf = transform_sf_into_required_layout(
         w2_sf_fp32,
         mn=n2,
         k=k2,
-        recipe=(1, 32),
+        recipe=recipe,
         num_groups=num_groups,
-        disable_ue8m0_cast=False,
+        disable_ue8m0_cast=disable_ue8m0_cast,
     )
 
-    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get() and not use_sm90_fp8_mega:
         # Build the interleaved L1 weight + scale once; share the weight buffer
         # between `w13_weight.data` (normal deep-ep path) and `mega_l1_weights[0]`
         # (mega moe path). Mega moe additionally needs a UTCCP-transposed scale;
@@ -2043,11 +2069,18 @@ def build_mega_moe_experts_weights(experts) -> None:
         experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
         experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
     else:
-        l1_pair, l2_pair = transform_weights_for_mega_moe((w13, w13_sf), (w2, w2_sf))
+        transform_fn = transform_weights_for_mega_moe
+        if use_sm90_fp8_mega:
+            from deep_gemm import transform_weights_for_mega_moe_sm90
+
+            transform_fn = transform_weights_for_mega_moe_sm90
+
+        l1_pair, l2_pair = transform_fn((w13, w13_sf), (w2, w2_sf))
 
         experts.mega_l1_weights = l1_pair
         experts.mega_l2_weights = l2_pair
 
+    experts._mega_moe_sm90_fp8_weights = use_sm90_fp8_mega
     experts._mega_moe_weights_built = True
 
 

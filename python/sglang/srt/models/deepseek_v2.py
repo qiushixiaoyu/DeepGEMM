@@ -1095,6 +1095,25 @@ class DeepseekV2MoE(nn.Module):
         if not getattr(self.experts, "_mega_moe_weights_built", False):
             return False
 
+        # MegaMoE only supports Hopper/Blackwell and requires matching DeepGEMM APIs.
+        if _device_sm < 90:
+            return False
+        try:
+            import deep_gemm
+        except ImportError:
+            return False
+        if _device_sm == 90:
+            # SM90 path currently requires FP8 MegaMoE weights + kernel.
+            if not hasattr(deep_gemm, "fp8_mega_moe"):
+                return False
+            if not getattr(self.experts, "_mega_moe_sm90_fp8_weights", False):
+                return False
+        elif _device_sm >= 100:
+            if not hasattr(deep_gemm, "fp8_fp4_mega_moe"):
+                return False
+        else:
+            return False
+
         if not envs.SGLANG_OPT_FIX_NEXTN_MEGA_MOE.get():
             if self.is_nextn:
                 return False
@@ -1167,6 +1186,7 @@ class DeepseekV2MoE(nn.Module):
 
         from sglang.srt.distributed.parallel_state import get_moe_ep_group
         from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
             sglang_per_token_group_quant_fp8_ue8m0,
         )
 
@@ -1218,7 +1238,14 @@ class DeepseekV2MoE(nn.Module):
         )
 
         padded_max = buf.topk_idx.shape[0]
-        if envs.SGLANG_OPT_MEGA_MOE_FUSED_PRE_DISPATCH.get():
+        use_sm90_fp8_mega = _device_sm == 90 and getattr(
+            self.experts, "_mega_moe_sm90_fp8_weights", False
+        )
+        use_fused_pre_dispatch = (
+            envs.SGLANG_OPT_MEGA_MOE_FUSED_PRE_DISPATCH.get() and not use_sm90_fp8_mega
+        )
+
+        if use_fused_pre_dispatch:
             from sglang.jit_kernel.deepseek_v4 import mega_moe_pre_dispatch
 
             if num_tokens > 0:
@@ -1241,9 +1268,16 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             if num_tokens > 0:
-                x_fp8, x_sf = sglang_per_token_group_quant_fp8_ue8m0(
-                    hidden_states, group_size=32
-                )
+                if use_sm90_fp8_mega:
+                    x_fp8, x_sf = sglang_per_token_group_quant_fp8(
+                        hidden_states,
+                        group_size=128,
+                        scale_ue8m0=False,
+                    )
+                else:
+                    x_fp8, x_sf = sglang_per_token_group_quant_fp8_ue8m0(
+                        hidden_states, group_size=32
+                    )
                 buf.x[:num_tokens].copy_(x_fp8)
                 buf.x_sf[:num_tokens].copy_(x_sf)
                 buf.topk_idx[:num_tokens].copy_(topk_ids)
@@ -1258,16 +1292,28 @@ class DeepseekV2MoE(nn.Module):
             device=hidden_states.device,
         )
         swiglu_limit = getattr(self.config, "swiglu_limit", None)
-        deep_gemm.fp8_fp4_mega_moe(
-            y,
-            self.experts.mega_l1_weights,
-            self.experts.mega_l2_weights,
-            buf,
-            recipe=(1, 1, 32),
-            activation="swiglu",
-            activation_clamp=swiglu_limit,
-            fast_math=True,
-        )
+        if use_sm90_fp8_mega:
+            deep_gemm.fp8_mega_moe(
+                y,
+                self.experts.mega_l1_weights,
+                self.experts.mega_l2_weights,
+                buf,
+                recipe=(1, 128, 128),
+                activation="swiglu",
+                activation_clamp=swiglu_limit,
+                fast_math=True,
+            )
+        else:
+            deep_gemm.fp8_fp4_mega_moe(
+                y,
+                self.experts.mega_l1_weights,
+                self.experts.mega_l2_weights,
+                buf,
+                recipe=(1, 1, 32),
+                activation="swiglu",
+                activation_clamp=swiglu_limit,
+                fast_math=True,
+            )
 
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             y.mul_(self.routed_scaling_factor)

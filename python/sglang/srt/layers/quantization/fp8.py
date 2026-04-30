@@ -941,12 +941,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         "Use `--moe-runner-backend marlin` on Hopper or "
                         "`--moe-runner-backend flashinfer_mxfp4` when available."
                     )
-
                 else:
                     layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
                     layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
 
-                    if envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get():
+                    # FP4 expert mega MoE requires SM100+ (weights are already
+                    # viewed as int8, so SM90 dtype detection would be wrong).
+                    # All-FP8 mega MoE on SM90 is handled below in the
+                    # non-fp4-expert branch.
+                    if (
+                        envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
+                        and is_sm100_supported()
+                    ):
                         from sglang.srt.models.deepseek_v4 import (
                             build_mega_moe_experts_weights,
                         )
@@ -978,6 +984,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                             )
                         layer.w13_weight_scale_inv.format_ue8m0 = True
                         layer.w2_weight_scale_inv.format_ue8m0 = True
+
+            if (
+                not self.is_fp4_expert
+                and envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
+                and is_sm90_supported()
+                and not is_sm100_supported()
+            ):
+                from sglang.srt.models.deepseek_v4 import (
+                    build_mega_moe_experts_weights,
+                )
+
+                build_mega_moe_experts_weights(layer)
+                return
 
             if (
                 not self.is_fp4_expert
