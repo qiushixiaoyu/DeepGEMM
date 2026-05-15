@@ -792,6 +792,10 @@ sm90_fp8_mega_moe_impl(void* y,
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
             const uint32_t m_idx = pool_block_idx * BLOCK_M;
             const uint32_t n_idx = n_block_idx * BLOCK_N;
+            const uint32_t row_offset_r0 = epilogue_wg_idx * WG_BLOCK_M + r_0;
+            const uint32_t row_offset_r1 = epilogue_wg_idx * WG_BLOCK_M + r_1;
+            const bool valid_r0 = row_offset_r0 < valid_m;
+            const bool valid_r1 = row_offset_r1 < valid_m;
 
             // ---------------- GEMM ----------------
             using WGMMA = L1WGMMA;
@@ -827,6 +831,14 @@ sm90_fp8_mega_moe_impl(void* y,
                 //
                 // L2 weight SF shape: (E, H/128, IH/128) MN-major. One scalar per
                 // (BLOCK_N, BLOCK_K) tile, broadcast across all WGMMA accumulators.
+                //
+                // NOTE: we tried hoisting these LDGs above the barrier wait and/or
+                // having only lane 0 load + shfl-broadcast. Both regressed on H20
+                // by 7-11% across all batch sizes, presumably because (a) Hopper's
+                // L1 read-only cache already coalesces same-address LDGs from all
+                // 128 WG threads and (b) hoisting contended with the dispatch
+                // warps' NVLink LDGs on the MIO unit. Keep the simple parallel
+                // post-wait load.
                 constexpr uint32_t kL1SFKBlocks   = kHidden / 128;
                 constexpr uint32_t kL2SFKBlocks   = kIntermediateHidden / 128;
                 constexpr uint32_t kL1SFGateBlks  = kIntermediateHidden / 128;
@@ -1000,22 +1012,31 @@ sm90_fp8_mega_moe_impl(void* y,
                         return x * sig;
                     };
 
-                    swiglu_r0[p][0] = silu(g_r0_c0) * u_r0_c0;
-                    swiglu_r0[p][1] = silu(g_r0_c1) * u_r0_c1;
-                    swiglu_r1[p][0] = silu(g_r1_c0) * u_r1_c0;
-                    swiglu_r1[p][1] = silu(g_r1_c1) * u_r1_c1;
-
-                    amax_r0 = cute::max(amax_r0, cute::max(cute::abs(swiglu_r0[p][0]), cute::abs(swiglu_r0[p][1])));
-                    amax_r1 = cute::max(amax_r1, cute::max(cute::abs(swiglu_r1[p][0]), cute::abs(swiglu_r1[p][1])));
+                    if (valid_r0) {
+                        swiglu_r0[p][0] = silu(g_r0_c0) * u_r0_c0;
+                        swiglu_r0[p][1] = silu(g_r0_c1) * u_r0_c1;
+                        amax_r0 = cute::max(amax_r0, cute::max(cute::abs(swiglu_r0[p][0]), cute::abs(swiglu_r0[p][1])));
+                    } else {
+                        swiglu_r0[p][0] = 0.0f;
+                        swiglu_r0[p][1] = 0.0f;
+                    }
+                    if (valid_r1) {
+                        swiglu_r1[p][0] = silu(g_r1_c0) * u_r1_c0;
+                        swiglu_r1[p][1] = silu(g_r1_c1) * u_r1_c1;
+                        amax_r1 = cute::max(amax_r1, cute::max(cute::abs(swiglu_r1[p][0]), cute::abs(swiglu_r1[p][1])));
+                    } else {
+                        swiglu_r1[p][0] = 0.0f;
+                        swiglu_r1[p][1] = 0.0f;
+                    }
                 }
 
                 // Apply token weight: SwiGLU * topk_weight (single load per row)
-                float weight_r0 = *l1_topk_weights_buffer
-                    .get_data_buffer(m_idx + epilogue_wg_idx * WG_BLOCK_M + r_0)
-                    .get_base_ptr<float>();
-                float weight_r1 = *l1_topk_weights_buffer
-                    .get_data_buffer(m_idx + epilogue_wg_idx * WG_BLOCK_M + r_1)
-                    .get_base_ptr<float>();
+                float weight_r0 = valid_r0 ? *l1_topk_weights_buffer
+                    .get_data_buffer(m_idx + row_offset_r0)
+                    .get_base_ptr<float>() : 0.0f;
+                float weight_r1 = valid_r1 ? *l1_topk_weights_buffer
+                    .get_data_buffer(m_idx + row_offset_r1)
+                    .get_base_ptr<float>() : 0.0f;
                 #pragma unroll
                 for (uint32_t p = 0; p < kNumPairs; ++ p) {
                     swiglu_r0[p][0] *= weight_r0;
@@ -1069,8 +1090,10 @@ sm90_fp8_mega_moe_impl(void* y,
                         smem_cd_l1_wg + r_0 * L1_OUT_BLOCK_N + col);
                     auto* p1 = reinterpret_cast<uint16_t*>(
                         smem_cd_l1_wg + r_1 * L1_OUT_BLOCK_N + col);
-                    *p0 = r0_pair.__x;
-                    *p1 = r1_pair.__x;
+                    if (valid_r0)
+                        *p0 = r0_pair.__x;
+                    if (valid_r1)
+                        *p1 = r1_pair.__x;
                 }
 
                 // Write SF as float at `[token, n_block_idx]` in L2 acts SF buffer (per-64 layout).
@@ -1079,17 +1102,27 @@ sm90_fp8_mega_moe_impl(void* y,
                     auto sf_base_ptr = l2_sf_buffer.get_base_ptr<float>();
                     // SF buffer is (kNumPaddedSFPoolTokens × kIntermediateHidden/64), MN-major:
                     //   addr[k_idx * num_padded_sf_pool_tokens + token_idx]
-                    const uint32_t token_r0 = pool_block_idx * BLOCK_M + epilogue_wg_idx * WG_BLOCK_M + r_0;
-                    const uint32_t token_r1 = pool_block_idx * BLOCK_M + epilogue_wg_idx * WG_BLOCK_M + r_1;
+                    const uint32_t token_r0 = pool_block_idx * BLOCK_M + row_offset_r0;
+                    const uint32_t token_r1 = pool_block_idx * BLOCK_M + row_offset_r1;
                     const uint32_t k_sf_idx = n_block_idx;  // one per-64 SF per L1 block
-                    sf_base_ptr[k_sf_idx * kNumPaddedSFPoolTokens + token_r0] = sf_r0;
-                    sf_base_ptr[k_sf_idx * kNumPaddedSFPoolTokens + token_r1] = sf_r1;
+                    if (valid_r0)
+                        sf_base_ptr[k_sf_idx * kNumPaddedSFPoolTokens + token_r0] = sf_r0;
+                    if (valid_r1)
+                        sf_base_ptr[k_sf_idx * kNumPaddedSFPoolTokens + token_r1] = sf_r1;
                 }
 
                 // Sync the warpgroup before TMA store
                 ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
-                // Issue TMA store from SMEM to global L1 output buffer
+                // Issue TMA store of the entire tile. Padding rows beyond
+                // `valid_m` are written with stale/garbage FP8 to the L1-output
+                // pool buffer, but they are never consumed downstream: the L2
+                // GEMM tile loads them, but its NVLink-scatter epilogue is
+                // gated by `m_idx_in_block >= valid_m`, and stale SF in the
+                // padding rows can produce NaN accumulators that simply stay
+                // in registers (only valid rows are converted to BF16 and
+                // STSM'd into smem). Using TMA for partial tiles is a large
+                // win for low-batch / decode where every tile is partial.
                 if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
                     const uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N;
                     cute::tma_store_fence();
@@ -1101,9 +1134,9 @@ sm90_fp8_mega_moe_impl(void* y,
                     cute::tma_store_arrive();
                 }
                 __syncwarp();
+                ptx::tma_store_wait<0>();
 
                 // Notify L2 that this N block's L1 output (and SF) is ready
-                ptx::tma_store_wait<0>();
                 DG_DBG_MATH_STATE(6);
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 DG_DBG_MATH_STATE(7);
@@ -1126,16 +1159,6 @@ sm90_fp8_mega_moe_impl(void* y,
                     //   final_accum[i*8 + (4..7)] = chunk 2i+1: same shape
                     const uint32_t chunk_lo = 2 * i, chunk_hi = 2 * i + 1;
 
-                    // Pack each (row, col) pair into BF162
-                    const uint32_t r0_lo = math::cast_into_bf16_and_pack(
-                        final_accum[chunk_lo*4 + 0], final_accum[chunk_lo*4 + 1]);
-                    const uint32_t r1_lo = math::cast_into_bf16_and_pack(
-                        final_accum[chunk_lo*4 + 2], final_accum[chunk_lo*4 + 3]);
-                    const uint32_t r0_hi = math::cast_into_bf16_and_pack(
-                        final_accum[chunk_hi*4 + 0], final_accum[chunk_hi*4 + 1]);
-                    const uint32_t r1_hi = math::cast_into_bf16_and_pack(
-                        final_accum[chunk_hi*4 + 2], final_accum[chunk_hi*4 + 3]);
-
                     // Write to SMEM at appropriate position
                     // Row r_0 cols [chunk_lo*8 + col_idx*2, chunk_lo*8 + col_idx*2 + 1] = r0_lo
                     // Row r_0 cols [chunk_hi*8 + col_idx*2, chunk_hi*8 + col_idx*2 + 1] = r0_hi
@@ -1149,10 +1172,22 @@ sm90_fp8_mega_moe_impl(void* y,
                         // BF16 STS: 2 bf16 elements
                         *reinterpret_cast<uint32_t*>(smem_ptr) = packed;
                     };
-                    write_pair(r_0, chunk_lo * 8 + col_idx * 2, r0_lo);
-                    write_pair(r_0, chunk_hi * 8 + col_idx * 2, r0_hi);
-                    write_pair(r_1, chunk_lo * 8 + col_idx * 2, r1_lo);
-                    write_pair(r_1, chunk_hi * 8 + col_idx * 2, r1_hi);
+                    if (valid_r0) {
+                        const uint32_t r0_lo = math::cast_into_bf16_and_pack(
+                            final_accum[chunk_lo*4 + 0], final_accum[chunk_lo*4 + 1]);
+                        const uint32_t r0_hi = math::cast_into_bf16_and_pack(
+                            final_accum[chunk_hi*4 + 0], final_accum[chunk_hi*4 + 1]);
+                        write_pair(r_0, chunk_lo * 8 + col_idx * 2, r0_lo);
+                        write_pair(r_0, chunk_hi * 8 + col_idx * 2, r0_hi);
+                    }
+                    if (valid_r1) {
+                        const uint32_t r1_lo = math::cast_into_bf16_and_pack(
+                            final_accum[chunk_lo*4 + 2], final_accum[chunk_lo*4 + 3]);
+                        const uint32_t r1_hi = math::cast_into_bf16_and_pack(
+                            final_accum[chunk_hi*4 + 2], final_accum[chunk_hi*4 + 3]);
+                        write_pair(r_1, chunk_lo * 8 + col_idx * 2, r1_lo);
+                        write_pair(r_1, chunk_hi * 8 + col_idx * 2, r1_hi);
+                    }
                 }
 
                 ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);

@@ -73,7 +73,7 @@ public:
         const char* dbg_env = std::getenv("DG_DEBUG_SCHED_TRACE");
         const bool dbg_on = dbg_env != nullptr && std::string(dbg_env) != "0";
         return fmt::format(R"(
-// dbg_trace_v5_block_128_128_weight_sf (bump to invalidate JIT cache when sm90_fp8_mega_moe.cuh changes)
+// dbg_trace_v8_revert_sf_hoist (bump to invalidate JIT cache when sm90_fp8_mega_moe.cuh changes)
 {}#include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 
 using namespace deep_gemm;
