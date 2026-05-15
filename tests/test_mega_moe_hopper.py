@@ -13,7 +13,6 @@ H200 (SM90 / Hopper) mega-MoE: fused kernel + 同管线 baseline 性能对比。
                   reduction us / `t_baseline / t_fused` legacy 比。
 """
 
-import deep_ep
 import argparse
 import math
 import os
@@ -27,7 +26,14 @@ from typing import Tuple
 import deep_gemm
 from deep_gemm.utils import per_token_cast_to_fp8
 from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
-from deep_gemm.testing import bench_kineto
+from deep_gemm.testing import bench_kineto, get_arch_major
+
+try:
+    import deep_ep as _deep_ep
+    _deep_ep_import_error = None
+except Exception as ex:
+    _deep_ep = None
+    _deep_ep_import_error = ex
 
 
 # 与 deep_gemm/include/deep_gemm/impls/sm90_fp8_mega_moe.cuh 中模板入口同名，
@@ -220,13 +226,10 @@ def _quantize_grouped_fp8_block_128_128(
 
 
 def _import_deep_ep():
-    try:
-        import deep_ep
-
-        return deep_ep
-    except Exception as ex:
-        dist_print(f"Failed to import deep_ep: {ex}", once_in_node=True)
+    if _deep_ep is None:
+        dist_print(f"Failed to import deep_ep: {_deep_ep_import_error}", once_in_node=True)
         return None
+    return _deep_ep
 
 
 # ============================================================================
@@ -271,9 +274,25 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     torch.manual_seed(rank_idx)
     random.seed(rank_idx)
 
+    if get_arch_major() != 9:
+        dist_print(
+            f"[SKIP] test_mega_moe_hopper requires SM90; got SM{get_arch_major()}0",
+            once_in_node=True,
+        )
+        dist.destroy_process_group()
+        return
+
     # 形状参数（与 test_mega_moe.py 同名同义）
     num_max_tokens_per_rank = args.num_max_tokens_per_rank
-    num_tokens = args.num_tokens if args.num_tokens > 0 else num_max_tokens_per_rank
+    num_tokens = (
+        max(
+            0,
+            args.num_max_tokens_per_rank
+            - random.randint(0, args.num_max_removed_tokens),
+        )
+        if args.num_tokens == 0
+        else args.num_tokens
+    )
     hidden, intermediate_hidden = args.hidden, args.intermediate_hidden
     num_experts, num_topk = args.num_experts, args.num_topk
     num_experts_per_rank = num_experts // num_ranks
@@ -312,6 +331,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     topk_weights, topk_idx = torch.topk(
         scores, num_topk, dim=-1, largest=True, sorted=False
     )
+    if args.masked_ratio > 0:
+        rand_mask = torch.rand_like(topk_idx, dtype=torch.float)
+        topk_idx.masked_fill_(rand_mask < args.masked_ratio, -1)
+        topk_weights.masked_fill_(topk_idx < 0, 0)
 
     # 累计接收统计：fused 与 baseline 各持一份避免相互覆盖
     cum_stats_fused = torch.zeros(
@@ -338,6 +361,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # SwiGLU clamp：finite → 传给 fused/triton；inf → None（关闭 clamp，与 SM90 fused 一致）
     clamp_arg = args.activation_clamp if math.isfinite(args.activation_clamp) else None
+    run_baseline_enabled = args.run_baseline or bool(args.check_output_diff)
 
     # ---- DeepGEMM grouped GEMM 的 M 维 alignment（baseline 走 DeepEP 时也用这个）----
     alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
@@ -375,8 +399,46 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         )
         return y_fused
 
+    # ---- 打印 config ----
+    dist_print("Config (H200 fused mega-MoE):", once_in_node=True)
+    dist_print(f" > Tokens: {num_tokens}/{num_max_tokens_per_rank}", once_in_node=True)
+    dist_print(
+        f" > Hidden: {hidden}, Intermediate: {intermediate_hidden}", once_in_node=True
+    )
+    dist_print(
+        f" > Experts: {num_topk}/{num_experts} (per-rank: {num_experts_per_rank})",
+        once_in_node=True,
+    )
+    dist_print(f" > Masked ratio: {args.masked_ratio}", once_in_node=True)
+    dist_print(
+        f" > Activation SF: fused L2 per-{FUSED_L2_ACT_SF_GRAN} UE8M0, "
+        f"baseline L2 per-{BASELINE_L2_ACT_SF_GRAN} UE8M0 "
+        f"(SM90 grouped GEMM constraint)",
+        once_in_node=True,
+    )
+    dist_print(
+        f" > Baseline: {'enabled' if run_baseline_enabled else 'disabled'}",
+        once_in_node=True,
+    )
+    dist_print(
+        f" > Buffer: {sym_buffer.buffer.nbytes / 2**30:.3f} GiB", once_in_node=True
+    )
+    dist_print(once_in_node=True)
+
+    # 与社区版 test_mega_moe.py 对齐：NCU 模式只跑 fused kernel，避免 baseline 噪声。
+    if args.ncu_profile_only:
+        dist_print("Run fused SM90 mega-MoE kernel:", once_in_node=True)
+        y = run_fused()
+        torch.cuda.synchronize()
+        assert y.shape == (num_tokens, hidden) and y.dtype == torch.bfloat16
+        dist_print(" > Done, exiting", once_in_node=True)
+        dist.barrier()
+        sym_buffer.destroy()
+        dist.destroy_process_group()
+        return
+
     # ---- 分配 DeepEP buffer（baseline 用）----
-    deep_ep = _import_deep_ep()
+    deep_ep = _import_deep_ep() if run_baseline_enabled else None
     ep_buffer = None
     if deep_ep is not None:
         ep_buffer = deep_ep.ElasticBuffer(
@@ -448,27 +510,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         # DeepEP combine：把每个 token 在 topk 个 expert 上的输出汇聚回源 rank
         return ep_buffer.combine(l2_y, handle=handle)[0]
 
-    # ---- 打印 config ----
-    dist_print("Config (H200 fused mega-MoE):", once_in_node=True)
-    dist_print(f" > Tokens: {num_tokens}/{num_max_tokens_per_rank}", once_in_node=True)
-    dist_print(
-        f" > Hidden: {hidden}, Intermediate: {intermediate_hidden}", once_in_node=True
-    )
-    dist_print(
-        f" > Experts: {num_topk}/{num_experts} (per-rank: {num_experts_per_rank})",
-        once_in_node=True,
-    )
-    dist_print(
-        f" > Activation SF: fused L2 per-{FUSED_L2_ACT_SF_GRAN} UE8M0, "
-        f"baseline L2 per-{BASELINE_L2_ACT_SF_GRAN} UE8M0 "
-        f"(SM90 grouped GEMM constraint)",
-        once_in_node=True,
-    )
-    dist_print(
-        f" > Buffer: {sym_buffer.buffer.nbytes / 2**30:.3f} GiB", once_in_node=True
-    )
-    dist_print(once_in_node=True)
-
     # ---- 跑一次确保不报错（fused + 可选 baseline）----
     y = run_fused()
     assert y.shape == (num_tokens, hidden) and y.dtype == torch.bfloat16, (
@@ -501,8 +542,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         (gathered_topk_idx < rank_idx * num_experts_per_rank)
         | (gathered_topk_idx >= (rank_idx + 1) * num_experts_per_rank)
     ] = -1
-    num_recv_tokens = int((gathered_topk_idx != -1).sum().item())
-    num_touched_experts = max(torch.unique(gathered_topk_idx.flatten()).numel() - 1, 0)
+    local_expert_ids = gathered_topk_idx[gathered_topk_idx != -1]
+    num_recv_tokens = int(local_expert_ids.numel())
+    num_touched_experts = int(torch.unique(local_expert_ids).numel())
 
     # ---- benchmark ----
     # fused：bench_kineto 抓 sm90_fp8_mega_moe_impl 的 GPU 段（不含 host overhead）
@@ -590,29 +632,68 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     hbm_gbs_baseline = safe_div(num_hbm_bytes / 1e9, t_baseline)
     nvlink_gbs_baseline = safe_div(num_nvlink_bytes / 1e9, t_baseline)
 
+    def fmt_perf_line(
+        name: str,
+        t: float,
+        compute_tflops: float,
+        hbm_gbs_: float,
+        nvlink_gbs_: float,
+        reduction_us: float | None = None,
+        speedup: float | None = None,
+    ) -> str:
+        reduction = f"{reduction_us:13.1f}" if reduction_us is not None else f"{'-':>13}"
+        speedup_text = (
+            f"{speedup:6.2f}x {'fused faster' if speedup > 1 else 'baseline faster'}"
+            if speedup is not None else
+            f"{'-':>21}"
+        )
+        return (
+            f" > {name:<10} {rank_idx:2d}/{num_ranks:<2d} "
+            f"{num_recv_tokens:12d} "
+            f"{num_touched_experts:14d} | "
+            f"{compute_tflops:15.0f} "
+            f"{hbm_gbs_:9.0f} "
+            f"{nvlink_gbs_:9.0f} "
+            f"{t * 1e6:9.0f} "
+            f"{reduction} "
+            f"{speedup_text}"
+        )
+
     dist_print("Performance:", once_in_node=True)
     dist_print(
-        f" > [fused]    EP {rank_idx:2}/{num_ranks} | "
-        f"{tflops:4.0f} TFLOPS | "
-        f"overlap: {tflops * approx_factor:4.0f} TFLOPS, "
-        f"HBM {hbm_gbs * approx_factor:4.0f} GB/s, "
-        f"NVL {nvlink_gbs * approx_factor:3.0f} GB/s | "
-        f"{t_fused * 1e6:6.0f} us, "
-        f"reduction: {t_reduction * 1e6:5.1f} us"
+        " > kind       EP    recv_tokens active_experts | "
+        "compute(TFLOPS) HBM(GB/s) NVL(GB/s)  time(us) reduction(us) speedup",
+        once_in_node=True,
+    )
+    dist_print(
+        fmt_perf_line(
+            "[fused]",
+            t_fused,
+            tflops * approx_factor,
+            hbm_gbs * approx_factor,
+            nvlink_gbs * approx_factor,
+            reduction_us=t_reduction * 1e6,
+        )
     )
     if ep_buffer is not None:
         speedup = safe_div(t_baseline, t_fused)
         dist_print(
-            f" > [baseline] EP {rank_idx:2}/{num_ranks} | "
-            f"{tflops_baseline:4.0f} TFLOPS | "
-            f"               HBM {hbm_gbs_baseline:4.0f} GB/s, "
-            f"NVL {nvlink_gbs_baseline:3.0f} GB/s | "
-            f"{t_baseline * 1e6:6.0f} us | "
-            f"t_baseline/t_fused = {speedup:.2f}x "
-            f"({'fused 更快' if speedup > 1 else 'baseline 更快'})"
+            fmt_perf_line(
+                "[baseline]",
+                t_baseline,
+                tflops_baseline,
+                hbm_gbs_baseline,
+                nvlink_gbs_baseline,
+                speedup=speedup,
+            )
         )
     else:
-        dist_print(" > [baseline] (no baseline: deep_ep unavailable)", once_in_node=True)
+        reason = (
+            "disabled; pass --run-baseline or --check-output-diff to compare"
+            if not run_baseline_enabled
+            else "deep_ep unavailable"
+        )
+        dist_print(f" > [baseline] ({reason})", once_in_node=True)
 
     # ---- 清理 ----
     dist.barrier()
@@ -633,7 +714,18 @@ if __name__ == "__main__":
 
     # 资源
     parser.add_argument(
+        "--ncu-profile-only",
+        action="store_true",
+        help="只运行一次 fused SM90 kernel，便于 NCU/Nsight 采样",
+    )
+    parser.add_argument(
         "--num-processes", type=int, default=8, help="spawn 出来的进程数（一卡一进程）"
+    )
+    parser.add_argument(
+        "--local-rank-idx",
+        type=int,
+        default=None,
+        help="单进程模式的 local rank；用于外部 launcher/NCU 分别启动每个 rank",
     )
 
     # 模型形状
@@ -644,6 +736,12 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="per-rank 实际 token 数；0 表示用 num-max-tokens-per-rank",
+    )
+    parser.add_argument(
+        "--num-max-removed-tokens",
+        type=int,
+        default=0,
+        help="num-tokens 为 0 时，每个 rank 随机移除的最大 token 数",
     )
     parser.add_argument("--hidden", type=int, default=7168)
     parser.add_argument(
@@ -660,6 +758,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num-experts", type=int, default=384)
     parser.add_argument("--num-topk", type=int, default=6)
+    parser.add_argument(
+        "--masked-ratio",
+        type=float,
+        default=0.0,
+        help="随机 mask 掉部分 topk expert selection，用于验证稀疏路由边界",
+    )
     parser.add_argument(
         "--fast-math",
         type=int,
@@ -687,6 +791,11 @@ if __name__ == "__main__":
         help="baseline event 测时前用于 flush L2 的临时写入大小；0 表示关闭",
     )
     parser.add_argument(
+        "--run-baseline",
+        action="store_true",
+        help="启用 DeepEP+grouped-FP8 legacy baseline；默认关闭以避免 full-size 默认配置触发 baseline kernel 非法访问",
+    )
+    parser.add_argument(
         "--check-output-diff",
         type=int,
         default=0,
@@ -704,7 +813,11 @@ if __name__ == "__main__":
     if args.dump_profile_traces:
         os.makedirs(args.dump_profile_traces, exist_ok=True)
 
-    # 多进程启动：每个进程对应一个 GPU；test() 内部用 init_dist 建 NCCL group
-    torch.multiprocessing.spawn(
-        test, args=(args.num_processes, args), nprocs=args.num_processes
-    )
+    if args.local_rank_idx is not None:
+        # 单进程模式：由外部 launcher 分别设置 MASTER_ADDR/PORT/WORLD_SIZE/RANK。
+        test(args.local_rank_idx, args.num_processes, args)
+    else:
+        # 多进程启动：每个进程对应一个 GPU；test() 内部用 init_dist 建 NCCL group。
+        torch.multiprocessing.spawn(
+            test, args=(args.num_processes, args), nprocs=args.num_processes
+        )
