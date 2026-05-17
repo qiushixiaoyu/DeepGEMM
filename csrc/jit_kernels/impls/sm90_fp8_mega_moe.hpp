@@ -1,6 +1,7 @@
 #pragma once
 
 #include <torch/python.h>
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 
@@ -16,6 +17,45 @@
 #include "../heuristics/mega_moe.hpp"
 
 namespace deep_gemm {
+
+static int get_active_sms_for_sm90_mega_moe(
+    const int& physical_num_sms,
+    const int& num_tokens,
+    const int& num_topk,
+    const MegaMoESM90Config& config) {
+    DG_HOST_ASSERT(physical_num_sms >= 1);
+
+    const int forced_num_sms = get_env<int>("DG_SM90_MEGA_MOE_ACTIVE_SMS", 0);
+    if (forced_num_sms > 0)
+        return std::clamp(forced_num_sms, 1, physical_num_sms);
+
+    if (not get_env<int>("DG_SM90_MEGA_MOE_ENABLE_ACTIVE_SMS_HEURISTIC", 0))
+        return physical_num_sms;
+
+    // Small-batch decode runs spend a large fraction of time in the persistent
+    // kernel's grid-wide dispatch / count / barrier work.  Keep the full-grid
+    // path for larger tiles, but reduce the number of participating CTAs when
+    // the expected per-rank routed slots are tiny.  The scheduler still covers
+    // all L1/L2 blocks by striding over the smaller logical grid.
+    if (config.block_m != 64)
+        return physical_num_sms;
+
+    const int num_slots_per_rank = num_tokens * num_topk;
+    int active_sms = physical_num_sms;
+    if (num_slots_per_rank <= 12) {
+        active_sms = 16;
+    } else if (num_slots_per_rank <= 24) {
+        active_sms = 24;
+    } else if (num_slots_per_rank <= 48) {
+        active_sms = 32;
+    } else if (num_slots_per_rank <= 96) {
+        active_sms = 48;
+    }
+
+    // At least two CTAs are required by workspace cleanup paths that split
+    // work between sm_idx == 0 and sm_idx > 0.
+    return std::clamp(active_sms, std::min(2, physical_num_sms), physical_num_sms);
+}
 
 // ============================================================================
 // SM90 (Hopper) FP8 MegaMoE host runtime
@@ -72,9 +112,15 @@ public:
     static std::string generate_impl(const Args& args) {
         const char* dbg_env = std::getenv("DG_DEBUG_SCHED_TRACE");
         const bool dbg_on = dbg_env != nullptr && std::string(dbg_env) != "0";
+        const bool l2_dual_accum_on = get_env<int>("DG_SM90_MEGA_MOE_L2_DUAL_ACCUM", 0) != 0;
+        const bool sfb_smem_on = get_env<int>("DG_SM90_MEGA_MOE_SFB_SMEM", 0) != 0;
+        const bool l2_sfa_pair_tma_on = get_env<int>("DG_SM90_MEGA_MOE_L2_SFA_PAIR_TMA", 0) != 0;
+        const bool l1_direct_store_on = get_env<int>("DG_SM90_MEGA_MOE_L1_DIRECT_STORE", 0) != 0;
+        const int force_combine_chunks = get_env<int>("DG_SM90_MEGA_MOE_FORCE_COMBINE_CHUNKS", 0);
+        DG_HOST_ASSERT(force_combine_chunks == 0 or force_combine_chunks == 1 or force_combine_chunks == 2);
         return fmt::format(R"(
-// dbg_trace_v8_revert_sf_hoist (bump to invalidate JIT cache when sm90_fp8_mega_moe.cuh changes)
-{}#include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
+    // wave_v2_active_sms_v1_dbg_trace_v13_l1_direct_store (bump to invalidate JIT cache when sm90_fp8_mega_moe.cuh changes)
+    {}{}{}{}{}{}#include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 
 using namespace deep_gemm;
 
@@ -94,7 +140,12 @@ static void __instantiate_kernel() {{
         {}
     >);
 }};
-)", dbg_on ? "#define DG_DEBUG_SCHED_TRACE\n" : "",
+    )", dbg_on ? "#define DG_DEBUG_SCHED_TRACE\n" : "",
+    l2_dual_accum_on ? "#define DG_SM90_MEGA_MOE_L2_DUAL_ACCUM 1\n" : "",
+    sfb_smem_on ? "#define DG_SM90_MEGA_MOE_SFB_SMEM 1\n" : "",
+    l2_sfa_pair_tma_on ? "#define DG_SM90_MEGA_MOE_L2_SFA_PAIR_TMA 1\n" : "",
+    l1_direct_store_on ? "#define DG_SM90_MEGA_MOE_L1_DIRECT_STORE 1\n" : "",
+    force_combine_chunks > 0 ? fmt::format("#define DG_SM90_MEGA_MOE_FORCE_COMBINE_CHUNKS {}\n", force_combine_chunks) : "",
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_topk,
@@ -192,10 +243,24 @@ static void sm90_fp8_mega_moe(
                                                      config.block_k, config.block_m,
                                                      static_cast<int>(l2_acts.stride(-2)),
                                                      config.swizzle_acts_mode);
-    const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
-                                                        config.num_padded_sf_pool_tokens, intermediate_hidden,
-                                                        config.block_m, kL2ActsSFGranK,
-                                                        1, 0);
+    const bool l2_sfa_pair_tma_on = get_env<int>("DG_SM90_MEGA_MOE_L2_SFA_PAIR_TMA", 0) != 0;
+    const auto tensor_map_l2_acts_sf = [&]() {
+        if (l2_sfa_pair_tma_on) {
+            const int shape_mn = get_tma_aligned_size(
+                config.num_padded_sf_pool_tokens,
+                static_cast<int>(l2_acts_sf.element_size()));
+            return make_tma_2d_desc(
+                l2_acts_sf,
+                shape_mn, ceil_div(intermediate_hidden, kL2ActsSFGranK),
+                config.block_m, 2,
+                shape_mn,
+                0);
+        }
+        return make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
+                                config.num_padded_sf_pool_tokens, intermediate_hidden,
+                                config.block_m, kL2ActsSFGranK,
+                                1, 0);
+    }();
     const auto tensor_map_l2_weights = make_tma_2d_desc(l2_weights,
                                                         intermediate_hidden, num_experts_per_rank * hidden,
                                                         config.block_k, config.block_n,
@@ -209,6 +274,12 @@ static void sm90_fp8_mega_moe(
 
     // Launch
     const auto num_sms = device_runtime->get_num_sms();
+    const auto active_sms = get_active_sms_for_sm90_mega_moe(num_sms, num_tokens, num_topk, config);
+    if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
+        std::cout << fmt::format(
+            "SM90FP8MegaMoE active_sms={} physical_sms={} num_tokens={} num_topk={} block_m={}",
+            active_sms, num_sms, num_tokens, num_topk, config.block_m) << std::endl;
+    }
     const SM90FP8MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
@@ -230,7 +301,7 @@ static void sm90_fp8_mega_moe(
         .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
         .tensor_map_l2_weights = tensor_map_l2_weights,
         .l2_weights_sf = l2_weights_sf.data_ptr<float>(),
-        .launch_args = LaunchArgs(num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
+        .launch_args = LaunchArgs(active_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, config.cluster_size)
     };
     const auto code = SM90FP8MegaMoERuntime::generate(args);

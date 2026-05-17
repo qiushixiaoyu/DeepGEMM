@@ -1,0 +1,60 @@
+===== batch 1 =====
+Traceback (most recent call last):
+  File "/workspace/DeepGEMM/tests/test_mega_moe_hopper.py", line 27, in <module>
+    from deep_gemm.utils import per_token_cast_to_fp8
+  File "/workspace/DeepGEMM/deep_gemm/utils/__init__.py", line 1, in <module>
+    from . import math, layout
+  File "/workspace/DeepGEMM/deep_gemm/utils/layout.py", line 13, in <module>
+    from .._C import (
+ImportError: dynamic module does not define module export function (PyInit__C)
+
+===== batch 16 =====
+Traceback (most recent call last):
+  File "/workspace/DeepGEMM/tests/test_mega_moe_hopper.py", line 27, in <module>
+    from deep_gemm.utils import per_token_cast_to_fp8
+  File "/workspace/DeepGEMM/deep_gemm/utils/__init__.py", line 1, in <module>
+    from . import math, layout
+  File "/workspace/DeepGEMM/deep_gemm/utils/layout.py", line 13, in <module>
+    from .._C import (
+ImportError: dynamic module does not define module export function (PyInit__C)
+
+===== batch 64 =====
+Traceback (most recent call last):
+  File "/workspace/DeepGEMM/tests/test_mega_moe_hopper.py", line 27, in <module>
+    from deep_gemm.utils import per_token_cast_to_fp8
+  File "/workspace/DeepGEMM/deep_gemm/utils/__init__.py", line 1, in <module>
+    from . import math, layout
+  File "/workspace/DeepGEMM/deep_gemm/utils/layout.py", line 13, in <module>
+    from .._C import (
+ImportError: dynamic module does not define module export function (PyInit__C)
+
+===== batch 512 =====
+Traceback (most recent call last):
+  File "/workspace/DeepGEMM/tests/test_mega_moe_hopper.py", line 27, in <module>
+    from deep_gemm.utils import per_token_cast_to_fp8
+  File "/workspace/DeepGEMM/deep_gemm/utils/__init__.py", line 1, in <module>
+    from . import math, layout
+  File "/workspace/DeepGEMM/deep_gemm/utils/layout.py", line 13, in <module>
+    from .._C import (
+ImportError: dynamic module does not define module export function (PyInit__C)
+
+===== batch 4096 =====
+Traceback (most recent call last):
+  File "/workspace/DeepGEMM/tests/test_mega_moe_hopper.py", line 27, in <module>
+    from deep_gemm.utils import per_token_cast_to_fp8
+  File "/workspace/DeepGEMM/deep_gemm/utils/__init__.py", line 1, in <module>
+    from . import math, layout
+  File "/workspace/DeepGEMM/deep_gemm/utils/layout.py", line 13, in <module>
+    from .._C import (
+ImportError: dynamic module does not define module export function (PyInit__C)
+
+===== batch 9192 =====
+Traceback (most recent call last):
+  File "/workspace/DeepGEMM/tests/test_mega_moe_hopper.py", line 27, in <module>
+    from deep_gemm.utils import per_token_cast_to_fp8
+  File "/workspace/DeepGEMM/deep_gemm/utils/__init__.py", line 1, in <module>
+    from . import math, layout
+  File "/workspace/DeepGEMM/deep_gemm/utils/layout.py", line 13, in <module>
+    from .._C import (
+ImportError: dynamic module does not define module export function (PyInit__C)
+

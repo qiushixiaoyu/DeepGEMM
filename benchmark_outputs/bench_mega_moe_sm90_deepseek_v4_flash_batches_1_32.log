@@ -1,0 +1,14 @@
+bench_mega_moe_sm90.py DeepSeek-V4-Flash benchmark
+Config: num_processes=8 batches=1 2 4 8 16 32 hidden=4096 intermediate_hidden=2048 experts=256 topk=6 num_tests=5
+Generated: 2026-05-15T07:13:23Z UTC
+
+SM90 MegaMoE bench: ranks=8 hidden=4096 ih=2048 experts=256 topk=6 masked_ratio=0.0 fast_math=True
+ tokens=   1  recv=    7  experts=   7    193.6 us     1.8 TFLOPS     911 GB/s  (rank0)
+ tokens=   2  recv=   12  experts=  11    303.6 us     2.0 TFLOPS     912 GB/s  (rank0)
+ tokens=   4  recv=   27  experts=  15    415.8 us     3.3 TFLOPS     909 GB/s  (rank0)
+ tokens=   8  recv=   34  experts=  21    498.5 us     3.4 TFLOPS    1061 GB/s  (rank0)
+ tokens=  16  recv=   98  experts=  30    573.8 us     8.6 TFLOPS    1319 GB/s  (rank0)
+ tokens=  32  recv=  191  experts=  32    587.4 us    16.4 TFLOPS    1376 GB/s  (rank0)
+
+exit_code=0
+Saved log: /workspace/DeepGEMM/benchmark_outputs/bench_mega_moe_sm90_deepseek_v4_flash_batches_1_32.log

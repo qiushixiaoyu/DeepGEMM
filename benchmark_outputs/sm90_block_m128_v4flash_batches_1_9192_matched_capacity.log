@@ -1,0 +1,168 @@
+===== batch 1 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 1/1
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-64 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: enabled
+ > Buffer: 0.257 GiB
+
+Performance:
+ > kind       EP    recv_tokens active_experts | compute(TFLOPS) HBM(GB/s) NVL(GB/s)  time(us) reduction(us) speedup
+ > [fused]     0/8             7              7 |               1       421         0       419           0.0                     -
+ > [fused]     4/8             4              4 |               0       240         0       419           0.0                     -
+ > [fused]     6/8             2              2 |               0       120         0       419           0.0                     -
+ > [fused]     5/8            11              8 |               1       480         0       420           0.0                     -
+ > [fused]     2/8             6              6 |               1       361         0       419           0.0                     -
+ > [fused]     3/8             4              4 |               0       240         0       420           0.0                     -
+ > [fused]     7/8             5              4 |               1       240         0       419           0.0                     -
+ > [fused]     1/8             9              9 |               1       541         0       419           0.0                     -
+ > [baseline]  0/8             7              7 |               1       685         0       257             -   0.61x baseline faster
+ > [baseline]  2/8             6              6 |               1       616         0       245             -   0.59x baseline faster
+ > [baseline]  5/8            11              8 |               2       750         1       269             -   0.64x baseline faster
+ > [baseline]  4/8             4              4 |               1       414         0       243             -   0.58x baseline faster
+ > [baseline]  3/8             4              4 |               1       454         0       222             -   0.53x baseline faster
+ > [baseline]  1/8             9              9 |               2       911         0       249             -   0.59x baseline faster
+ > [baseline]  7/8             5              4 |               1       445         0       226             -   0.54x baseline faster
+ > [baseline]  6/8             2              2 |               0       187         0       269             -   0.64x baseline faster
+===== batch 16 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 16/16
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-64 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: enabled
+ > Buffer: 0.257 GiB
+
+Performance:
+ > kind       EP    recv_tokens active_experts | compute(TFLOPS) HBM(GB/s) NVL(GB/s)  time(us) reduction(us) speedup
+ > [fused]     0/8           106             32 |               4       583         1      1386           0.1                     -
+ > [fused]     7/8            94             31 |               3       565         1      1385           0.1                     -
+ > [fused]     4/8            94             32 |               3       582         1      1386           0.1                     -
+ > [fused]     6/8            96             30 |               3       546         1      1386           0.1                     -
+ > [fused]     5/8            93             31 |               3       564         1      1386           0.1                     -
+ > [fused]     1/8            98             31 |               4       564         1      1386           0.1                     -
+ > [fused]     3/8            93             30 |               3       546         1      1386           0.1                     -
+ > [fused]     2/8            94             30 |               3       546         1      1386           0.1                     -
+ > [baseline]  0/8           106             32 |               9      1367         2       590             -   0.43x baseline faster
+ > [baseline]  1/8            98             31 |               9      1377         2       568             -   0.41x baseline faster
+ > [baseline]  4/8            94             32 |               8      1432         2       564             -   0.41x baseline faster
+ > [baseline]  5/8            93             31 |               8      1411         2       554             -   0.40x baseline faster
+ > [baseline]  7/8            94             31 |               8      1336         2       585             -   0.42x baseline faster
+ > [baseline]  2/8            94             30 |               8      1300         2       582             -   0.42x baseline faster
+ > [baseline]  3/8            93             30 |               8      1310         2       578             -   0.42x baseline faster
+ > [baseline]  6/8            96             30 |               9      1353         2       560             -   0.40x baseline faster
+===== batch 64 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 64/64
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-64 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: enabled
+ > Buffer: 0.257 GiB
+
+Performance:
+ > kind       EP    recv_tokens active_experts | compute(TFLOPS) HBM(GB/s) NVL(GB/s)  time(us) reduction(us) speedup
+ > [fused]     0/8           379             32 |              13       574         3      1415           0.6                     -
+ > [fused]     7/8           371             32 |              13       574         3      1415           0.6                     -
+ > [fused]     6/8           365             32 |              13       574         3      1414           0.6                     -
+ > [fused]     5/8           365             32 |              13       574         3      1415           0.6                     -
+ > [fused]     2/8           382             32 |              14       574         3      1414           0.6                     -
+ > [fused]     4/8           384             32 |              14       574         3      1414           0.6                     -
+ > [fused]     1/8           418             32 |              15       575         4      1413           0.6                     -
+ > [fused]     3/8           408             32 |              15       575         4      1414           0.6                     -
+ > [baseline]  0/8           379             32 |              33      1426         8       570             -   0.40x baseline faster
+ > [baseline]  1/8           418             32 |              36      1408         9       577             -   0.41x baseline faster
+ > [baseline]  2/8           382             32 |              33      1387         8       585             -   0.41x baseline faster
+ > [baseline]  4/8           384             32 |              31      1320         8       615             -   0.44x baseline faster
+ > [baseline]  7/8           371             32 |              30      1314         7       618             -   0.44x baseline faster
+ > [baseline]  5/8           365             32 |              30      1316         7       617             -   0.44x baseline faster
+ > [baseline]  6/8           365             32 |              31      1349         8       602             -   0.43x baseline faster
+ > [baseline]  3/8           408             32 |              35      1395         9       582             -   0.41x baseline faster
+===== batch 512 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 512/512
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-64 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: enabled
+ > Buffer: 0.455 GiB
+
+Performance:
+ > kind       EP    recv_tokens active_experts | compute(TFLOPS) HBM(GB/s) NVL(GB/s)  time(us) reduction(us) speedup
+ > [fused]     0/8          3074             32 |             109       604        27      1424           4.5                     -
+ > [fused]     3/8          3092             32 |             110       604        27      1424           4.5                     -
+ > [fused]     2/8          3029             32 |             107       603        26      1425           4.5                     -
+ > [fused]     5/8          3037             32 |             108       603        27      1424           4.5                     -
+ > [fused]     7/8          3038             32 |             108       603        27      1424           4.5                     -
+ > [fused]     4/8          3048             32 |             108       603        27      1424           4.5                     -
+ > [fused]     6/8          3145             32 |             112       605        28      1424           4.5                     -
+ > [fused]     1/8          3113             32 |             110       604        27      1424           4.5                     -
+ > [baseline]  0/8          3074             32 |             126       696        31      1231             -   0.86x baseline faster
+ > [baseline]  2/8          3029             32 |             124       699        31      1225             -   0.86x baseline faster
+ > [baseline]  1/8          3113             32 |             132       725        33      1183             -   0.83x baseline faster
+ > [baseline]  6/8          3145             32 |             133       720        33      1192             -   0.84x baseline faster
+ > [baseline]  5/8          3037             32 |             124       695        31      1232             -   0.87x baseline faster
+ > [baseline]  3/8          3092             32 |             128       707        32      1212             -   0.85x baseline faster
+ > [baseline]  4/8          3048             32 |             129       720        32      1190             -   0.84x baseline faster
+ > [baseline]  7/8          3038             32 |             126       706        31      1213             -   0.85x baseline faster
+===== batch 4096 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 4096/4096
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-64 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: enabled
+ > Buffer: 2.238 GiB
+
+Performance:
+ > kind       EP    recv_tokens active_experts | compute(TFLOPS) HBM(GB/s) NVL(GB/s)  time(us) reduction(us) speedup
+ > [fused]     0/8         24703             32 |             146       143        36      8546          36.1                     -
+ > [fused]     1/8         24693             32 |             146       143        36      8543          36.1                     -
+ > [fused]     7/8         24557             32 |             145       143        36      8543          36.1                     -
+ > [fused]     3/8         24503             32 |             145       143        36      8546          36.1                     -
+ > [fused]     2/8         24480             32 |             145       143        36      8545          36.1                     -
+ > [fused]     5/8         24662             32 |             146       143        36      8542          36.1                     -
+ > [fused]     6/8         24476             32 |             145       143        36      8544          36.1                     -
+ > [fused]     4/8         24534             32 |             145       143        36      8544          36.1                     -
+ > [baseline]  0/8         24703             32 |             180       177        44      6897             -   0.81x baseline faster
+ > [baseline]  1/8         24693             32 |             180       177        44      6904             -   0.81x baseline faster
+ > [baseline]  2/8         24480             32 |             179       177        44      6875             -   0.80x baseline faster
+ > [baseline]  3/8         24503             32 |             179       177        44      6889             -   0.81x baseline faster
+ > [baseline]  5/8         24662             32 |             180       177        44      6906             -   0.81x baseline faster
+ > [baseline]  6/8         24476             32 |             179       176        44      6900             -   0.81x baseline faster
+ > [baseline]  4/8         24534             32 |             179       176        44      6897             -   0.81x baseline faster
+ > [baseline]  7/8         24557             32 |             179       176        44      6911             -   0.81x baseline faster
+===== batch 9192 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 9192/9192
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-64 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: enabled
+ > Buffer: 4.814 GiB
+
+Performance:
+ > kind       EP    recv_tokens active_experts | compute(TFLOPS) HBM(GB/s) NVL(GB/s)  time(us) reduction(us) speedup
+ > [fused]     0/8         54750             32 |             153        96        38     18090          81.1                     -
+ > [fused]     7/8         55100             32 |             154        96        38     18085          81.1                     -
+ > [fused]     5/8         55288             32 |             155        96        38     18085          81.1                     -
+ > [fused]     6/8         55360             32 |             155        96        38     18083          81.1                     -
+ > [fused]     2/8         55315             32 |             155        96        38     18084          81.1                     -
+ > [fused]     4/8         55041             32 |             154        96        38     18084          81.1                     -
+ > [fused]     3/8         55488             32 |             155        96        38     18088          81.1                     -
+ > [fused]     1/8         54874             32 |             153        96        38     18083          81.1                     -
+ > [baseline]  0/8         54750             32 |             184       115        45     14981             -   0.83x baseline faster
+ > [baseline]  1/8         54874             32 |             184       115        45     14980             -   0.83x baseline faster
+ > [baseline]  2/8         55315             32 |             186       116        46     14981             -   0.83x baseline faster
+ > [baseline]  6/8         55360             32 |             185       115        46     15022             -   0.83x baseline faster
+ > [baseline]  3/8         55488             32 |             187       116        46     14972             -   0.83x baseline faster
+ > [baseline]  5/8         55288             32 |             185       115        46     15008             -   0.83x baseline faster
+ > [baseline]  7/8         55100             32 |             185       115        46     15004             -   0.83x baseline faster
+ > [baseline]  4/8         55041             32 |             185       115        46     15006             -   0.83x baseline faster

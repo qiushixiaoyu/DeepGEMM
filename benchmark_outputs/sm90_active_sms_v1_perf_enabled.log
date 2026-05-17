@@ -1,0 +1,138 @@
+sm90_active_sms_v1 enabled heuristic
+Config: DeepSeek-V4-Flash hidden=4096 intermediate_hidden=2048 experts=256 topk=6 num_processes=8
+Batches: 1 2 4 8 16 32 64 512 1024 4096 9192
+Generated: 2026-05-15T08:38:34Z UTC
+
+===== enabled batch=1 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 1/1
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-64 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: disabled
+ > Buffer: 0.257 GiB
+
+Performance:
+ > kind       EP    recv_tokens active_experts | compute(TFLOPS) HBM(GB/s) NVL(GB/s)  time(us) reduction(us) speedup
+ > [fused]     0/8             7              7 |               0       238         0       742           0.0                     -
+ > [fused]     1/8             9              9 |               1       303         0       749           0.0                     -
+ > [fused]     3/8             4              4 |               0       134         0       751           0.0                     -
+ > [fused]     7/8             5              4 |               0       134         0       754           0.0                     -
+ > [fused]     2/8             6              6 |               0       205         0       738           0.0                     -
+ > [fused]     5/8            11              8 |               1       271         0       744           0.0                     -
+ > [fused]     4/8             4              4 |               0       135         0       747           0.0                     -
+ > [fused]     6/8             2              2 |               0        67         0       752           0.0                     -
+ > [baseline] (disabled; pass --run-baseline or --check-output-diff to compare)
+
+===== enabled batch=2 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 2/2
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-64 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: disabled
+ > Buffer: 0.257 GiB
+
+Performance:
+ > kind       EP    recv_tokens active_experts | compute(TFLOPS) HBM(GB/s) NVL(GB/s)  time(us) reduction(us) speedup
+ > [fused]     0/8            13             12 |               1       262         0      1155           0.0                     -
+ > [fused]     3/8            10              9 |               0       197         0      1152           0.0                     -
+ > [fused]     2/8            11             10 |               0       218         0      1156           0.0                     -
+ > [fused]     1/8            15             14 |               1       308         0      1146           0.0                     -
+ > [fused]     5/8            12              9 |               1       198         0      1147           0.0                     -
+ > [fused]     6/8            11              9 |               0       198         0      1145           0.0                     -
+ > [fused]     7/8            11              9 |               0       198         0      1143           0.0                     -
+ > [fused]     4/8            13             12 |               1       264         0      1145           0.0                     -
+ > [baseline] (disabled; pass --run-baseline or --check-output-diff to compare)
+
+===== enabled batch=4 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 4/4
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-64 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: disabled
+ > Buffer: 0.257 GiB
+
+Performance:
+ > kind       EP    recv_tokens active_experts | compute(TFLOPS) HBM(GB/s) NVL(GB/s)  time(us) reduction(us) speedup
+ > [fused]     0/8            29             18 |               1       375         0      1208           0.0                     -
+ > [fused]     4/8            28             22 |               1       462         0      1201           0.0                     -
+ > [fused]     7/8            22             16 |               1       339         0      1189           0.0                     -
+ > [fused]     1/8            31             22 |               1       460         0      1205           0.0                     -
+ > [fused]     6/8            19             15 |               1       314         0      1202           0.0                     -
+ > [fused]     5/8            20             15 |               1       314         0      1203           0.0                     -
+ > [fused]     2/8            21             15 |               1       314         0      1205           0.0                     -
+ > [fused]     3/8            22             15 |               1       316         0      1197           0.0                     -
+ > [baseline] (disabled; pass --run-baseline or --check-output-diff to compare)
+
+===== enabled batch=8 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 8/8
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-64 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: disabled
+ > Buffer: 0.257 GiB
+
+Performance:
+ > kind       EP    recv_tokens active_experts | compute(TFLOPS) HBM(GB/s) NVL(GB/s)  time(us) reduction(us) speedup
+ > [fused]     0/8            61             28 |               2       556         1      1269           0.1                     -
+ > [fused]     1/8            52             27 |               2       536         1      1269           0.1                     -
+ > [fused]     3/8            45             25 |               2       557         0      1132           0.1                     -
+ > [fused]     4/8            50             25 |               2       510         1      1235           0.1                     -
+ > [fused]     7/8            41             24 |               2       477         0      1269           0.1                     -
+ > [fused]     6/8            44             24 |               2       476         0      1270           0.1                     -
+ > [fused]     5/8            47             27 |               2       552         0      1232           0.1                     -
+ > [fused]     2/8            44             24 |               2       476         0      1270           0.1                     -
+ > [baseline] (disabled; pass --run-baseline or --check-output-diff to compare)
+
+===== enabled batch=16 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 16/16
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-64 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: disabled
+ > Buffer: 0.257 GiB
+
+Performance:
+ > kind       EP    recv_tokens active_experts | compute(TFLOPS) HBM(GB/s) NVL(GB/s)  time(us) reduction(us) speedup
+ > [fused]     0/8           106             32 |               6       912         1       885           0.1                     -
+ > [fused]     5/8            93             31 |               5       857         1       912           0.1                     -
+ > [fused]     3/8            93             30 |               5       830         1       912           0.1                     -
+ > [fused]     7/8            94             31 |               5       853         1       917           0.1                     -
+ > [fused]     2/8            94             30 |               5       825         1       918           0.1                     -
+ > [fused]     6/8            96             30 |               5       827         1       915           0.1                     -
+ > [fused]     1/8            98             31 |               5       848         1       922           0.1                     -
+ > [fused]     4/8            94             32 |               5       874         1       923           0.1                     -
+ > [baseline] (disabled; pass --run-baseline or --check-output-diff to compare)
+
+===== enabled batch=32 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 32/32
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-64 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: disabled
+ > Buffer: 0.257 GiB
+
+Performance:
+ > kind       EP    recv_tokens active_experts | compute(TFLOPS) HBM(GB/s) NVL(GB/s)  time(us) reduction(us) speedup
+ > [fused]     0/8           201             32 |              17      1330         4       608           0.3                     -
+ > [fused]     7/8           185             32 |              15      1308         4       618           0.3                     -
+ > [fused]     1/8           209             32 |              17      1306         4       620           0.3                     -
+ > [fused]     4/8           193             32 |              16      1317         4       615           0.3                     -
+ > [fused]     6/8           187             32 |              16      1365         4       592           0.3                     -
+ > [fused]     2/8           186             32 |              16      1373         4       589           0.3                     -
+ > [fused]     5/8           182             32 |              15      1362         4       594           0.3                     -
+ > [fused]     3/8           193             32 |              16      1334         4       607           0.3                     -
+ > [baseline] (disabled; pass --run-baseline or --check-output-diff to compare)
+
+===== enabled batch=64 =====

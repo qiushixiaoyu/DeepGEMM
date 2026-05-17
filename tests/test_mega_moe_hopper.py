@@ -17,11 +17,19 @@ import argparse
 import math
 import os
 import random
+import sys
 import torch
 import torch.distributed as dist
 import triton
 import triton.language as tl
 from typing import Tuple
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+DEEPEP_ROOT = os.path.join(os.path.dirname(REPO_ROOT), "DeepEP")
+if os.path.isdir(DEEPEP_ROOT) and DEEPEP_ROOT not in sys.path:
+    sys.path.insert(0, DEEPEP_ROOT)
 
 import deep_gemm
 from deep_gemm.utils import per_token_cast_to_fp8

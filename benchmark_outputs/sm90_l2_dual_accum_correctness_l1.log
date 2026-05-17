@@ -1,0 +1,4 @@
+SM90 MegaMoE test plan: 1 scenarios across layers [1] on 8 ranks
+  [L1.smoke                        ] diff=0.0006 (tol=0.07) OK
+
+PASSED all 1 scenarios

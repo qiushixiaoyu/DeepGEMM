@@ -95,7 +95,8 @@ static std::tuple<int, int, int, int> get_block_config_for_mega_moe(
 
 static int get_num_experts_per_wave_for_mega_moe(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
-    const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms) {
+    const int& intermediate_hidden, const int& block_m, const int& block_n,
+    const int& num_sms, const int& imbalance_factor) {
 
     float expected_tokens_per_expert = static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
     if (expected_tokens_per_expert < 1) {
@@ -103,8 +104,7 @@ static int get_num_experts_per_wave_for_mega_moe(
         return num_experts_per_rank;
     }
 
-    // Reduce per-expert block count by this factor since uneven routing leaves some experts with fewer tokens
-    constexpr int kImbalanceFactor = 2;
+    DG_HOST_ASSERT(imbalance_factor >= 1);
 
     // Count L1 blocks per expert assuming tokens are evenly spread across experts
     const int num_m_blocks = ceil_div(static_cast<int>(std::ceil(expected_tokens_per_expert)), block_m);
@@ -113,7 +113,7 @@ static int get_num_experts_per_wave_for_mega_moe(
 
     // Pick the smallest value whose total blocks (after imbalance reduction) can keep all SMs busy
     int num_experts_per_wave = num_l1_blocks_per_expert > 0
-        ? ceil_div(kImbalanceFactor * num_sms, num_l1_blocks_per_expert) : 1;
+        ? ceil_div(imbalance_factor * num_sms, num_l1_blocks_per_expert) : 1;
     num_experts_per_wave = std::min(num_experts_per_wave, num_experts_per_rank);
 
     // Round up to the nearest divisor of num_experts_per_rank so every wave processes the same count
@@ -121,6 +121,17 @@ static int get_num_experts_per_wave_for_mega_moe(
         ++ num_experts_per_wave;
 
     return num_experts_per_wave;
+}
+
+static int get_num_experts_per_wave_for_mega_moe(
+    const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
+    const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms) {
+    // Reduce per-expert block count by this factor since uneven routing leaves some experts with fewer tokens.
+    constexpr int kImbalanceFactor = 2;
+    return get_num_experts_per_wave_for_mega_moe(
+        num_experts_per_rank, num_tokens, num_topk,
+        intermediate_hidden, block_m, block_n, num_sms,
+        kImbalanceFactor);
 }
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe(
@@ -296,14 +307,20 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
     // Pick block_m and number of math (epilogue) warpgroups. WGMMA::M = 64 is
     // the hard floor on Hopper, so each warpgroup needs at least 64 rows;
     // i.e. (block_m / num_epilogue_warpgroups) >= 64.
-    const auto& [block_m, num_epilogue_warpgroups] = [&]() -> std::tuple<int, int> {
-        const float num_expected_tokens_per_expert =
-            static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
-        if (num_expected_tokens_per_expert <= 64.5)  return {64, 1};
-        if (num_expected_tokens_per_expert <= 96.5)  return {128, 2};
-        if (num_expected_tokens_per_expert <= 192.5) return {128, 2};
-        return {128, 2};
-    }();
+    const int forced_block_m = get_env<int>("DG_SM90_MEGA_MOE_FORCE_BLOCK_M", 0);
+    if (forced_block_m > 0) {
+        DG_HOST_ASSERT(forced_block_m == 64 or forced_block_m == 128);
+        return {forced_block_m, forced_block_m / 64 * 128};
+    }
+
+    // On SM90 the 2-WG BLOCK_M=128 path increases per-CTA work, but also lowers
+    // pipeline depth and leaves the fused L2/epilogue/combine path behind the
+    // legacy grouped-GEMM baseline at large batch sizes.  The 1-WG BLOCK_M=64
+    // path gives finer-grained scheduling and higher measured throughput across
+    // the DeepSeek-V4-Flash sweep without hurting small batches.  Use it by
+    // default; keep the env override above for A/B experiments.
+    constexpr int block_m = 64;
+    constexpr int num_epilogue_warpgroups = 1;
 
     DG_HOST_ASSERT(std::any_of(
         layout::kCandidateBlockM, layout::kCandidateBlockM + layout::kNumCandidateBlockMs,
@@ -317,25 +334,29 @@ static int get_num_experts_per_wave_for_mega_moe_sm90(
     const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms) {
     // SM90 (Hopper) wave heuristic.
     //
-    // For low-batch decode workloads we observed that the SM100 generic heuristic
-    // (which packs ~`kImbalanceFactor * num_sms` blocks into a wave) creates
-    // unnecessary wave boundaries: e.g. with block_m=64, IH=2048, num_topk=8,
-    // num_experts_per_rank=32 the heuristic returns 8 experts/wave => 4 waves,
-    // even though there is barely any per-expert work to overlap. Each wave
-    // boundary triggers a full L1->L2 transition with `set_expert_idx` rewinds,
-    // workspace re-reads, and per-stage barrier resets that don't shrink with
-    // batch size.
+    // The SM100 generic heuristic packs roughly `kImbalanceFactor * num_sms`
+    // blocks into a wave. On the SM90 block_m=64 decode path this helps only
+    // when each active expert has enough tokens to benefit from narrower waves,
+    // but not enough work to amortize one giant all-expert wave. Keep the
+    // single-wave schedule for very sparse routing and the upper end of the
+    // block_m=64 band where extra wave boundaries start to cost more than they
+    // save.
     //
-    // On SM90 we prefer a single-wave schedule whenever per-expert work is so
-    // small that even a single wave doesn't oversubscribe the SMs (block_m=64
-    // path = the small-batch heuristic band). When per-expert work is large
-    // (block_m > 64) we fall back to the generic heuristic.
-    if (block_m == 64) {
+    // `DG_SM90_MEGA_MOE_BLOCK64_GENERIC_WAVES=1` keeps the broader experimental
+    // mode for profiling.
+    const float expected_tokens_per_expert =
+        static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
+    if (block_m == 64 and
+        not get_env<int>("DG_SM90_MEGA_MOE_BLOCK64_GENERIC_WAVES", 0) and
+        (expected_tokens_per_expert < 1.0f or expected_tokens_per_expert > 4.0f)) {
         return num_experts_per_rank;
     }
+    const int imbalance_factor = block_m > 64
+        ? get_env<int>("DG_SM90_MEGA_MOE_LARGE_WAVE_IMBALANCE_FACTOR", 2) : 2;
     return get_num_experts_per_wave_for_mega_moe(
         num_experts_per_rank, num_tokens, num_topk,
-        intermediate_hidden, block_m, block_n, num_sms);
+        intermediate_hidden, block_m, block_n, num_sms,
+        imbalance_factor);
 }
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
@@ -363,10 +384,12 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     // SF on SM90:
     //   * SFA per stage must hold the larger of L1 (BLOCK_M floats, per-128 K)
     //     and L2 (2 * BLOCK_M floats, per-64 K), aligned to 128 bytes
-    //   * SFB is loaded directly from global by the math warpgroup (block-(128,128)
-    //     weight quantization), so no SMEM is reserved for it.
+    //   * SFB normally loads directly from global by the math warpgroup.  An
+    //     experimental env-gated path stages the 1-2 block-(128,128) weight SF
+    //     scalars in SMEM from the B-loader warp.
     const int smem_sfa_per_stage = align(2 * block_m * static_cast<int>(sizeof(float)), 128);
-    const int smem_sfb_per_stage = 0;
+    const int smem_sfb_per_stage = get_env<int>("DG_SM90_MEGA_MOE_SFB_SMEM", 0) ?
+        align(2 * static_cast<int>(sizeof(float)), 128) : 0;
 
     // Per-stage: A tile + B tile + SFA tile + SFB tile
     const int smem_per_stage = block_m * block_k + block_n * block_k +

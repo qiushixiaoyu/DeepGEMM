@@ -1,0 +1,31 @@
+SM90 MegaMoE test plan: 28 scenarios across layers [1, 2, 3, 4] on 8 ranks
+  [L1.smoke                        ] diff=0.0006 (tol=0.07) OK
+  [L2.heur.small.t64               ] diff=0.0006 (tol=0.07) OK
+  [L2.heur.midA.t256               ] diff=0.0006 (tol=0.07) OK
+  [L2.heur.midB.t512               ] diff=0.0006 (tol=0.07) OK
+  [L2.heur.large.t2048             ] diff=0.0006 (tol=0.07) OK
+  [L3.h512_ih512_k1                ] diff=0.0006 (tol=0.07) OK
+  [L3.h512_ih512_k2                ] diff=0.0006 (tol=0.07) OK
+  [L3.h512_ih512_k4                ] diff=0.0006 (tol=0.07) OK
+  [L3.h512_ih2048_k1               ] diff=0.0006 (tol=0.07) OK
+  [L3.h512_ih2048_k2               ] diff=0.0006 (tol=0.07) OK
+  [L3.h512_ih2048_k4               ] diff=0.0006 (tol=0.07) OK
+  [L3.h2048_ih512_k1               ] diff=0.0006 (tol=0.07) OK
+  [L3.h2048_ih512_k2               ] diff=0.0006 (tol=0.07) OK
+  [L3.h2048_ih512_k4               ] diff=0.0006 (tol=0.07) OK
+  [L3.h2048_ih2048_k1              ] diff=0.0006 (tol=0.07) OK
+  [L3.h2048_ih2048_k2              ] diff=0.0006 (tol=0.07) OK
+  [L3.h2048_ih2048_k4              ] diff=0.0006 (tol=0.07) OK
+  [L4.mask0.0                      ] diff=0.0006 (tol=0.07) OK
+  [L4.mask0.3                      ] diff=0.0006 (tol=0.07) OK
+  [L4.mask0.7                      ] diff=0.0006 (tol=0.07) OK
+  [L4.mask_all                     ] diff=0.0000 (tol=0.07) OK
+  [L4.clamp1.0                     ] diff=0.0006 (tol=0.07) OK
+  [L4.clamp10.0                    ] diff=0.0006 (tol=0.07) OK
+  [L4.clampinf                     ] diff=0.0006 (tol=0.07) OK
+  [L4.fm1                          ] diff=0.0006 (tol=0.07) OK
+  [L4.fm0                          ] diff=0.0006 (tol=0.07) OK
+  [L4.tokens0                      ] diff=0.0000 (tol=0.07) OK
+  [L4.tokens_max                   ] diff=0.0006 (tol=0.07) OK
+
+PASSED all 28 scenarios
