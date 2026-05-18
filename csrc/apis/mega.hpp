@@ -41,6 +41,8 @@ get_symm_buffer_size_for_mega_moe(
     const auto bf16_token_layout = layout::Data(hidden * 2);
     const auto fp8_intermediate_token_layout = layout::Data(intermediate_hidden);
     const auto fp8_sf_layout = layout::Data(hidden / 32);
+    const bool sm90_l2_act_sf_per128 =
+        is_sm90 and get_env<int>("DG_SM90_MEGA_MOE_L2_ACT_SF_PER128", 0) != 0;
     // L2 acts SF granularity differs by arch:
     //   * SM100 packs 4 UE8M0 bytes per int along K, so each token uses
     //     `intermediate_hidden / 32` bytes (per-32 K).
@@ -48,8 +50,16 @@ get_symm_buffer_size_for_mega_moe(
     //     produces 64 post-SwiGLU columns) can write its own SF independently
     //     without cross-CTA amax synchronisation; bytes per token become
     //     `intermediate_hidden / 64 * sizeof(float) = intermediate_hidden / 16`.
+    //     The per-128 experiment keeps raw per-64 SF columns plus final per-128
+    //     SF columns in the same MN-major buffer.
+    const int sm90_l2_act_sf_cols =
+        sm90_l2_act_sf_per128
+            ? (intermediate_hidden / 64 + intermediate_hidden / 128)
+            : (intermediate_hidden / 64);
     const int fp8_intermediate_sf_bytes_per_token =
-        is_sm90 ? (intermediate_hidden / 16) : (intermediate_hidden / 32);
+        is_sm90
+            ? (deep_gemm::align(sm90_l2_act_sf_cols, 4) * static_cast<int>(sizeof(float)))
+            : (intermediate_hidden / 32);
     const auto fp8_intermediate_sf_layout = layout::Data(fp8_intermediate_sf_bytes_per_token);
     const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
     const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
@@ -145,7 +155,7 @@ get_symm_buffer_size_for_mega_moe(
             torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
         auto l2_acts_sf = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l2_sf_buffer.base)),
-            {num_max_padded_sf_pool_tokens, is_sm90 ? intermediate_hidden / 64 : intermediate_hidden / 128},
+            {num_max_padded_sf_pool_tokens, is_sm90 ? sm90_l2_act_sf_cols : intermediate_hidden / 128},
             {1, num_max_padded_sf_pool_tokens},
             torch::TensorOptions().dtype(sf_dtype).device(buffer.device()));
         return std::make_tuple(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
@@ -264,7 +274,8 @@ static void fp8_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const std::optional<torch::Tensor>& stage_profile = std::nullopt
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -320,6 +331,14 @@ static void fp8_mega_moe(
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
     }
+    uint64_t* stage_profile_ptr = nullptr;
+    if (stage_profile.has_value()) {
+        DG_HOST_ASSERT(stage_profile->scalar_type() == torch::kInt64);
+        DG_HOST_ASSERT(stage_profile->is_cuda());
+        DG_HOST_ASSERT(stage_profile->is_contiguous());
+        DG_HOST_ASSERT(stage_profile->numel() >= 32 + 256 * 40);
+        stage_profile_ptr = reinterpret_cast<uint64_t*>(stage_profile->data_ptr<int64_t>());
+    }
 
     // Check buffer bytes
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
@@ -346,7 +365,8 @@ static void fp8_mega_moe(
                      num_experts_per_rank,
                      num_tokens, num_topk,
                      hidden, intermediate_hidden,
-                     activation_clamp, fast_math);
+                     activation_clamp, fast_math,
+                     stage_profile_ptr);
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();

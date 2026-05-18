@@ -1,0 +1,19 @@
+SM90 MegaMoE test plan: 1 scenarios across layers [1] on 2 ranks
+MegaMoESM90Config(num_ranks=2, num_experts=8, hidden=512, intermediate_hidden=512, num_max_tokens_per_rank=384, num_tokens=64, num_topk=2): MegaMoESM90Config(block_m=64, block_n=128, block_k=128, cluster_size=1, num_max_pool_tokens=2304, num_padded_sf_pool_tokens=36864, swizzle_acts_mode=128, swizzle_weights_mode=128, num_experts_per_wave=4, num_stages=3, smem_size=94864, num_dispatch_threads=128, num_non_epilogue_threads=128, num_epilogue_threads=128)
+MegaMoESM90Config(num_ranks=2, num_experts=8, hidden=512, intermediate_hidden=512, num_max_tokens_per_rank=384, num_tokens=64, num_topk=2): MegaMoESM90Config(block_m=64, block_n=128, block_k=128, cluster_size=1, num_max_pool_tokens=2304, num_padded_sf_pool_tokens=36864, swizzle_acts_mode=128, swizzle_weights_mode=128, num_experts_per_wave=4, num_stages=3, smem_size=94864, num_dispatch_threads=128, num_non_epilogue_threads=128, num_epilogue_threads=128)
+Making TMA desc: global memory: 512 2304, shared memory: 128 64, outer stride: 512, swizzle: 128 (base: 0), elem size: 1, pointer: 453010267968
+Making TMA desc: global memory: 36864 4, shared memory: 64 1, outer stride: 36864, swizzle: 0 (base: 0), elem size: 4, pointer: 453011447616
+Making TMA desc: global memory: 512 4096, shared memory: 128 128, outer stride: 512, swizzle: 128 (base: 0), elem size: 1, pointer: 140668475277312
+Making TMA desc: global memory: 512 2304, shared memory: 64 64, outer stride: 512, swizzle: 0 (base: 0), elem size: 1, pointer: 453012046656
+Making TMA desc: global memory: 512 2304, shared memory: 128 64, outer stride: 512, swizzle: 128 (base: 0), elem size: 1, pointer: 453012046656
+Making TMA desc: global memory: 36864 8, shared memory: 64 1, outer stride: 36864, swizzle: 0 (base: 0), elem size: 4, pointer: 453013226304
+Making TMA desc: global memory: 512 2048, shared memory: 128 128, outer stride: 512, swizzle: 128 (base: 0), elem size: 1, pointer: 43210022912
+SM90FP8MegaMoE active_sms=78 launch_ctas=156 cta_multiplier=2 physical_sms=78 num_tokens=64 num_topk=2 block_m=64
+Making TMA desc: global memory: 512 2304, shared memory: 128 64, outer stride: 512, swizzle: 128 (base: 0), elem size: 1, pointer: 453010267968
+Making TMA desc: global memory: 36864 4, shared memory: 64 1, outer stride: 36864, swizzle: 0 (base: 0), elem size: 4, pointer: 453011447616
+Making TMA desc: global memory: 512 4096, shared memory: 128 128, outer stride: 512, swizzle: 128 (base: 0), elem size: 1, pointer: 139833607454720
+Making TMA desc: global memory: 512 2304, shared memory: 64 64, outer stride: 512, swizzle: 0 (base: 0), elem size: 1, pointer: 453012046656
+Making TMA desc: global memory: 512 2304, shared memory: 128 64, outer stride: 512, swizzle: 128 (base: 0), elem size: 1, pointer: 453012046656
+Making TMA desc: global memory: 36864 8, shared memory: 64 1, outer stride: 36864, swizzle: 0 (base: 0), elem size: 4, pointer: 453013226304
+Making TMA desc: global memory: 512 2048, shared memory: 128 128, outer stride: 512, swizzle: 128 (base: 0), elem size: 1, pointer: 43210022912
+SM90FP8MegaMoE active_sms=78 launch_ctas=156 cta_multiplier=2 physical_sms=78 num_tokens=64 num_topk=2 block_m=64

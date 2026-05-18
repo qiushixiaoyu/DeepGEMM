@@ -1,0 +1,98 @@
+SM90 MegaMoE test plan: 1 scenarios across layers [1] on 2 ranks
+MegaMoESM90Config(num_ranks=2, num_experts=8, hidden=512, intermediate_hidden=512, num_max_tokens_per_rank=384, num_tokens=64, num_topk=2): MegaMoESM90Config(block_m=64, block_n=128, block_k=128, cluster_size=1, num_max_pool_tokens=2304, num_padded_sf_pool_tokens=36864, swizzle_acts_mode=128, swizzle_weights_mode=128, num_experts_per_wave=4, num_stages=8, smem_size=220384, num_dispatch_threads=128, num_non_epilogue_threads=128, num_epilogue_threads=128)
+MegaMoESM90Config(num_ranks=2, num_experts=8, hidden=512, intermediate_hidden=512, num_max_tokens_per_rank=384, num_tokens=64, num_topk=2): MegaMoESM90Config(block_m=64, block_n=128, block_k=128, cluster_size=1, num_max_pool_tokens=2304, num_padded_sf_pool_tokens=36864, swizzle_acts_mode=128, swizzle_weights_mode=128, num_experts_per_wave=4, num_stages=8, smem_size=220384, num_dispatch_threads=128, num_non_epilogue_threads=128, num_epilogue_threads=128)
+Making TMA desc: global memory: 512 2304, shared memory: 128 64, outer stride: 512, swizzle: 128 (base: 0), elem size: 1, pointer: 453010267968
+Making TMA desc: global memory: 36864 4, shared memory: 64 1, outer stride: 36864, swizzle: 0 (base: 0), elem size: 4, pointer: 453011447616
+Making TMA desc: global memory: 512 4096, shared memory: 128 128, outer stride: 512, swizzle: 128 (base: 0), elem size: 1, pointer: 140496005496832
+Making TMA desc: global memory: 512 2304, shared memory: 64 64, outer stride: 512, swizzle: 0 (base: 0), elem size: 1, pointer: 453012046656
+Making TMA desc: global memory: 512 2304, shared memory: 128 64, outer stride: 512, swizzle: 128 (base: 0), elem size: 1, pointer: 453012046656
+Making TMA desc: global memory: 36864 8, shared memory: 64 1, outer stride: 36864, swizzle: 0 (base: 0), elem size: 4, pointer: 453013226304
+Making TMA desc: global memory: 512 2048, shared memory: 128 128, outer stride: 512, swizzle: 128 (base: 0), elem size: 1, pointer: 43210022912
+SM90FP8MegaMoE active_sms=78 physical_sms=78 num_tokens=64 num_topk=2 block_m=64
+Making TMA desc: global memory: 512 2304, shared memory: 128 64, outer stride: 512, swizzle: 128 (base: 0), elem size: 1, pointer: 453010267968
+Making TMA desc: global memory: 36864 4, shared memory: 64 1, outer stride: 36864, swizzle: 0 (base: 0), elem size: 4, pointer: 453011447616
+Making TMA desc: global memory: 512 4096, shared memory: 128 128, outer stride: 512, swizzle: 128 (base: 0), elem size: 1, pointer: 140076038225920
+Making TMA desc: global memory: 512 2304, shared memory: 64 64, outer stride: 512, swizzle: 0 (base: 0), elem size: 1, pointer: 453012046656
+Making TMA desc: global memory: 512 2304, shared memory: 128 64, outer stride: 512, swizzle: 128 (base: 0), elem size: 1, pointer: 453012046656
+Making TMA desc: global memory: 36864 8, shared memory: 64 1, outer stride: 36864, swizzle: 0 (base: 0), elem size: 4, pointer: 453013226304
+Making TMA desc: global memory: 512 2048, shared memory: 128 128, outer stride: 512, swizzle: 128 (base: 0), elem size: 1, pointer: 43210022912
+SM90FP8MegaMoE active_sms=78 physical_sms=78 num_tokens=64 num_topk=2 block_m=64
+  [L1.smoke                        ] diff=0.0006 (tol=0.07) OK
+
+PASSED all 1 scenarios
+Generated kernel code:
+// Includes' hash value: 2be15abd20262f4cd2d8f4dbc4979864
+
+    // wave_v2_active_sms_v1_dbg_trace_v17_sync_profile_detail (bump to invalidate JIT cache when sm90_fp8_mega_moe.cuh changes)
+    #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {
+    auto ptr = reinterpret_cast<void*>(&sm90_fp8_mega_moe_impl<
+        384,
+        512, 512,
+        8, 2,
+        4,
+        64, 128, 128,
+        2304,
+        36864,
+        8,
+        128, 128, 128,
+        78, 2,
+        0x1.4p+3f,
+        true
+    >);
+};
+    
+Create directory: /root/.deep_gemm/tmp/325392-0b7c37c6-f87976c9-3c01a1d2
+Running NVCC command: cd /root/.deep_gemm/tmp && /usr/local/cuda/bin/nvcc /root/.deep_gemm/tmp/325392-0b7c37c6-f87976c9-3c01a1d2/kernel.cu -cubin -o /root/.deep_gemm/tmp/325392-0b7c37c6-f87976c9-3c01a1d2/kernel.cubin -std=c++20 --diag-suppress=39,161,174,177,186,940 --ptxas-options=--register-usage-level=10 --ptxas-options=--verbose,--warn-on-local-memory-usage -I/workspace/DeepGEMM/deep_gemm/include --gpu-architecture=sm_90a --compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi -O3 --expt-relaxed-constexpr --expt-extended-lambda
+ptxas info    : (C7510) Potential Performance Loss: wgmma.mma_async instructions are serialized due to wgmma pipeline crossing function boundary at a function call in the function '_ZN9deep_gemm22sm90_fp8_mega_moe_implILj384ELj512ELj512ELj8ELj2ELj4ELj64ELj128ELj128ELj2304ELj36864ELj8ELj128ELj128ELj128ELj78ELj2ELf41200000ELb1ELj1024ELj512ELj512ELj512ELj4ELj4ELj4ELj1ELj384ELj16ELj4EEEvPvPijNS_6layout9SymBufferIXT15_EEE14CUtensorMap_stS6_S6_PKfS6_S6_S6_S6_S8_Pm'
+ptxas warning : Local memory used for function '_ZN9deep_gemm22sm90_fp8_mega_moe_implILj384ELj512ELj512ELj8ELj2ELj4ELj64ELj128ELj128ELj2304ELj36864ELj8ELj128ELj128ELj128ELj78ELj2ELf41200000ELb1ELj1024ELj512ELj512ELj512ELj4ELj4ELj4ELj1ELj384ELj16ELj4EEEvPvPijNS_6layout9SymBufferIXT15_EEE14CUtensorMap_stS6_S6_PKfS6_S6_S6_S6_S8_Pm', size of stack frame: 56 bytes
+ptxas info    : 474 bytes gmem
+ptxas info    : Compiling entry function '_ZN9deep_gemm22sm90_fp8_mega_moe_implILj384ELj512ELj512ELj8ELj2ELj4ELj64ELj128ELj128ELj2304ELj36864ELj8ELj128ELj128ELj128ELj78ELj2ELf41200000ELb1ELj1024ELj512ELj512ELj512ELj4ELj4ELj4ELj1ELj384ELj16ELj4EEEvPvPijNS_6layout9SymBufferIXT15_EEE14CUtensorMap_stS6_S6_PKfS6_S6_S6_S6_S8_Pm' for 'sm_90a'
+ptxas info    : Function properties for _ZN9deep_gemm22sm90_fp8_mega_moe_implILj384ELj512ELj512ELj8ELj2ELj4ELj64ELj128ELj128ELj2304ELj36864ELj8ELj128ELj128ELj128ELj78ELj2ELf41200000ELb1ELj1024ELj512ELj512ELj512ELj4ELj4ELj4ELj1ELj384ELj16ELj4EEEvPvPijNS_6layout9SymBufferIXT15_EEE14CUtensorMap_stS6_S6_PKfS6_S6_S6_S6_S8_Pm
+    56 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 16 barriers, 56 bytes cumulative stack size
+ptxas info    : Compile time = 248.632 ms
+Loading CUBIN: /root/.deep_gemm/cache/kernel.sm90_fp8_mega_moe.2fda74fe934bd4b1f0c9eda00aff01a0/kernel.cubin
+Load time (/root/.deep_gemm/cache/kernel.sm90_fp8_mega_moe.2fda74fe934bd4b1f0c9eda00aff01a0): 0.44 ms
+Launch kernel with {78, 1} x 384, shared memory: 220384 bytes, cluster: 1, pdl: 0, stream: 0
+Generated kernel code:
+// Includes' hash value: 2be15abd20262f4cd2d8f4dbc4979864
+
+    // wave_v2_active_sms_v1_dbg_trace_v17_sync_profile_detail (bump to invalidate JIT cache when sm90_fp8_mega_moe.cuh changes)
+    #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {
+    auto ptr = reinterpret_cast<void*>(&sm90_fp8_mega_moe_impl<
+        384,
+        512, 512,
+        8, 2,
+        4,
+        64, 128, 128,
+        2304,
+        36864,
+        8,
+        128, 128, 128,
+        78, 2,
+        0x1.4p+3f,
+        true
+    >);
+};
+    
+Create directory: /root/.deep_gemm/tmp/325393-962e4c14-b1f021e4-c9eb38cf
+Running NVCC command: cd /root/.deep_gemm/tmp && /usr/local/cuda/bin/nvcc /root/.deep_gemm/tmp/325393-962e4c14-b1f021e4-c9eb38cf/kernel.cu -cubin -o /root/.deep_gemm/tmp/325393-962e4c14-b1f021e4-c9eb38cf/kernel.cubin -std=c++20 --diag-suppress=39,161,174,177,186,940 --ptxas-options=--register-usage-level=10 --ptxas-options=--verbose,--warn-on-local-memory-usage -I/workspace/DeepGEMM/deep_gemm/include --gpu-architecture=sm_90a --compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi -O3 --expt-relaxed-constexpr --expt-extended-lambda
+ptxas info    : (C7510) Potential Performance Loss: wgmma.mma_async instructions are serialized due to wgmma pipeline crossing function boundary at a function call in the function '_ZN9deep_gemm22sm90_fp8_mega_moe_implILj384ELj512ELj512ELj8ELj2ELj4ELj64ELj128ELj128ELj2304ELj36864ELj8ELj128ELj128ELj128ELj78ELj2ELf41200000ELb1ELj1024ELj512ELj512ELj512ELj4ELj4ELj4ELj1ELj384ELj16ELj4EEEvPvPijNS_6layout9SymBufferIXT15_EEE14CUtensorMap_stS6_S6_PKfS6_S6_S6_S6_S8_Pm'
+ptxas warning : Local memory used for function '_ZN9deep_gemm22sm90_fp8_mega_moe_implILj384ELj512ELj512ELj8ELj2ELj4ELj64ELj128ELj128ELj2304ELj36864ELj8ELj128ELj128ELj128ELj78ELj2ELf41200000ELb1ELj1024ELj512ELj512ELj512ELj4ELj4ELj4ELj1ELj384ELj16ELj4EEEvPvPijNS_6layout9SymBufferIXT15_EEE14CUtensorMap_stS6_S6_PKfS6_S6_S6_S6_S8_Pm', size of stack frame: 56 bytes
+ptxas info    : 474 bytes gmem
+ptxas info    : Compiling entry function '_ZN9deep_gemm22sm90_fp8_mega_moe_implILj384ELj512ELj512ELj8ELj2ELj4ELj64ELj128ELj128ELj2304ELj36864ELj8ELj128ELj128ELj128ELj78ELj2ELf41200000ELb1ELj1024ELj512ELj512ELj512ELj4ELj4ELj4ELj1ELj384ELj16ELj4EEEvPvPijNS_6layout9SymBufferIXT15_EEE14CUtensorMap_stS6_S6_PKfS6_S6_S6_S6_S8_Pm' for 'sm_90a'
+ptxas info    : Function properties for _ZN9deep_gemm22sm90_fp8_mega_moe_implILj384ELj512ELj512ELj8ELj2ELj4ELj64ELj128ELj128ELj2304ELj36864ELj8ELj128ELj128ELj128ELj78ELj2ELf41200000ELb1ELj1024ELj512ELj512ELj512ELj4ELj4ELj4ELj1ELj384ELj16ELj4EEEvPvPijNS_6layout9SymBufferIXT15_EEE14CUtensorMap_stS6_S6_PKfS6_S6_S6_S6_S8_Pm
+    56 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 168 registers, used 16 barriers, 56 bytes cumulative stack size
+ptxas info    : Compile time = 255.579 ms
+Loading CUBIN: /root/.deep_gemm/cache/kernel.sm90_fp8_mega_moe.2fda74fe934bd4b1f0c9eda00aff01a0/kernel.cubin
+Load time (/root/.deep_gemm/cache/kernel.sm90_fp8_mega_moe.2fda74fe934bd4b1f0c9eda00aff01a0): 0.37 ms
+Launch kernel with {78, 1} x 384, shared memory: 220384 bytes, cluster: 1, pdl: 0, stream: 0

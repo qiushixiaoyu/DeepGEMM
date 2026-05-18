@@ -405,10 +405,17 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     // Fixed total
     const int smem_fixed = smem_dispatch_size + smem_cd + smem_barriers_fixed;
 
-    // Select max num_stages
-    const int num_stages = (smem_capacity - smem_fixed) /
-                           (smem_per_stage + smem_barriers_per_stage);
-    DG_HOST_ASSERT(num_stages >= 2);
+    // Select max num_stages by default. For SM90 large-batch profiling we also
+    // allow forcing a smaller stage ring to test whether the 1 CTA/SM pipeline
+    // is over-buffered enough to hurt producer/consumer cadence.
+    const int max_num_stages = (smem_capacity - smem_fixed) /
+                               (smem_per_stage + smem_barriers_per_stage);
+    DG_HOST_ASSERT(max_num_stages >= 2);
+    const int forced_num_stages = get_env<int>("DG_SM90_MEGA_MOE_FORCE_NUM_STAGES", 0);
+    if (forced_num_stages > 0) {
+        DG_HOST_ASSERT(forced_num_stages >= 2 and forced_num_stages <= max_num_stages);
+    }
+    const int num_stages = forced_num_stages > 0 ? forced_num_stages : max_num_stages;
     return {num_stages,
             smem_fixed + num_stages * (smem_per_stage + smem_barriers_per_stage)};
 }

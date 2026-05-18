@@ -1,0 +1,25 @@
+===== force_stages=3 smoke =====
+SM90 MegaMoE test plan: 1 scenarios across layers [1] on 2 ranks
+  [L1.smoke                        ] diff=0.0006 (tol=0.07) OK
+
+PASSED all 1 scenarios
+===== force_stages=4 smoke =====
+SM90 MegaMoE test plan: 1 scenarios across layers [1] on 2 ranks
+  [L1.smoke                        ] diff=0.0006 (tol=0.07) OK
+
+PASSED all 1 scenarios
+===== force_stages=5 smoke =====
+SM90 MegaMoE test plan: 1 scenarios across layers [1] on 2 ranks
+  [L1.smoke                        ] diff=0.0006 (tol=0.07) OK
+
+PASSED all 1 scenarios
+===== force_stages=6 smoke =====
+SM90 MegaMoE test plan: 1 scenarios across layers [1] on 2 ranks
+  [L1.smoke                        ] diff=0.0006 (tol=0.07) OK
+
+PASSED all 1 scenarios
+===== force_stages=7 smoke =====
+SM90 MegaMoE test plan: 1 scenarios across layers [1] on 2 ranks
+  [L1.smoke                        ] diff=0.0006 (tol=0.07) OK
+
+PASSED all 1 scenarios

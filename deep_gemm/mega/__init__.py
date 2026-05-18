@@ -162,7 +162,8 @@ def fp8_mega_moe(y: torch.Tensor,
                  recipe: Tuple[int, int, int] = (128, 128, 128),
                  activation: str = 'swiglu',
                  activation_clamp: Optional[float] = None,
-                 fast_math: bool = True):
+                 fast_math: bool = True,
+                 stage_profile: Optional[torch.Tensor] = None):
     """SM90 (Hopper) MegaMoE entry point.
 
     Expects FP8 e4m3 weights and block-(128, 128) float scale factors. The
@@ -180,5 +181,6 @@ def fp8_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
         activation, activation_clamp,
-        fast_math
+        fast_math,
+        stage_profile
     )

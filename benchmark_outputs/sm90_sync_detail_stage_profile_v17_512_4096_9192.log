@@ -1,0 +1,138 @@
+===== sync-detail-stage-profile batch=512 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 512/512
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-64 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: enabled
+ > Buffer: 0.455 GiB
+
+Performance:
+ > kind       EP    recv_tokens active_experts | compute(TFLOPS) HBM(GB/s) NVL(GB/s)  time(us) reduction(us) speedup
+ > [fused]     0/8          3074             32 |             127       702        31      1225           4.5                     -
+ > [fused]     3/8          3092             32 |             128       702        31      1225           4.5                     -
+ > [fused]     4/8          3048             32 |             126       701        31      1226           4.5                     -
+ > [fused]     7/8          3038             32 |             125       702        31      1225           4.5                     -
+ > [fused]     1/8          3113             32 |             128       703        32      1225           4.5                     -
+ > [fused]     6/8          3145             32 |             130       703        32      1225           4.5                     -
+ > [fused]     2/8          3029             32 |             125       701        31      1226           4.5                     -
+ > [fused]     5/8          3037             32 |             125       702        31      1225           4.5                     -
+ > [baseline]  0/8          3074             32 |             126       698        31      1228             -   1.00x fused faster
+ > [baseline]  1/8          3113             32 |             128       700        32      1226             -   1.00x fused faster
+ > [baseline]  2/8          3029             32 |             124       698        31      1226             -   1.00x fused faster
+ > [baseline]  3/8          3092             32 |             127       699        31      1227             -   1.00x fused faster
+ > [baseline]  7/8          3038             32 |             124       697        31      1229             -   1.00x fused faster
+ > [baseline]  4/8          3048             32 |             125       698        31      1227             -   1.00x fused faster
+ > [baseline]  6/8          3145             32 |             129       700        32      1227             -   1.00x fused faster
+ > [baseline]  5/8          3037             32 |             125       700        31      1224             -   1.00x baseline faster
+Stage profile:
+ > [stage-profile] rank= 0 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=1225.0us crit_est=1115.1us | max_cta math=1096.1us L1=725.8us(659.5+66.3) L2=384.3us(322.3+62.0) combine=9.9us barrier=35.1us sync=1.9us | dispatch=1130.8us pull=58.2us prod_wait(L1/L2)=23.8/5.9us | sync_detail full=85.0us(7.6%) wgmma=1.7us(0.2%) L1(wg/tma/full)=0.2/1.9/0.0us L2(wg/full)=0.2/21.8us sync_pct(L1/L2)=0.1/3.0% | agg_math L1=65.2% L2=34.8% epi(L1/L2)=8.0/15.5%
+ > [stage-profile] rank= 1 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=1225.0us crit_est=1115.8us | max_cta math=1096.7us L1=728.7us(661.0+67.6) L2=382.5us(321.2+61.3) combine=10.0us barrier=34.4us sync=6.5us | dispatch=1177.6us pull=60.2us prod_wait(L1/L2)=23.4/6.1us | sync_detail full=84.9us(7.7%) wgmma=1.7us(0.2%) L1(wg/tma/full)=0.2/1.8/0.0us L2(wg/full)=0.2/21.1us sync_pct(L1/L2)=0.1/2.5% | agg_math L1=65.3% L2=34.7% epi(L1/L2)=8.1/15.6%
+ > [stage-profile] rank= 2 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=1226.0us crit_est=1115.2us | max_cta math=1090.6us L1=719.9us(655.1+64.8) L2=386.2us(322.9+63.2) combine=10.0us barrier=37.4us sync=9.9us | dispatch=1179.4us pull=51.7us prod_wait(L1/L2)=20.4/6.3us | sync_detail full=81.6us(7.5%) wgmma=1.7us(0.2%) L1(wg/tma/full)=0.2/1.9/0.0us L2(wg/full)=0.2/23.0us sync_pct(L1/L2)=0.1/2.8% | agg_math L1=65.2% L2=34.8% epi(L1/L2)=8.1/15.5%
+ > [stage-profile] rank= 3 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=1225.0us crit_est=1121.3us | max_cta math=1070.6us L1=698.0us(634.5+63.5) L2=375.5us(310.4+65.1) combine=9.8us barrier=59.1us sync=36.4us | dispatch=1123.5us pull=51.3us prod_wait(L1/L2)=21.7/6.6us | sync_detail full=81.2us(7.5%) wgmma=1.7us(0.2%) L1(wg/tma/full)=0.2/1.8/0.0us L2(wg/full)=0.2/21.2us sync_pct(L1/L2)=0.1/2.7% | agg_math L1=65.2% L2=34.8% epi(L1/L2)=8.0/15.5%
+ > [stage-profile] rank= 4 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=1226.0us crit_est=1111.6us | max_cta math=1091.9us L1=724.3us(658.8+65.5) L2=384.1us(322.8+61.3) combine=9.7us barrier=35.6us sync=7.5us | dispatch=1171.1us pull=53.5us prod_wait(L1/L2)=21.6/6.2us | sync_detail full=83.2us(7.5%) wgmma=1.7us(0.2%) L1(wg/tma/full)=0.2/1.9/0.0us L2(wg/full)=0.2/23.1us sync_pct(L1/L2)=0.1/2.7% | agg_math L1=65.2% L2=34.8% epi(L1/L2)=8.0/15.4%
+ > [stage-profile] rank= 5 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=1225.0us crit_est=1117.6us | max_cta math=1093.3us L1=722.1us(657.5+64.5) L2=384.4us(322.7+61.7) combine=9.9us barrier=40.1us sync=11.6us | dispatch=1124.9us pull=56.2us prod_wait(L1/L2)=22.3/6.3us | sync_detail full=83.4us(7.6%) wgmma=1.7us(0.2%) L1(wg/tma/full)=0.2/1.9/0.0us L2(wg/full)=0.2/22.3us sync_pct(L1/L2)=0.1/3.1% | agg_math L1=65.3% L2=34.7% epi(L1/L2)=7.8/15.4%
+ > [stage-profile] rank= 6 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=1225.0us crit_est=1112.3us | max_cta math=1093.5us L1=724.4us(658.4+66.0) L2=384.8us(322.4+62.4) combine=10.1us barrier=32.7us sync=4.2us | dispatch=1122.6us pull=55.6us prod_wait(L1/L2)=22.8/6.2us | sync_detail full=84.2us(7.7%) wgmma=1.7us(0.2%) L1(wg/tma/full)=0.2/1.9/0.0us L2(wg/full)=0.2/21.5us sync_pct(L1/L2)=0.1/2.9% | agg_math L1=65.2% L2=34.8% epi(L1/L2)=8.0/15.6%
+ > [stage-profile] rank= 7 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=1225.0us crit_est=1113.0us | max_cta math=1090.8us L1=721.3us(656.5+64.8) L2=383.0us(322.0+61.0) combine=9.8us barrier=35.7us sync=6.3us | dispatch=1177.4us pull=52.9us prod_wait(L1/L2)=20.5/6.2us | sync_detail full=80.3us(7.4%) wgmma=1.7us(0.2%) L1(wg/tma/full)=0.2/1.8/0.0us L2(wg/full)=0.2/21.3us sync_pct(L1/L2)=0.1/3.2% | agg_math L1=65.2% L2=34.8% epi(L1/L2)=7.9/15.4%
+Baseline stage profile (single event-timed call, ms):
+ > [baseline-stage] rank= 0 dispatch=0.139 l1_gemm=0.655 swiglu=0.125 l2_gemm=0.309 combine=0.110
+ > [baseline-stage] rank= 1 dispatch=0.138 l1_gemm=0.650 swiglu=0.125 l2_gemm=0.307 combine=0.126
+ > [baseline-stage] rank= 2 dispatch=0.137 l1_gemm=0.652 swiglu=0.125 l2_gemm=0.307 combine=0.119
+ > [baseline-stage] rank= 3 dispatch=0.140 l1_gemm=0.655 swiglu=0.123 l2_gemm=0.307 combine=0.120
+ > [baseline-stage] rank= 4 dispatch=0.140 l1_gemm=0.651 swiglu=0.124 l2_gemm=0.305 combine=0.124
+ > [baseline-stage] rank= 5 dispatch=0.141 l1_gemm=0.653 swiglu=0.124 l2_gemm=0.307 combine=0.118
+ > [baseline-stage] rank= 6 dispatch=0.146 l1_gemm=0.657 swiglu=0.125 l2_gemm=0.307 combine=0.104
+ > [baseline-stage] rank= 7 dispatch=0.137 l1_gemm=0.657 swiglu=0.124 l2_gemm=0.306 combine=0.120
+===== sync-detail-stage-profile batch=4096 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 4096/4096
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-64 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: enabled
+ > Buffer: 2.238 GiB
+
+Performance:
+ > kind       EP    recv_tokens active_experts | compute(TFLOPS) HBM(GB/s) NVL(GB/s)  time(us) reduction(us) speedup
+ > [fused]     0/8         24703             32 |             167       164        41      7476          36.1                     -
+ > [fused]     3/8         24503             32 |             166       164        41      7475          36.1                     -
+ > [fused]     4/8         24534             32 |             166       164        41      7475          36.1                     -
+ > [fused]     1/8         24693             32 |             167       164        41      7476          36.1                     -
+ > [fused]     2/8         24480             32 |             166       163        41      7477          36.1                     -
+ > [fused]     6/8         24476             32 |             166       163        41      7474          36.1                     -
+ > [fused]     7/8         24557             32 |             166       164        41      7475          36.1                     -
+ > [fused]     5/8         24662             32 |             167       164        41      7473          36.1                     -
+ > [baseline]  0/8         24703             32 |             180       177        45      6889             -   0.92x baseline faster
+ > [baseline]  2/8         24480             32 |             179       176        44      6892             -   0.92x baseline faster
+ > [baseline]  1/8         24693             32 |             180       177        45      6888             -   0.92x baseline faster
+ > [baseline]  3/8         24503             32 |             179       177        44      6889             -   0.92x baseline faster
+ > [baseline]  4/8         24534             32 |             179       177        44      6891             -   0.92x baseline faster
+ > [baseline]  7/8         24557             32 |             179       177        44      6890             -   0.92x baseline faster
+ > [baseline]  6/8         24476             32 |             179       176        44      6889             -   0.92x baseline faster
+ > [baseline]  5/8         24662             32 |             180       177        44      6889             -   0.92x baseline faster
+Stage profile:
+ > [stage-profile] rank= 0 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=7476.0us crit_est=6853.5us | max_cta math=6692.0us L1=4366.6us(3963.5+403.1) L2=2344.7us(1949.5+395.2) combine=74.9us barrier=92.4us sync=61.9us | dispatch=6829.8us pull=378.2us prod_wait(L1/L2)=54.6/34.1us | sync_detail full=458.1us(6.7%) wgmma=10.7us(0.2%) L1(wg/tma/full)=1.4/11.4/0.2us L2(wg/full)=0.7/29.7us sync_pct(L1/L2)=0.1/1.0% | agg_math L1=64.8% L2=35.2% epi(L1/L2)=8.0/16.4%
+ > [stage-profile] rank= 1 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=7476.0us crit_est=6830.9us | max_cta math=6706.0us L1=4367.9us(3963.2+404.7) L2=2335.7us(1949.2+386.5) combine=74.9us barrier=64.2us sync=47.7us | dispatch=6825.4us pull=392.9us prod_wait(L1/L2)=53.6/33.9us | sync_detail full=457.5us(6.7%) wgmma=10.7us(0.2%) L1(wg/tma/full)=1.4/11.5/0.2us L2(wg/full)=0.7/30.1us sync_pct(L1/L2)=0.1/1.0% | agg_math L1=64.8% L2=35.2% epi(L1/L2)=8.2/16.3%
+ > [stage-profile] rank= 2 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=7477.0us crit_est=6856.7us | max_cta math=6685.6us L1=4364.3us(3960.3+404.0) L2=2334.2us(1947.7+386.5) combine=75.6us barrier=111.4us sync=77.0us | dispatch=6846.1us pull=378.5us prod_wait(L1/L2)=54.1/34.1us | sync_detail full=457.5us(6.7%) wgmma=10.7us(0.2%) L1(wg/tma/full)=1.4/11.5/0.2us L2(wg/full)=0.7/29.7us sync_pct(L1/L2)=0.1/1.0% | agg_math L1=64.8% L2=35.2% epi(L1/L2)=8.1/16.3%
+ > [stage-profile] rank= 3 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=7475.0us crit_est=6841.6us | max_cta math=6643.3us L1=4341.6us(3937.4+404.2) L2=2322.5us(1937.8+384.7) combine=75.1us barrier=136.8us sync=112.8us | dispatch=6786.4us pull=362.6us prod_wait(L1/L2)=53.0/33.5us | sync_detail full=453.7us(6.7%) wgmma=10.6us(0.2%) L1(wg/tma/full)=1.4/11.4/0.2us L2(wg/full)=0.7/29.6us sync_pct(L1/L2)=0.1/0.9% | agg_math L1=64.8% L2=35.2% epi(L1/L2)=8.2/16.3%
+ > [stage-profile] rank= 4 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=7475.0us crit_est=6828.7us | max_cta math=6686.8us L1=4361.7us(3954.2+407.5) L2=2340.4us(1946.3+394.1) combine=74.6us barrier=73.7us sync=58.4us | dispatch=6819.3us pull=375.2us prod_wait(L1/L2)=54.5/33.8us | sync_detail full=457.3us(6.7%) wgmma=10.7us(0.2%) L1(wg/tma/full)=1.4/11.5/0.2us L2(wg/full)=0.7/33.7us sync_pct(L1/L2)=0.1/1.0% | agg_math L1=64.8% L2=35.2% epi(L1/L2)=8.1/16.4%
+ > [stage-profile] rank= 5 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=7473.0us crit_est=6837.3us | max_cta math=6748.6us L1=4394.0us(3985.7+408.2) L2=2358.5us(1963.4+395.1) combine=72.6us barrier=29.8us sync=1.9us | dispatch=6822.6us pull=375.5us prod_wait(L1/L2)=55.1/34.1us | sync_detail full=461.8us(6.8%) wgmma=10.7us(0.2%) L1(wg/tma/full)=1.4/11.5/0.2us L2(wg/full)=0.7/30.6us sync_pct(L1/L2)=0.1/1.0% | agg_math L1=64.8% L2=35.2% epi(L1/L2)=8.3/16.3%
+ > [stage-profile] rank= 6 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=7474.0us crit_est=6848.0us | max_cta math=6639.4us L1=4332.4us(3935.9+396.5) L2=2333.3us(1936.7+396.6) combine=75.6us barrier=139.4us sync=123.9us | dispatch=6796.1us pull=371.6us prod_wait(L1/L2)=52.4/33.7us | sync_detail full=453.9us(6.7%) wgmma=10.6us(0.2%) L1(wg/tma/full)=1.4/11.3/0.2us L2(wg/full)=0.7/30.2us sync_pct(L1/L2)=0.1/1.0% | agg_math L1=64.8% L2=35.2% epi(L1/L2)=7.9/16.5%
+ > [stage-profile] rank= 7 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=7475.0us crit_est=6852.8us | max_cta math=6658.6us L1=4339.4us(3937.0+402.4) L2=2328.4us(1938.8+389.6) combine=74.7us barrier=129.2us sync=111.0us | dispatch=6803.1us pull=362.4us prod_wait(L1/L2)=53.3/33.7us | sync_detail full=454.7us(6.7%) wgmma=10.6us(0.2%) L1(wg/tma/full)=1.4/11.4/0.2us L2(wg/full)=0.7/29.2us sync_pct(L1/L2)=0.1/0.9% | agg_math L1=64.8% L2=35.2% epi(L1/L2)=8.3/16.3%
+Baseline stage profile (single event-timed call, ms):
+ > [baseline-stage] rank= 0 dispatch=0.372 l1_gemm=3.249 swiglu=0.821 l2_gemm=1.666 combine=0.830
+ > [baseline-stage] rank= 1 dispatch=0.375 l1_gemm=3.340 swiglu=0.824 l2_gemm=1.711 combine=0.696
+ > [baseline-stage] rank= 2 dispatch=0.372 l1_gemm=3.325 swiglu=0.822 l2_gemm=1.698 combine=0.729
+ > [baseline-stage] rank= 3 dispatch=0.380 l1_gemm=3.273 swiglu=0.826 l2_gemm=1.681 combine=0.788
+ > [baseline-stage] rank= 4 dispatch=0.376 l1_gemm=3.294 swiglu=0.825 l2_gemm=1.689 combine=0.766
+ > [baseline-stage] rank= 5 dispatch=0.369 l1_gemm=3.305 swiglu=0.822 l2_gemm=1.692 combine=0.755
+ > [baseline-stage] rank= 6 dispatch=0.369 l1_gemm=3.275 swiglu=0.822 l2_gemm=1.680 combine=0.797
+ > [baseline-stage] rank= 7 dispatch=0.370 l1_gemm=3.302 swiglu=0.823 l2_gemm=1.691 combine=0.757
+===== sync-detail-stage-profile batch=9192 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 9192/9192
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-64 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: enabled
+ > Buffer: 4.814 GiB
+
+Performance:
+ > kind       EP    recv_tokens active_experts | compute(TFLOPS) HBM(GB/s) NVL(GB/s)  time(us) reduction(us) speedup
+ > [fused]     0/8         54750             32 |             170       106        42     16335          81.1                     -
+ > [fused]     2/8         55315             32 |             171       107        42     16336          81.1                     -
+ > [fused]     5/8         55288             32 |             171       107        42     16335          81.1                     -
+ > [fused]     7/8         55100             32 |             171       106        42     16336          81.1                     -
+ > [fused]     6/8         55360             32 |             171       107        42     16334          81.1                     -
+ > [fused]     1/8         54874             32 |             170       106        42     16335          81.1                     -
+ > [fused]     4/8         55041             32 |             170       106        42     16335          81.1                     -
+ > [fused]     3/8         55488             32 |             172       107        42     16333          81.1                     -
+ > [baseline]  0/8         54750             32 |             184       115        45     15005             -   0.92x baseline faster
+ > [baseline]  2/8         55315             32 |             186       115        46     15006             -   0.92x baseline faster
+ > [baseline]  4/8         55041             32 |             185       115        46     15004             -   0.92x baseline faster
+ > [baseline]  1/8         54874             32 |             184       115        45     15006             -   0.92x baseline faster
+ > [baseline]  6/8         55360             32 |             186       116        46     15002             -   0.92x baseline faster
+ > [baseline]  5/8         55288             32 |             185       115        46     15005             -   0.92x baseline faster
+ > [baseline]  7/8         55100             32 |             185       115        46     15006             -   0.92x baseline faster
+ > [baseline]  3/8         55488             32 |             186       116        46     15006             -   0.92x baseline faster
+Stage profile:
+ > [stage-profile] rank= 0 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=16335.0us crit_est=14961.1us | max_cta math=14514.6us L1=9449.2us(8562.0+887.2) L2=5075.9us(4224.2+851.7) combine=166.9us barrier=282.6us sync=267.9us | dispatch=14848.4us pull=801.9us prod_wait(L1/L2)=94.8/73.0us | sync_detail full=969.1us(6.6%) wgmma=23.1us(0.2%) L1(wg/tma/full)=3.1/24.5/0.4us L2(wg/full)=1.4/59.6us sync_pct(L1/L2)=0.1/0.8% | agg_math L1=64.8% L2=35.2% epi(L1/L2)=8.2/16.4%
+ > [stage-profile] rank= 1 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=16335.0us crit_est=14940.3us | max_cta math=14565.3us L1=9506.7us(8610.8+895.9) L2=5086.9us(4239.2+847.7) combine=166.7us barrier=222.4us sync=207.3us | dispatch=14830.5us pull=798.1us prod_wait(L1/L2)=94.4/72.9us | sync_detail full=971.8us(6.6%) wgmma=23.2us(0.2%) L1(wg/tma/full)=3.1/24.7/0.4us L2(wg/full)=1.5/61.8us sync_pct(L1/L2)=0.1/0.8% | agg_math L1=64.8% L2=35.2% epi(L1/L2)=8.3/16.4%
+ > [stage-profile] rank= 2 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=16336.0us crit_est=14959.2us | max_cta math=14657.0us L1=9564.9us(8659.3+905.5) L2=5106.1us(4257.4+848.7) combine=166.3us barrier=145.4us sync=130.6us | dispatch=14832.4us pull=808.2us prod_wait(L1/L2)=95.2/73.7us | sync_detail full=977.7us(6.6%) wgmma=23.3us(0.2%) L1(wg/tma/full)=3.1/24.9/0.4us L2(wg/full)=1.5/54.2us sync_pct(L1/L2)=0.1/0.8% | agg_math L1=64.8% L2=35.2% epi(L1/L2)=8.3/16.4%
+ > [stage-profile] rank= 3 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=16333.0us crit_est=14949.5us | max_cta math=14741.5us L1=9613.2us(8703.7+909.5) L2=5146.6us(4286.8+859.8) combine=165.9us barrier=56.4us sync=37.9us | dispatch=14826.4us pull=803.3us prod_wait(L1/L2)=96.0/74.2us | sync_detail full=984.2us(6.6%) wgmma=23.5us(0.2%) L1(wg/tma/full)=3.1/24.9/0.4us L2(wg/full)=1.5/52.1us sync_pct(L1/L2)=0.1/0.8% | agg_math L1=64.8% L2=35.2% epi(L1/L2)=8.1/16.4%
+ > [stage-profile] rank= 4 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=16335.0us crit_est=14947.1us | max_cta math=14600.6us L1=9498.8us(8610.8+888.0) L2=5103.0us(4243.0+860.0) combine=167.3us barrier=187.4us sync=170.0us | dispatch=14807.8us pull=808.7us prod_wait(L1/L2)=93.0/73.2us | sync_detail full=972.3us(6.6%) wgmma=23.2us(0.2%) L1(wg/tma/full)=3.1/24.8/0.4us L2(wg/full)=1.5/56.2us sync_pct(L1/L2)=0.1/0.8% | agg_math L1=64.8% L2=35.2% epi(L1/L2)=8.1/16.4%
+ > [stage-profile] rank= 5 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=16335.0us crit_est=14930.7us | max_cta math=14717.5us L1=9591.0us(8683.3+907.8) L2=5149.6us(4276.7+872.9) combine=163.9us barrier=57.4us sync=18.5us | dispatch=14797.3us pull=838.8us prod_wait(L1/L2)=96.1/74.8us | sync_detail full=981.1us(6.6%) wgmma=23.4us(0.2%) L1(wg/tma/full)=3.1/25.1/0.4us L2(wg/full)=1.5/58.1us sync_pct(L1/L2)=0.1/0.8% | agg_math L1=64.8% L2=35.2% epi(L1/L2)=8.2/16.4%
+ > [stage-profile] rank= 6 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=16334.0us crit_est=14885.2us | max_cta math=14700.8us L1=9583.6us(8679.4+904.2) L2=5132.3us(4277.0+855.3) combine=166.2us barrier=26.2us sync=1.9us | dispatch=14755.6us pull=818.3us prod_wait(L1/L2)=94.6/73.6us | sync_detail full=979.6us(6.6%) wgmma=23.4us(0.2%) L1(wg/tma/full)=3.1/24.8/0.4us L2(wg/full)=1.5/56.3us sync_pct(L1/L2)=0.1/0.8% | agg_math L1=64.8% L2=35.2% epi(L1/L2)=8.2/16.4%
+ > [stage-profile] rank= 7 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=16336.0us crit_est=14940.4us | max_cta math=14653.1us L1=9547.7us(8635.5+912.3) L2=5110.5us(4254.2+856.4) combine=163.9us barrier=135.4us sync=105.3us | dispatch=14890.6us pull=794.5us prod_wait(L1/L2)=97.8/74.3us | sync_detail full=976.9us(6.6%) wgmma=23.3us(0.2%) L1(wg/tma/full)=3.1/24.9/0.4us L2(wg/full)=1.5/50.4us sync_pct(L1/L2)=0.1/0.8% | agg_math L1=64.8% L2=35.2% epi(L1/L2)=8.1/16.4%
+Baseline stage profile (single event-timed call, ms):
+ > [baseline-stage] rank= 0 dispatch=0.741 l1_gemm=7.154 swiglu=1.809 l2_gemm=3.654 combine=1.667
+ > [baseline-stage] rank= 1 dispatch=0.717 l1_gemm=7.170 swiglu=1.811 l2_gemm=3.662 combine=1.662
+ > [baseline-stage] rank= 2 dispatch=0.719 l1_gemm=7.245 swiglu=1.811 l2_gemm=3.702 combine=1.546
+ > [baseline-stage] rank= 3 dispatch=0.734 l1_gemm=7.209 swiglu=1.810 l2_gemm=3.686 combine=1.581
+ > [baseline-stage] rank= 4 dispatch=0.718 l1_gemm=7.190 swiglu=1.811 l2_gemm=3.673 combine=1.624
+ > [baseline-stage] rank= 5 dispatch=0.725 l1_gemm=7.229 swiglu=1.809 l2_gemm=3.684 combine=1.575
+ > [baseline-stage] rank= 6 dispatch=0.720 l1_gemm=7.248 swiglu=1.812 l2_gemm=3.695 combine=1.545
+ > [baseline-stage] rank= 7 dispatch=0.723 l1_gemm=7.144 swiglu=1.807 l2_gemm=3.649 combine=1.704

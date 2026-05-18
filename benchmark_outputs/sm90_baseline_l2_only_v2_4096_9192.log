@@ -1,0 +1,36 @@
+===== baseline_l2_only batch=4096 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 4096/4096
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-64 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: enabled
+ > Buffer: 2.238 GiB
+
+ > [baseline-l2-only] rank= 0 l2_gemm=1681.344 us
+ > [baseline-l2-only] rank= 1 l2_gemm=1723.840 us
+ > [baseline-l2-only] rank= 2 l2_gemm=1709.568 us
+ > [baseline-l2-only] rank= 3 l2_gemm=1681.376 us
+ > [baseline-l2-only] rank= 4 l2_gemm=1700.256 us
+ > [baseline-l2-only] rank= 5 l2_gemm=1709.504 us
+ > [baseline-l2-only] rank= 6 l2_gemm=1689.568 us
+ > [baseline-l2-only] rank= 7 l2_gemm=1708.512 us
+===== baseline_l2_only batch=9192 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 9192/9192
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-64 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: enabled
+ > Buffer: 4.814 GiB
+
+ > [baseline-l2-only] rank= 0 l2_gemm=3666.592 us
+ > [baseline-l2-only] rank= 1 l2_gemm=3681.632 us
+ > [baseline-l2-only] rank= 2 l2_gemm=3719.840 us
+ > [baseline-l2-only] rank= 3 l2_gemm=3692.384 us
+ > [baseline-l2-only] rank= 4 l2_gemm=3666.784 us
+ > [baseline-l2-only] rank= 5 l2_gemm=3698.848 us
+ > [baseline-l2-only] rank= 6 l2_gemm=3686.048 us
+ > [baseline-l2-only] rank= 7 l2_gemm=3672.288 us

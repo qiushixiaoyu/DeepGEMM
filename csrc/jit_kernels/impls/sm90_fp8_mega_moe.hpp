@@ -104,6 +104,7 @@ public:
         CUtensorMap tensor_map_l2_acts_sf;
         CUtensorMap tensor_map_l2_weights;
         const float* l2_weights_sf;
+        uint64_t* stage_profile;
 
         // Launch configs
         LaunchArgs launch_args;
@@ -116,11 +117,16 @@ public:
         const bool sfb_smem_on = get_env<int>("DG_SM90_MEGA_MOE_SFB_SMEM", 0) != 0;
         const bool l2_sfa_pair_tma_on = get_env<int>("DG_SM90_MEGA_MOE_L2_SFA_PAIR_TMA", 0) != 0;
         const bool l1_direct_store_on = get_env<int>("DG_SM90_MEGA_MOE_L1_DIRECT_STORE", 0) != 0;
+        const bool l2_act_sf_per128_on = get_env<int>("DG_SM90_MEGA_MOE_L2_ACT_SF_PER128", 0) != 0;
+        const bool stage_profile_on = get_env<int>("DG_SM90_MEGA_MOE_STAGE_PROFILE", 0) != 0;
+        const bool split_a_sfa_producer_on = get_env<int>("DG_SM90_MEGA_MOE_SPLIT_A_SFA_PRODUCER", 0) != 0;
         const int force_combine_chunks = get_env<int>("DG_SM90_MEGA_MOE_FORCE_COMBINE_CHUNKS", 0);
         DG_HOST_ASSERT(force_combine_chunks == 0 or force_combine_chunks == 1 or force_combine_chunks == 2);
+        DG_HOST_ASSERT(not (l2_act_sf_per128_on and l2_dual_accum_on));
+        DG_HOST_ASSERT(not (l2_act_sf_per128_on and l2_sfa_pair_tma_on));
         return fmt::format(R"(
-    // wave_v2_active_sms_v1_dbg_trace_v13_l1_direct_store (bump to invalidate JIT cache when sm90_fp8_mega_moe.cuh changes)
-    {}{}{}{}{}{}#include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
+    // wave_v2_active_sms_v1_dbg_trace_v21_split_a_sfa_producer (bump to invalidate JIT cache when sm90_fp8_mega_moe.cuh changes)
+    {}{}{}{}{}{}{}{}{}#include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 
 using namespace deep_gemm;
 
@@ -145,6 +151,9 @@ static void __instantiate_kernel() {{
     sfb_smem_on ? "#define DG_SM90_MEGA_MOE_SFB_SMEM 1\n" : "",
     l2_sfa_pair_tma_on ? "#define DG_SM90_MEGA_MOE_L2_SFA_PAIR_TMA 1\n" : "",
     l1_direct_store_on ? "#define DG_SM90_MEGA_MOE_L1_DIRECT_STORE 1\n" : "",
+    l2_act_sf_per128_on ? "#define DG_SM90_MEGA_MOE_L2_ACT_SF_PER128 1\n" : "",
+    stage_profile_on ? "#define DG_SM90_MEGA_MOE_STAGE_PROFILE 1\n" : "",
+    split_a_sfa_producer_on ? "#define DG_SM90_MEGA_MOE_SPLIT_A_SFA_PRODUCER 1\n" : "",
     force_combine_chunks > 0 ? fmt::format("#define DG_SM90_MEGA_MOE_FORCE_COMBINE_CHUNKS {}\n", force_combine_chunks) : "",
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
@@ -174,7 +183,8 @@ static void __instantiate_kernel() {{
             args.tensor_map_l2_acts,
             args.tensor_map_l2_acts_sf,
             args.tensor_map_l2_weights,
-            args.l2_weights_sf
+            args.l2_weights_sf,
+            args.stage_profile
         ));
     }
 };
@@ -192,7 +202,8 @@ static void sm90_fp8_mega_moe(
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
-    const bool& fast_math
+    const bool& fast_math,
+    uint64_t* stage_profile = nullptr
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -209,7 +220,10 @@ static void sm90_fp8_mega_moe(
     // Activation SF: per-128 channel float for L1, per-64 for L2 (MN-major, no swizzle).
     // Weight SF: block (128, 128) raw float pointer (no TMA descriptor).
     constexpr int kGranK = 128;
-    constexpr int kL2ActsSFGranK = 64;
+    const bool l2_act_sf_per128_on = get_env<int>("DG_SM90_MEGA_MOE_L2_ACT_SF_PER128", 0) != 0;
+    constexpr int kL2ActsSFGranKDefault = 64;
+    constexpr int kL2ActsSFGranKPer128 = 128;
+    const int kL2ActsSFGranK = l2_act_sf_per128_on ? kL2ActsSFGranKPer128 : kL2ActsSFGranKDefault;
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
                                                      hidden, config.num_max_pool_tokens,
                                                      config.block_k, config.block_m,
@@ -245,6 +259,14 @@ static void sm90_fp8_mega_moe(
                                                      config.swizzle_acts_mode);
     const bool l2_sfa_pair_tma_on = get_env<int>("DG_SM90_MEGA_MOE_L2_SFA_PAIR_TMA", 0) != 0;
     const auto tensor_map_l2_acts_sf = [&]() {
+        if (l2_act_sf_per128_on) {
+            const int raw_cols = intermediate_hidden / kL2ActsSFGranKDefault;
+            const auto l2_acts_sf_final = l2_acts_sf.slice(1, raw_cols, raw_cols + intermediate_hidden / kL2ActsSFGranKPer128);
+            return make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf_final,
+                                    config.num_padded_sf_pool_tokens, intermediate_hidden,
+                                    config.block_m, kL2ActsSFGranKPer128,
+                                    1, 0);
+        }
         if (l2_sfa_pair_tma_on) {
             const int shape_mn = get_tma_aligned_size(
                 config.num_padded_sf_pool_tokens,
@@ -275,10 +297,13 @@ static void sm90_fp8_mega_moe(
     // Launch
     const auto num_sms = device_runtime->get_num_sms();
     const auto active_sms = get_active_sms_for_sm90_mega_moe(num_sms, num_tokens, num_topk, config);
+    const int cta_multiplier = get_env<int>("DG_SM90_MEGA_MOE_CTA_MULTIPLIER", 1);
+    DG_HOST_ASSERT(cta_multiplier == 1 or cta_multiplier == 2);
+    const int launch_ctas = active_sms * cta_multiplier;
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
         std::cout << fmt::format(
-            "SM90FP8MegaMoE active_sms={} physical_sms={} num_tokens={} num_topk={} block_m={}",
-            active_sms, num_sms, num_tokens, num_topk, config.block_m) << std::endl;
+            "SM90FP8MegaMoE active_sms={} launch_ctas={} cta_multiplier={} physical_sms={} num_tokens={} num_topk={} block_m={}",
+            active_sms, launch_ctas, cta_multiplier, num_sms, num_tokens, num_topk, config.block_m) << std::endl;
     }
     const SM90FP8MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
@@ -301,7 +326,8 @@ static void sm90_fp8_mega_moe(
         .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
         .tensor_map_l2_weights = tensor_map_l2_weights,
         .l2_weights_sf = l2_weights_sf.data_ptr<float>(),
-        .launch_args = LaunchArgs(active_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
+        .stage_profile = stage_profile,
+        .launch_args = LaunchArgs(launch_ctas, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, config.cluster_size)
     };
     const auto code = SM90FP8MegaMoERuntime::generate(args);

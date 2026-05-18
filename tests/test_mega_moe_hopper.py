@@ -47,6 +47,10 @@ except Exception as ex:
 # 与 deep_gemm/include/deep_gemm/impls/sm90_fp8_mega_moe.cuh 中模板入口同名，
 # bench_kineto 用它从 trace 里挑出 fused mega-MoE 的 GPU 段
 SM90_KERNEL_NAME = "sm90_fp8_mega_moe_impl"
+STAGE_PROFILE_HEADER = 32
+STAGE_PROFILE_CTA_STRIDE = 40
+STAGE_PROFILE_MAX_CTAS = 256
+STAGE_PROFILE_NUMEL = STAGE_PROFILE_HEADER + STAGE_PROFILE_CTA_STRIDE * STAGE_PROFILE_MAX_CTAS
 
 
 # FP8 e4m3fn 的最大可表示值，量化时用 amax / 448 作为 scale 基准
@@ -55,10 +59,135 @@ FP8_E4M3_MAX = 448.0
 # 否则编译期 NameError。宿主 Python 侧仍用上面的普通 float 做 torch 运算。
 _FP8_E4M3_MAX_TL = tl.constexpr(448.0)
 L1_ACT_SF_GRAN = 128
-FUSED_L2_ACT_SF_GRAN = 64
+FUSED_L2_ACT_SF_GRAN = 128 if os.getenv("DG_SM90_MEGA_MOE_L2_ACT_SF_PER128", "0") != "0" else 64
 BASELINE_L2_ACT_SF_GRAN = 128
 WEIGHT_SF_GRAN_MN = 128
 WEIGHT_SF_GRAN_K = 128
+
+
+def _summarize_stage_profile(stage_profile: torch.Tensor, rank_idx: int, t_fused: float) -> dict:
+    """Convert the SM90 in-kernel clock64 counters into a compact rank summary."""
+    flat = stage_profile.detach().cpu()
+    header = flat[:STAGE_PROFILE_HEADER].tolist()
+    rows = flat[STAGE_PROFILE_HEADER:].view(STAGE_PROFILE_MAX_CTAS, STAGE_PROFILE_CTA_STRIDE).to(torch.float64)
+    active = rows[:, 9] > 0
+    active_rows = rows[active]
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    clock_khz = float(getattr(props, "clock_rate", 0) or 0)
+
+    def max_field(idx: int) -> float:
+        return float(active_rows[:, idx].max().item()) if active_rows.numel() else 0.0
+
+    def sum_field(idx: int) -> float:
+        return float(active_rows[:, idx].sum().item()) if active_rows.numel() else 0.0
+
+    def cycles_to_us(cycles: float) -> float:
+        # CUDA reports clock_rate in kHz: cycles / kHz = ms.
+        return cycles / clock_khz * 1000.0 if clock_khz > 0 else float("nan")
+
+    l1_gemm = sum_field(10)
+    l1_epi = sum_field(11)
+    l2_gemm = sum_field(12)
+    l2_epi = sum_field(13)
+    math_sum = l1_gemm + l1_epi + l2_gemm + l2_epi
+    full_wait = sum_field(20)
+    wgmma_wait = sum_field(21)
+    l1_wg_sync = sum_field(22)
+    l1_tma_wait = sum_field(23)
+    l1_full_sync = sum_field(24)
+    l2_wg_sync = sum_field(25)
+    l2_full_sync = sum_field(26)
+    prod_a_l1_empty = sum_field(27)
+    prod_a_l2_empty = sum_field(28)
+    prod_a_l1_issue = sum_field(29)
+    prod_a_l2_issue = sum_field(30)
+    prod_b_l1_empty = sum_field(31)
+    prod_b_l2_empty = sum_field(32)
+    prod_b_l1_issue = sum_field(33)
+    prod_b_l2_issue = sum_field(34)
+    crit_cycles = 0.0
+    if active_rows.numel():
+        crit_cycles = float((active_rows[:, 9] + active_rows[:, 16] + active_rows[:, 17] + active_rows[:, 18]).max().item())
+
+    return {
+        "rank": rank_idx,
+        "fused_us": t_fused * 1e6,
+        "active_ctas": int(active.sum().item()),
+        "block_m": int(header[1]),
+        "stages": int(header[2]),
+        "experts_per_wave": int(header[3]),
+        "crit_us": cycles_to_us(crit_cycles),
+        "math_us": cycles_to_us(max_field(9)),
+        "l1_us": cycles_to_us(max_field(10) + max_field(11)),
+        "l1_gemm_us": cycles_to_us(max_field(10)),
+        "l1_epi_us": cycles_to_us(max_field(11)),
+        "l2_us": cycles_to_us(max_field(12) + max_field(13)),
+        "l2_gemm_us": cycles_to_us(max_field(12)),
+        "l2_epi_us": cycles_to_us(max_field(13)),
+        "combine_barrier_us": cycles_to_us(max_field(16)),
+        "combine_sync_us": cycles_to_us(max_field(17)),
+        "combine_reduce_us": cycles_to_us(max_field(18)),
+        "dispatch_total_us": cycles_to_us(max_field(1)),
+        "dispatch_pull_us": cycles_to_us(max_field(3)),
+        "producer_l1_wait_us": cycles_to_us(max_field(5)),
+        "producer_l2_wait_us": cycles_to_us(max_field(6)),
+        "full_wait_us": cycles_to_us(max_field(20)),
+        "wgmma_wait_us": cycles_to_us(max_field(21)),
+        "l1_wg_sync_us": cycles_to_us(max_field(22)),
+        "l1_tma_wait_us": cycles_to_us(max_field(23)),
+        "l1_full_sync_us": cycles_to_us(max_field(24)),
+        "l2_wg_sync_us": cycles_to_us(max_field(25)),
+        "l2_full_sync_us": cycles_to_us(max_field(26)),
+        "prod_a_l1_empty_us": cycles_to_us(max_field(27)),
+        "prod_a_l2_empty_us": cycles_to_us(max_field(28)),
+        "prod_a_l1_issue_us": cycles_to_us(max_field(29)),
+        "prod_a_l2_issue_us": cycles_to_us(max_field(30)),
+        "prod_b_l1_empty_us": cycles_to_us(max_field(31)),
+        "prod_b_l2_empty_us": cycles_to_us(max_field(32)),
+        "prod_b_l1_issue_us": cycles_to_us(max_field(33)),
+        "prod_b_l2_issue_us": cycles_to_us(max_field(34)),
+        "l1_agg_pct": 100.0 * (l1_gemm + l1_epi) / math_sum if math_sum else 0.0,
+        "l2_agg_pct": 100.0 * (l2_gemm + l2_epi) / math_sum if math_sum else 0.0,
+        "l1_epi_pct": 100.0 * l1_epi / (l1_gemm + l1_epi) if (l1_gemm + l1_epi) else 0.0,
+        "l2_epi_pct": 100.0 * l2_epi / (l2_gemm + l2_epi) if (l2_gemm + l2_epi) else 0.0,
+        "full_wait_pct": 100.0 * full_wait / math_sum if math_sum else 0.0,
+        "wgmma_wait_pct": 100.0 * wgmma_wait / math_sum if math_sum else 0.0,
+        "l1_sync_pct": 100.0 * (l1_wg_sync + l1_tma_wait + l1_full_sync) / (l1_gemm + l1_epi) if (l1_gemm + l1_epi) else 0.0,
+        "l2_sync_pct": 100.0 * (l2_wg_sync + l2_full_sync) / (l2_gemm + l2_epi) if (l2_gemm + l2_epi) else 0.0,
+        "prod_a_empty_pct": 100.0 * (prod_a_l1_empty + prod_a_l2_empty) / math_sum if math_sum else 0.0,
+        "prod_b_empty_pct": 100.0 * (prod_b_l1_empty + prod_b_l2_empty) / math_sum if math_sum else 0.0,
+        "prod_a_issue_pct": 100.0 * (prod_a_l1_issue + prod_a_l2_issue) / math_sum if math_sum else 0.0,
+        "prod_b_issue_pct": 100.0 * (prod_b_l1_issue + prod_b_l2_issue) / math_sum if math_sum else 0.0,
+        "l1_blocks": int(sum_field(14)),
+        "l2_blocks": int(sum_field(15)),
+    }
+
+
+def _format_stage_profile(summary: dict) -> str:
+    return (
+        f" > [stage-profile] rank={summary['rank']:2d} "
+        f"ctas={summary['active_ctas']:3d} block_m={summary['block_m']} "
+        f"stages={summary['stages']} wave_exp={summary['experts_per_wave']} "
+        f"fused={summary['fused_us']:.1f}us crit_est={summary['crit_us']:.1f}us | "
+        f"max_cta math={summary['math_us']:.1f}us "
+        f"L1={summary['l1_us']:.1f}us({summary['l1_gemm_us']:.1f}+{summary['l1_epi_us']:.1f}) "
+        f"L2={summary['l2_us']:.1f}us({summary['l2_gemm_us']:.1f}+{summary['l2_epi_us']:.1f}) "
+        f"combine={summary['combine_reduce_us']:.1f}us "
+        f"barrier={summary['combine_barrier_us']:.1f}us sync={summary['combine_sync_us']:.1f}us | "
+        f"dispatch={summary['dispatch_total_us']:.1f}us pull={summary['dispatch_pull_us']:.1f}us "
+        f"prod_wait(L1/L2)={summary['producer_l1_wait_us']:.1f}/{summary['producer_l2_wait_us']:.1f}us | "
+        f"sync_detail full={summary['full_wait_us']:.1f}us({summary['full_wait_pct']:.1f}%) "
+        f"wgmma={summary['wgmma_wait_us']:.1f}us({summary['wgmma_wait_pct']:.1f}%) "
+        f"L1(wg/tma/full)={summary['l1_wg_sync_us']:.1f}/{summary['l1_tma_wait_us']:.1f}/{summary['l1_full_sync_us']:.1f}us "
+        f"L2(wg/full)={summary['l2_wg_sync_us']:.1f}/{summary['l2_full_sync_us']:.1f}us "
+        f"sync_pct(L1/L2)={summary['l1_sync_pct']:.1f}/{summary['l2_sync_pct']:.1f}% | "
+        f"prodA empty(L1/L2)={summary['prod_a_l1_empty_us']:.1f}/{summary['prod_a_l2_empty_us']:.1f}us "
+        f"issue(L1/L2)={summary['prod_a_l1_issue_us']:.1f}/{summary['prod_a_l2_issue_us']:.1f}us "
+        f"prodB empty(L1/L2)={summary['prod_b_l1_empty_us']:.1f}/{summary['prod_b_l2_empty_us']:.1f}us "
+        f"issue(L1/L2)={summary['prod_b_l1_issue_us']:.1f}/{summary['prod_b_l2_issue_us']:.1f}us | "
+        f"agg_math L1={summary['l1_agg_pct']:.1f}% L2={summary['l2_agg_pct']:.1f}% "
+        f"epi(L1/L2)={summary['l1_epi_pct']:.1f}/{summary['l2_epi_pct']:.1f}%"
+    )
 
 
 # ============================================================================
@@ -369,7 +498,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # SwiGLU clamp：finite → 传给 fused/triton；inf → None（关闭 clamp，与 SM90 fused 一致）
     clamp_arg = args.activation_clamp if math.isfinite(args.activation_clamp) else None
-    run_baseline_enabled = args.run_baseline or bool(args.check_output_diff)
+    run_baseline_enabled = (
+        args.run_baseline or bool(args.check_output_diff) or args.baseline_l2_only_profile
+    )
 
     # ---- DeepGEMM grouped GEMM 的 M 维 alignment（baseline 走 DeepEP 时也用这个）----
     alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
@@ -385,14 +516,21 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         intermediate_hidden,
     )
     y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    stage_profile = (
+        torch.empty((STAGE_PROFILE_NUMEL,), dtype=torch.long, device="cuda")
+        if args.stage_profile
+        else None
+    )
 
-    def run_fused():
+    def run_fused_with_profile(profile_tensor=None):
         # NOTE: 跟 SM100 test_mega_moe.py 的处理一致 —— DG_COMM_KERNEL_DEBUG=1 时
         # kernel 出口会把 sym_buffer 整块清零，所以每次都要重新拷输入
         sym_buffer.x[:num_tokens].copy_(x_fp8[0])
         sym_buffer.x_sf[:num_tokens].copy_(x_fp8[1])
         sym_buffer.topk_idx[:num_tokens].copy_(topk_idx)
         sym_buffer.topk_weights[:num_tokens].copy_(topk_weights)
+        if profile_tensor is not None:
+            profile_tensor.zero_()
 
         deep_gemm.fp8_mega_moe(
             y_fused,
@@ -404,8 +542,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             activation="swiglu",
             activation_clamp=clamp_arg,
             fast_math=bool(args.fast_math),
+            stage_profile=profile_tensor,
         )
         return y_fused
+
+    def run_fused():
+        return run_fused_with_profile(None)
 
     # ---- 打印 config ----
     dist_print("Config (H200 fused mega-MoE):", once_in_node=True)
@@ -464,7 +606,22 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # 与 fused 用同一份 (FP8 weight, FP32 block-(128,128) SF) —— 但是 **未变换**
     # 的版本（baseline grouped GEMM 不需要 gate/up interleave）
     # ----------------------------------------------------------------
-    def run_baseline():
+    def run_baseline(stage_times: dict | None = None):
+        if stage_times is not None:
+            stage_times.clear()
+            events = []
+
+            def mark(name: str):
+                event = torch.cuda.Event(enable_timing=True)
+                event.record()
+                events.append((name, event))
+        else:
+            events = None
+
+            def mark(name: str):
+                return None
+
+        mark("start")
         recv_x, _, recv_topk_weights, handle, _ = ep_buffer.dispatch(
             x_fp8,
             topk_idx=topk_idx,
@@ -477,6 +634,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             do_expand=True,
             use_tma_aligned_col_major_sf=False,  # SM90: row-major float SF
         )
+        mark("dispatch")
         n = recv_x[0].size(0)
 
         # L1 GEMM：FP8 token @ FP8 W1 → BF16 中间激活 (gate||up 拼接)
@@ -491,11 +649,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             use_psum_layout=True,
             disable_ue8m0_cast=True,
         )
+        mark("l1_gemm")
 
         # Triton SwiGLU + FP8 量化（含 topk 权重乘法）
-        # 注意：fused SM90 mega-MoE 的 L2 activation SFA 是 per-64-K；
-        # 当前 DeepGEMM SM90 grouped GEMM 只支持 per-128-K SFA，所以性能 baseline
-        # 只能用 per-128-K，但 scale 数值采用 fused 同款 UE8M0/power-of-two。
+        # baseline grouped GEMM 只支持 per-128-K L2 activation SFA；默认 fused
+        # 是 per-64-K，per-128 实验则与 baseline granularity 对齐。scale 数值
+        # 统一采用 fused 同款 UE8M0/power-of-two。
         l1_y = swiglu_apply_weight_to_fp8_triton(
             x=l1_y,
             topk_weights=recv_topk_weights,
@@ -503,6 +662,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             num_per_channels=BASELINE_L2_ACT_SF_GRAN,
             use_ue8m0_scale=True,
         )
+        mark("swiglu_quant")
 
         # L2 GEMM：FP8 中间激活 @ FP8 W2 → BF16
         l2_y = torch.empty((n, hidden), dtype=torch.bfloat16, device="cuda")
@@ -514,9 +674,50 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             use_psum_layout=True,
             disable_ue8m0_cast=True,
         )
+        mark("l2_gemm")
 
         # DeepEP combine：把每个 token 在 topk 个 expert 上的输出汇聚回源 rank
-        return ep_buffer.combine(l2_y, handle=handle)[0]
+        out = ep_buffer.combine(l2_y, handle=handle)[0]
+        mark("combine")
+        if stage_times is not None:
+            torch.cuda.synchronize()
+            for (left_name, left_event), (right_name, right_event) in zip(events, events[1:]):
+                stage_times[f"{left_name}_to_{right_name}"] = left_event.elapsed_time(right_event)
+        return out
+
+    def prepare_baseline_l2_inputs():
+        recv_x, _, recv_topk_weights, handle, _ = ep_buffer.dispatch(
+            x_fp8,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            cumulative_local_expert_recv_stats=cum_stats_baseline,
+            num_experts=num_experts,
+            expert_alignment=alignment,
+            do_cpu_sync=False,
+            do_handle_copy=False,
+            do_expand=True,
+            use_tma_aligned_col_major_sf=False,
+        )
+        n = recv_x[0].size(0)
+        l1_y = torch.empty(
+            (n, intermediate_hidden * 2), dtype=torch.bfloat16, device="cuda"
+        )
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            recv_x,
+            l1_weights,
+            l1_y,
+            handle.psum_num_recv_tokens_per_expert,
+            use_psum_layout=True,
+            disable_ue8m0_cast=True,
+        )
+        l1_y = swiglu_apply_weight_to_fp8_triton(
+            x=l1_y,
+            topk_weights=recv_topk_weights,
+            clamp_value=clamp_arg,
+            num_per_channels=BASELINE_L2_ACT_SF_GRAN,
+            use_ue8m0_scale=True,
+        )
+        return l1_y, handle
 
     # ---- 跑一次确保不报错（fused + 可选 baseline）----
     y = run_fused()
@@ -541,6 +742,41 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 once_in_node=True,
             )
             dist_print(once_in_node=True)
+
+    if args.baseline_l2_only_profile:
+        assert ep_buffer is not None, "--baseline-l2-only-profile requires --run-baseline"
+        l2_input, l2_handle = prepare_baseline_l2_inputs()
+        l2_y = torch.empty((l2_input[0].size(0), hidden), dtype=torch.bfloat16, device="cuda")
+
+        def run_baseline_l2_only():
+            deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+                l2_input,
+                l2_weights,
+                l2_y,
+                l2_handle.psum_num_recv_tokens_per_expert,
+                use_psum_layout=True,
+                disable_ue8m0_cast=True,
+            )
+            return l2_y
+
+        run_baseline_l2_only()
+        torch.cuda.synchronize()
+        t_l2_only = _bench_cuda_events(
+            run_baseline_l2_only,
+            num_warmup=args.num_warmup,
+            num_repeat=args.num_repeat,
+            l2_flush_gb=args.l2_flush_gb,
+        )
+        l2_summaries = [None for _ in range(num_ranks)]
+        dist.all_gather_object(l2_summaries, t_l2_only, group=group)
+        if rank_idx == 0:
+            for r, item in enumerate(l2_summaries):
+                print(f" > [baseline-l2-only] rank={r:2d} l2_gemm={item * 1e6:.3f} us", flush=True)
+        dist.barrier()
+        sym_buffer.destroy()
+        ep_buffer.destroy()
+        dist.destroy_process_group()
+        return
 
     # ---- 统计本 rank 实际接收的 token 数与触达的 expert 数 ----
     # 把所有 rank 的 topk_idx 收齐，再把不落在本 rank 持有 expert 范围内的条目
@@ -703,6 +939,45 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         )
         dist_print(f" > [baseline] ({reason})", once_in_node=True)
 
+    if stage_profile is not None:
+        # Run one clean profiled fused call after the timing pass.  The profile
+        # kernel still does useful work, but its clock64 bookkeeping is kept out
+        # of the main t_fused number above.
+        dist.barrier()
+        run_fused_with_profile(stage_profile)
+        torch.cuda.synchronize()
+        summary = _summarize_stage_profile(stage_profile, rank_idx, t_fused)
+        summaries = [None for _ in range(num_ranks)]
+        dist.all_gather_object(summaries, summary, group=group)
+        if rank_idx == 0:
+            print("Stage profile:", flush=True)
+            for item in summaries:
+                print(_format_stage_profile(item), flush=True)
+        dist.barrier()
+        if ep_buffer is not None:
+            baseline_stage_times = {}
+            if args.l2_flush_gb > 0:
+                free_bytes, _ = torch.cuda.mem_get_info()
+                flush_bytes = min(int(args.l2_flush_gb * 1e9), int(free_bytes * 0.5))
+                if flush_bytes >= 4:
+                    torch.empty(flush_bytes // 4, dtype=torch.int, device="cuda").zero_()
+            run_baseline(baseline_stage_times)
+            baseline_summaries = [None for _ in range(num_ranks)]
+            dist.all_gather_object(baseline_summaries, baseline_stage_times, group=group)
+            if rank_idx == 0:
+                print("Baseline stage profile (single event-timed call, ms):", flush=True)
+                for r, item in enumerate(baseline_summaries):
+                    print(
+                        f" > [baseline-stage] rank={r:2d} "
+                        f"dispatch={item.get('start_to_dispatch', 0.0):.3f} "
+                        f"l1_gemm={item.get('dispatch_to_l1_gemm', 0.0):.3f} "
+                        f"swiglu={item.get('l1_gemm_to_swiglu_quant', 0.0):.3f} "
+                        f"l2_gemm={item.get('swiglu_quant_to_l2_gemm', 0.0):.3f} "
+                        f"combine={item.get('l2_gemm_to_combine', 0.0):.3f}",
+                        flush=True,
+                    )
+            dist.barrier()
+
     # ---- 清理 ----
     dist.barrier()
     sym_buffer.destroy()
@@ -804,6 +1079,11 @@ if __name__ == "__main__":
         help="启用 DeepEP+grouped-FP8 legacy baseline；默认关闭以避免 full-size 默认配置触发 baseline kernel 非法访问",
     )
     parser.add_argument(
+        "--baseline-l2-only-profile",
+        action="store_true",
+        help="启用 baseline 后，只测准备好的 L2 grouped GEMM，用作 L2-only 下界参照",
+    )
+    parser.add_argument(
         "--check-output-diff",
         type=int,
         default=0,
@@ -814,6 +1094,12 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="非空时把 fused 的 Chrome trace 写到该目录（每 rank 一份）",
+    )
+    parser.add_argument(
+        "--stage-profile",
+        type=int,
+        default=0,
+        help="非 0 时为 SM90 fused kernel 额外跑一次 clock64 阶段 profile；需设置 DG_SM90_MEGA_MOE_STAGE_PROFILE=1",
     )
 
     args = parser.parse_args()

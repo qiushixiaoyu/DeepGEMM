@@ -85,6 +85,9 @@ struct Workspace {
         // L2 block arrival mask
         num_bytes += num_max_pool_blocks * sizeof(uint64_t);
 
+        // L2 raw SF pair arrival mask
+        num_bytes += num_max_pool_blocks * sizeof(uint64_t);
+
         // Dispatch pulling source token-topk
         num_bytes += num_experts_per_rank * num_ranks * num_max_recv_tokens_per_expert * sizeof(int);
 
@@ -154,11 +157,17 @@ struct Workspace {
         return reinterpret_cast<uint64_t*>(base) + pool_block_idx;
     }
 
+    CUTLASS_DEVICE
+    uint64_t* get_l2_sf_pair_arrival_mask_ptr(const uint32_t& pool_block_idx = 0) const {
+        const auto base = get_l2_arrival_mask_ptr(num_max_pool_blocks);
+        return reinterpret_cast<uint64_t*>(base) + pool_block_idx;
+    }
+
     // For dispatch pulling
     CUTLASS_DEVICE
     uint32_t* get_src_token_topk_idx_ptr(
         const uint32_t& expert_idx = 0, const uint32_t& rank_idx = 0, const uint32_t& token_idx = 0) const {
-        const auto base = get_l2_arrival_mask_ptr(num_max_pool_blocks);
+        const auto base = get_l2_sf_pair_arrival_mask_ptr(num_max_pool_blocks);
         return reinterpret_cast<uint32_t*>(base) +
             expert_idx * (num_ranks * num_max_recv_tokens_per_expert) +
             rank_idx * num_max_recv_tokens_per_expert + token_idx;

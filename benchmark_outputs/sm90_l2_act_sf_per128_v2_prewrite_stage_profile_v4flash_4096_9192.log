@@ -1,0 +1,94 @@
+===== stage-profile DG_SM90_MEGA_MOE_L2_ACT_SF_PER128=1 prewrite-v2 batch=4096 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 4096/4096
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-128 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: enabled
+ > Buffer: 2.437 GiB
+
+Performance:
+ > kind       EP    recv_tokens active_experts | compute(TFLOPS) HBM(GB/s) NVL(GB/s)  time(us) reduction(us) speedup
+ > [fused]     0/8         24703             32 |             163       160        40      7656          36.1                     -
+ > [fused]     4/8         24534             32 |             162       159        40      7657          36.1                     -
+ > [fused]     3/8         24503             32 |             162       159        40      7657          36.1                     -
+ > [fused]     6/8         24476             32 |             162       159        40      7655          36.1                     -
+ > [fused]     7/8         24557             32 |             162       159        40      7657          36.1                     -
+ > [fused]     2/8         24480             32 |             162       159        40      7657          36.1                     -
+ > [fused]     1/8         24693             32 |             163       160        40      7656          36.1                     -
+ > [fused]     5/8         24662             32 |             163       160        40      7653          36.1                     -
+ > [baseline]  0/8         24703             32 |             180       176        44      6926             -   0.90x baseline faster
+ > [baseline]  1/8         24693             32 |             180       176        44      6915             -   0.90x baseline faster
+ > [baseline]  3/8         24503             32 |             179       176        44      6877             -   0.90x baseline faster
+ > [baseline]  4/8         24534             32 |             179       176        44      6911             -   0.90x baseline faster
+ > [baseline]  2/8         24480             32 |             178       175        44      6911             -   0.90x baseline faster
+ > [baseline]  7/8         24557             32 |             178       175        44      6928             -   0.90x baseline faster
+ > [baseline]  6/8         24476             32 |             179       176        44      6892             -   0.90x baseline faster
+ > [baseline]  5/8         24662             32 |             180       177        45      6882             -   0.90x baseline faster
+Stage profile:
+ > [stage-profile] rank= 0 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=7656.0us crit_est=6937.1us | max_cta math=6805.8us L1=4538.5us(3941.8+596.7) L2=2298.4us(1936.4+362.0) combine=73.7us barrier=61.9us sync=0.0us | dispatch=6901.0us pull=372.6us prod_wait(L1/L2)=52.9/33.4us | agg_math L1=66.2% L2=33.8% epi(L1/L2)=12.1/15.2%
+ > [stage-profile] rank= 1 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=7656.0us crit_est=6951.7us | max_cta math=6832.1us L1=4547.1us(3945.8+601.3) L2=2297.7us(1934.9+362.8) combine=75.2us barrier=57.5us sync=0.0us | dispatch=6916.0us pull=390.2us prod_wait(L1/L2)=52.6/33.5us | agg_math L1=66.2% L2=33.8% epi(L1/L2)=12.0/15.2%
+ > [stage-profile] rank= 2 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=7657.0us crit_est=6964.1us | max_cta math=6800.3us L1=4533.7us(3941.2+592.5) L2=2292.9us(1932.2+360.7) combine=74.3us barrier=104.5us sync=0.0us | dispatch=6921.3us pull=369.2us prod_wait(L1/L2)=53.4/33.6us | agg_math L1=66.2% L2=33.8% epi(L1/L2)=12.0/15.3%
+ > [stage-profile] rank= 3 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=7657.0us crit_est=6948.4us | max_cta math=6767.2us L1=4506.5us(3916.4+590.2) L2=2277.3us(1922.8+354.5) combine=74.8us barrier=129.6us sync=0.0us | dispatch=6908.4us pull=376.2us prod_wait(L1/L2)=53.0/33.5us | agg_math L1=66.2% L2=33.8% epi(L1/L2)=12.0/15.2%
+ > [stage-profile] rank= 4 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=7657.0us crit_est=6948.8us | max_cta math=6801.9us L1=4535.8us(3941.3+594.6) L2=2287.6us(1931.4+356.2) combine=75.5us barrier=84.7us sync=0.0us | dispatch=6928.8us pull=384.6us prod_wait(L1/L2)=53.2/33.7us | agg_math L1=66.2% L2=33.8% epi(L1/L2)=12.2/15.3%
+ > [stage-profile] rank= 5 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=7653.0us crit_est=6949.2us | max_cta math=6864.0us L1=4565.8us(3967.1+598.7) L2=2315.0us(1947.4+367.7) combine=72.8us barrier=29.9us sync=0.0us | dispatch=6896.7us pull=369.7us prod_wait(L1/L2)=52.8/34.1us | agg_math L1=66.2% L2=33.8% epi(L1/L2)=12.0/15.2%
+ > [stage-profile] rank= 6 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=7655.0us crit_est=6962.6us | max_cta math=6755.5us L1=4501.3us(3911.0+590.3) L2=2285.7us(1924.6+361.1) combine=75.3us barrier=137.4us sync=0.0us | dispatch=6912.1us pull=373.7us prod_wait(L1/L2)=51.6/33.6us | agg_math L1=66.1% L2=33.9% epi(L1/L2)=12.1/15.4%
+ > [stage-profile] rank= 7 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=7657.0us crit_est=6971.5us | max_cta math=6789.0us L1=4521.6us(3923.9+597.7) L2=2285.4us(1921.4+364.0) combine=73.7us barrier=121.5us sync=0.0us | dispatch=6953.2us pull=385.2us prod_wait(L1/L2)=53.1/33.6us | agg_math L1=66.2% L2=33.8% epi(L1/L2)=12.0/15.4%
+Baseline stage profile (single event-timed call, ms):
+ > [baseline-stage] rank= 0 dispatch=0.404 l1_gemm=3.267 swiglu=0.824 l2_gemm=1.673 combine=0.784
+ > [baseline-stage] rank= 1 dispatch=0.339 l1_gemm=3.330 swiglu=0.822 l2_gemm=1.706 combine=0.696
+ > [baseline-stage] rank= 2 dispatch=0.314 l1_gemm=3.324 swiglu=0.822 l2_gemm=1.700 combine=0.710
+ > [baseline-stage] rank= 3 dispatch=0.377 l1_gemm=3.283 swiglu=0.825 l2_gemm=1.681 combine=0.760
+ > [baseline-stage] rank= 4 dispatch=0.388 l1_gemm=3.278 swiglu=0.823 l2_gemm=1.681 combine=0.772
+ > [baseline-stage] rank= 5 dispatch=0.302 l1_gemm=3.313 swiglu=0.822 l2_gemm=1.699 combine=0.720
+ > [baseline-stage] rank= 6 dispatch=0.328 l1_gemm=3.275 swiglu=0.821 l2_gemm=1.680 combine=0.779
+ > [baseline-stage] rank= 7 dispatch=0.360 l1_gemm=3.293 swiglu=0.820 l2_gemm=1.688 combine=0.755
+
+===== stage-profile DG_SM90_MEGA_MOE_L2_ACT_SF_PER128=1 prewrite-v2 batch=9192 =====
+Config (H200 fused mega-MoE):
+ > Tokens: 9192/9192
+ > Hidden: 4096, Intermediate: 2048
+ > Experts: 6/256 (per-rank: 32)
+ > Masked ratio: 0.0
+ > Activation SF: fused L2 per-128 UE8M0, baseline L2 per-128 UE8M0 (SM90 grouped GEMM constraint)
+ > Baseline: enabled
+ > Buffer: 5.242 GiB
+
+Performance:
+ > kind       EP    recv_tokens active_experts | compute(TFLOPS) HBM(GB/s) NVL(GB/s)  time(us) reduction(us) speedup
+ > [fused]     0/8         54750             32 |             165       103        41     16771          81.1                     -
+ > [fused]     7/8         55100             32 |             166       103        41     16771          81.1                     -
+ > [fused]     5/8         55288             32 |             167       103        41     16767          81.1                     -
+ > [fused]     4/8         55041             32 |             166       103        41     16771          81.1                     -
+ > [fused]     3/8         55488             32 |             167       104        41     16768          81.1                     -
+ > [fused]     1/8         54874             32 |             165       103        41     16771          81.1                     -
+ > [fused]     6/8         55360             32 |             167       103        41     16769          81.1                     -
+ > [fused]     2/8         55315             32 |             167       103        41     16769          81.1                     -
+ > [baseline]  0/8         54750             32 |             184       115        45     14973             -   0.89x baseline faster
+ > [baseline]  1/8         54874             32 |             184       115        45     14986             -   0.89x baseline faster
+ > [baseline]  2/8         55315             32 |             186       115        46     15003             -   0.89x baseline faster
+ > [baseline]  6/8         55360             32 |             186       115        46     14990             -   0.89x baseline faster
+ > [baseline]  3/8         55488             32 |             186       115        46     14993             -   0.89x baseline faster
+ > [baseline]  4/8         55041             32 |             184       115        46     15017             -   0.90x baseline faster
+ > [baseline]  7/8         55100             32 |             185       115        46     14997             -   0.89x baseline faster
+ > [baseline]  5/8         55288             32 |             185       115        46     15003             -   0.89x baseline faster
+Stage profile:
+ > [stage-profile] rank= 0 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=16771.0us crit_est=15285.5us | max_cta math=14841.7us L1=9868.0us(8533.3+1334.6) L2=4991.0us(4207.7+783.3) combine=166.7us barrier=282.0us sync=0.0us | dispatch=15197.4us pull=821.9us prod_wait(L1/L2)=95.5/73.1us | agg_math L1=66.2% L2=33.8% epi(L1/L2)=12.5/15.2%
+ > [stage-profile] rank= 1 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=16771.0us crit_est=15230.3us | max_cta math=14883.9us L1=9900.0us(8568.9+1331.1) L2=5015.4us(4223.9+791.5) combine=165.2us barrier=192.5us sync=0.0us | dispatch=15147.6us pull=821.2us prod_wait(L1/L2)=96.5/72.8us | agg_math L1=66.2% L2=33.8% epi(L1/L2)=12.4/15.2%
+ > [stage-profile] rank= 2 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=16769.0us crit_est=15219.8us | max_cta math=14990.6us L1=9977.6us(8623.9+1353.7) L2=5040.4us(4250.7+789.7) combine=163.4us barrier=79.4us sync=0.0us | dispatch=15147.8us pull=819.9us prod_wait(L1/L2)=98.0/73.3us | agg_math L1=66.2% L2=33.8% epi(L1/L2)=12.5/15.3%
+ > [stage-profile] rank= 3 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=16768.0us crit_est=15233.6us | max_cta math=15064.1us L1=10018.7us(8669.7+1348.9) L2=5063.1us(4279.6+783.5) combine=164.0us barrier=18.9us sync=0.0us | dispatch=15102.6us pull=797.8us prod_wait(L1/L2)=96.1/74.0us | agg_math L1=66.2% L2=33.8% epi(L1/L2)=12.4/15.2%
+ > [stage-profile] rank= 4 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=16771.0us crit_est=15243.4us | max_cta math=14928.6us L1=9905.2us(8574.4+1330.9) L2=5020.1us(4236.7+783.4) combine=164.4us barrier=166.5us sync=0.0us | dispatch=15155.4us pull=806.2us prod_wait(L1/L2)=95.1/73.0us | agg_math L1=66.2% L2=33.8% epi(L1/L2)=12.4/15.3%
+ > [stage-profile] rank= 5 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=16767.0us crit_est=15392.2us | max_cta math=15050.2us L1=10001.9us(8654.7+1347.2) L2=5064.2us(4269.3+794.8) combine=165.7us barrier=198.6us sync=0.0us | dispatch=15262.0us pull=837.6us prod_wait(L1/L2)=97.9/74.6us | agg_math L1=66.1% L2=33.9% epi(L1/L2)=12.4/15.3%
+ > [stage-profile] rank= 6 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=16769.0us crit_est=15357.5us | max_cta math=15033.6us L1=9996.3us(8652.0+1344.3) L2=5053.8us(4270.2+783.6) combine=164.6us barrier=172.6us sync=0.0us | dispatch=15227.9us pull=824.8us prod_wait(L1/L2)=96.8/73.2us | agg_math L1=66.2% L2=33.8% epi(L1/L2)=12.2/15.2%
+ > [stage-profile] rank= 7 ctas= 78 block_m=64 stages=7 wave_exp=32 fused=16771.0us crit_est=15266.7us | max_cta math=14965.1us L1=9934.5us(8599.1+1335.5) L2=5028.9us(4247.0+781.9) combine=166.8us barrier=153.1us sync=0.0us | dispatch=15135.9us pull=802.4us prod_wait(L1/L2)=96.4/73.1us | agg_math L1=66.1% L2=33.9% epi(L1/L2)=12.4/15.3%
+Baseline stage profile (single event-timed call, ms):
+ > [baseline-stage] rank= 0 dispatch=0.665 l1_gemm=7.156 swiglu=1.808 l2_gemm=3.647 combine=1.719
+ > [baseline-stage] rank= 1 dispatch=0.766 l1_gemm=7.168 swiglu=1.808 l2_gemm=3.664 combine=1.692
+ > [baseline-stage] rank= 2 dispatch=0.693 l1_gemm=7.262 swiglu=1.811 l2_gemm=3.716 combine=1.557
+ > [baseline-stage] rank= 3 dispatch=0.728 l1_gemm=7.212 swiglu=1.809 l2_gemm=3.686 combine=1.620
+ > [baseline-stage] rank= 4 dispatch=0.743 l1_gemm=7.163 swiglu=1.808 l2_gemm=3.659 combine=1.698
+ > [baseline-stage] rank= 5 dispatch=0.690 l1_gemm=7.174 swiglu=1.811 l2_gemm=3.663 combine=1.687
+ > [baseline-stage] rank= 6 dispatch=0.751 l1_gemm=7.169 swiglu=1.811 l2_gemm=3.665 combine=1.688
+ > [baseline-stage] rank= 7 dispatch=0.651 l1_gemm=7.149 swiglu=1.809 l2_gemm=3.652 combine=1.735
+

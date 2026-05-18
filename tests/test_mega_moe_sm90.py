@@ -200,11 +200,14 @@ def _reference_fused(
             # SwiGLU + clamp + multiply by topk weight
             l1_y = _swiglu_fp32(l1_y, activation_clamp) * weights.unsqueeze(-1)   # (S, IH)
 
-            # Per-row, per-64-col FP8 quantize -> dequantize
+            # Per-row FP8 quantize -> dequantize. Default fused SM90 uses
+            # per-64 L2 activation SF; the per-128 experiment re-scales paired
+            # L1 output halves before L2 consumes them.
             s_, ih = l1_y.shape
-            assert ih == intermediate_hidden and ih % 64 == 0
-            l1_view = l1_y.view(s_, ih // 64, 64)
-            amax = l1_view.abs().amax(dim=-1).clamp(1e-4)          # (S, IH/64)
+            l2_act_sf_gran = 128 if os.getenv("DG_SM90_MEGA_MOE_L2_ACT_SF_PER128", "0") != "0" else 64
+            assert ih == intermediate_hidden and ih % l2_act_sf_gran == 0
+            l1_view = l1_y.view(s_, ih // l2_act_sf_gran, l2_act_sf_gran)
+            amax = l1_view.abs().amax(dim=-1).clamp(1e-4)
             sf2 = amax / 448.0
             l1_q = (l1_view / sf2.unsqueeze(-1)).to(torch.float8_e4m3fn).float()
             l2_in = (l1_q * sf2.unsqueeze(-1)).view(s_, ih)        # (S, IH) fp32
