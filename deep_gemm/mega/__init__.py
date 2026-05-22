@@ -147,6 +147,65 @@ def transform_weights_for_mega_moe_sm90(
     return (_interleave_one(l1_fp8), l1_sf), l2_weights
 
 
+def transform_weights_for_mega_moe_sm90_fp4(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor]
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    """SM90 FP4 variant.
+
+    Inputs (per ``(weight, sf)`` pair):
+      * ``weight``: packed FP4 stored as int8/uint8 with shape ``[E, N, K//2]``
+        (one byte = two nibbles, low nibble = even K).
+      * ``sf``: FP32 SFB with shape ``[E, N, K//32]`` (per-32 K granularity,
+        gran_mn=1) — the checkpoint-native quantization granularity.
+
+    Outputs:
+      * ``weight``: same int8 storage, with L1 gate/up gran-8 interleave along
+        N (matching the FP8 SM90 path). L2 unchanged.
+      * ``sf``: ``[E, N, K//128]`` uint32, k-major contiguous, where every 4
+        consecutive K-groups are packed into one uint32 as little-endian
+        UE8M0 bytes (low byte = lowest K-group). This is exactly the layout
+        the kernel ldgs in `dequant_b_tile`:
+            ``__ldg(sfb_base + expert * (N * K/128) + n * (K/128) + k_block)``.
+    """
+    def _interleave_n(t, gran: int = 8) -> torch.Tensor:
+        g, n, *rest = t.shape
+        half = n // 2
+        gate = t[:, :half].reshape(g, half // gran, gran, *rest)
+        up = t[:, half:].reshape(g, half // gran, gran, *rest)
+        return torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
+
+    def _pack_fp32_sf_to_ue8m0_kmajor(sf_fp32: torch.Tensor) -> torch.Tensor:
+        # sf_fp32: [E, N, K/32] float32 → [E, N, K/128] int32 (k-major contig).
+        assert sf_fp32.dtype == torch.float32, f"unexpected SF dtype {sf_fp32.dtype}"
+        e, n, k_groups = sf_fp32.shape
+        assert k_groups % 4 == 0, f"K/32={k_groups} must be a multiple of 4 (BLOCK_K=128)"
+        # Float32 → UE8M0 byte: take exponent field (bits 23..30 + sign-bit-=0).
+        # The standard UE8M0 cast for power-of-two scales: (bits >> 23) & 0xff.
+        bits = sf_fp32.view(torch.int32)
+        ue8m0 = (bits.bitwise_right_shift(23).bitwise_and(0xff)).to(torch.uint8)
+        # Pack every 4 K-groups into one int32 little-endian.
+        ue8m0 = ue8m0.contiguous().view(e, n, k_groups // 4, 4)
+        # Reinterpret last dim's 4 bytes as one int32 (little-endian on CUDA).
+        packed = ue8m0.view(torch.int32).reshape(e, n, k_groups // 4)
+        return packed.contiguous()
+
+    def _as_packed_fp4_storage(fp4: torch.Tensor) -> torch.Tensor:
+        assert fp4.dtype in (torch.int8, torch.uint8), f"unexpected FP4 dtype {fp4.dtype}"
+        return fp4.contiguous().view(torch.int8)
+
+    l1_fp4, l1_sf_fp32 = l1_weights
+    l2_fp4, l2_sf_fp32 = l2_weights
+    l1_fp4 = _as_packed_fp4_storage(l1_fp4)
+    l2_fp4 = _as_packed_fp4_storage(l2_fp4)
+    l1_fp4_il = _interleave_n(l1_fp4)
+    l1_sf_il  = _interleave_n(l1_sf_fp32)
+    return (
+        (l1_fp4_il, _pack_fp32_sf_to_ue8m0_kmajor(l1_sf_il)),
+        (l2_fp4,    _pack_fp32_sf_to_ue8m0_kmajor(l2_sf_fp32)),
+    )
+
+
 def fp8_fp4_mega_moe(y: torch.Tensor,
                      l1_weights: Tuple[torch.Tensor, torch.Tensor],
                      l2_weights: Tuple[torch.Tensor, torch.Tensor],

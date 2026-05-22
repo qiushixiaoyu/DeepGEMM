@@ -400,6 +400,110 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
             smem_fixed + num_stages * (smem_per_stage + smem_barriers_per_stage)};
 }
 
+// SM90 FP4 path: identical to FP8 except per-stage SMEM also reserves a
+// packed FP4 weight tile of `block_n * (block_k / 2)` bytes (each byte holds
+// two E2M1 nibbles). The decoded E4M3 tile (`block_n * block_k` bytes) and
+// SFA tile are unchanged. SFB UE8M0 is read directly from global with __ldg
+// and consumes no SMEM.
+static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
+    const int& smem_capacity,
+    const int& num_experts, const int& hidden,
+    const int& block_m, const int& block_n, const int& block_k,
+    const int& num_dispatch_warps, const int& num_epilogue_warps) {
+    constexpr int kSmemAlignment = 1024;
+
+    const int smem_expert_count_size = align(
+        num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
+    const int smem_send_buffers_size = align(
+        static_cast<int>(layout::Buffer(layout::Data(hidden), num_dispatch_warps, 1).get_num_bytes()),
+        kSmemAlignment);
+    const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
+
+    const auto num_epilogue_warpgroups = num_epilogue_warps / 4;
+    const int smem_cd_l1 = num_epilogue_warpgroups * block_m * (block_n / 2);
+    const int smem_cd_l2 = num_epilogue_warpgroups * block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
+    const int smem_cd = align(std::max(smem_cd_l1, smem_cd_l2), kSmemAlignment);
+
+    const int smem_sfa_per_stage = align(2 * block_m * static_cast<int>(sizeof(float)), 128);
+    const int smem_sfb_per_stage = 0;
+
+    // Per-stage:
+    //   A tile (FP8 e4m3)                        : block_m * block_k
+    //   B decoded tile (FP8 e4m3, dequant target) : block_n * block_k
+    //   B packed tile  (FP4 source nibbles)       : block_n * (block_k / 2)
+    //   SFA tile                                  : smem_sfa_per_stage
+    const int smem_per_stage = block_m * block_k + block_n * block_k +
+                               block_n * (block_k / 2) +
+                               smem_sfa_per_stage + smem_sfb_per_stage;
+
+    const int smem_barriers_fixed = (num_dispatch_warps + 2 * num_epilogue_warps) * 8;
+    const int smem_barriers_per_stage = 2 * 8;
+    const int smem_fixed = smem_dispatch_size + smem_cd + smem_barriers_fixed;
+
+    const int num_stages = (smem_capacity - smem_fixed) /
+                           (smem_per_stage + smem_barriers_per_stage);
+    DG_HOST_ASSERT(num_stages >= 2);
+    return {num_stages,
+            smem_fixed + num_stages * (smem_per_stage + smem_barriers_per_stage)};
+}
+
+static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
+    const int& num_ranks, const int& num_experts, const int& num_experts_per_rank,
+    const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden,
+    const int& num_padded_sf_pool_tokens) {
+    const auto [block_m, num_epilogue_threads] = get_block_config_for_mega_moe_sm90(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens);
+    const int block_n = 128;
+    const int block_k = 128;
+    const int cluster_size = 1;
+    const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
+        num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
+    // Acts: FP8 K-major, 128B swizzle (same as FP8 path).
+    const int swizzle_acts_mode    = 128;
+    // Packed FP4 weight tile is laid out as plain row-major bytes (no swizzle)
+    // so the math-warpgroup dequant lambda can address it as
+    // `smem_b_packed[n_row * (BLOCK_K / 2) + k_byte]`. Decoded E4M3 tile is
+    // similarly unswizzled.
+    const int swizzle_weights_mode = 0;
+
+    const int num_sms = device_runtime->get_num_sms();
+    const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90(
+        num_experts_per_rank, num_tokens, num_topk,
+        intermediate_hidden, block_m, block_n, num_sms);
+
+    const int num_dispatch_threads = 128;
+    const int num_non_epilogue_threads = 128;
+
+    const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90_fp4(
+        SM90ArchSpec::smem_capacity,
+        num_experts, hidden,
+        block_m, block_n, block_k,
+        num_dispatch_threads / 32, num_epilogue_threads / 32);
+
+    const auto config = MegaMoESM90Config {
+        block_m, block_n, block_k,
+        cluster_size,
+        num_max_pool_tokens, num_padded_sf_pool_tokens,
+        swizzle_acts_mode, swizzle_weights_mode,
+        num_experts_per_wave,
+        num_stages, smem_size,
+        num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads
+    };
+
+    if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
+        const auto key = fmt::format(
+            "MegaMoESM90FP4Config(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
+            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk);
+        static std::unordered_set<std::string> printed;
+        if (printed.count(key) == 0) {
+            std::cout << key << ": " << config << std::endl;
+            printed.insert(key);
+        }
+    }
+    return config;
+}
+
 static MegaMoESM90Config get_mega_moe_config_sm90(
     const int& num_ranks, const int& num_experts, const int& num_experts_per_rank,
     const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
