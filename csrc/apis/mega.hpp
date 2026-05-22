@@ -358,7 +358,7 @@ static void fp8_fp4_mega_moe(
                               num_tokens, num_topk,
                               hidden, intermediate_hidden,
                               activation_clamp, fast_math,
-                              /*fuse_scale_b_humming_decode=*/true,
+                              /*fuse_scale_b_humming_decode=*/false,
                               /*scale_b_pow2_promote=*/true);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
