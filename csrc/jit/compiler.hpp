@@ -208,10 +208,14 @@ public:
         // The override the compiler flags
         // Only NVCC >= 12.9 supports arch-specific family suffix
         const auto arch = device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);
-        flags = fmt::format("{} -I{} --gpu-architecture=sm_{} "
+        const auto project_root_path = library_root_path.parent_path();
+        const auto cutlass_include_path = project_root_path / "third-party" / "cutlass" / "include";
+        const auto fmt_include_path = project_root_path / "third-party" / "fmt" / "include";
+        flags = fmt::format("{} -I{} -I{} -I{} --gpu-architecture=sm_{} "
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
                             "-O3 --expt-relaxed-constexpr --expt-extended-lambda",
-                            flags, library_include_path.c_str(), arch);
+                            flags, library_include_path.c_str(),
+                            cutlass_include_path.c_str(), fmt_include_path.c_str(), arch);
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path,
@@ -267,8 +271,11 @@ public:
         DG_HOST_ASSERT((major > 12 or (major == 12 and minor >= 3)) and "NVRTC version should be >= 12.3");
 
         // Build include directories list
+        const auto project_root_path = library_root_path.parent_path();
         std::string include_dirs;
         include_dirs += fmt::format("-I{} ", library_include_path.string());
+        include_dirs += fmt::format("-I{} ", (project_root_path / "third-party" / "cutlass" / "include").string());
+        include_dirs += fmt::format("-I{} ", (project_root_path / "third-party" / "fmt" / "include").string());
         include_dirs += fmt::format("-I{} ", (cuda_home / "include").string());
 
         // Add PCH support for version 12.8 and above
