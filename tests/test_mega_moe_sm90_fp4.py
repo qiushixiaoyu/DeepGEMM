@@ -310,6 +310,16 @@ def _run_scenario(
     dist_print(f'  [{name:<32}] diff={diff:.4f} '
                f'(tol={diff_tol:.2f}) {"OK" if ok else "FAIL"}',
                once_in_node=True)
+    if not ok:
+        for label, tensor in (('fused', y_fused), ('ref', y_ref)):
+            tensor_f = tensor.float()
+            dist_print(
+                f'    {label}: abs_max={tensor_f.abs().max().item():.6g} '
+                f'mean={tensor_f.mean().item():.6g} '
+                f'nonzero={(tensor_f != 0).sum().item()}/{tensor_f.numel()} '
+                f'finite={torch.isfinite(tensor_f).all().item()}',
+                once_in_node=True,
+            )
     assert ok, f'{name}: diff={diff} >= tol={diff_tol}'
 
     buffer.destroy()
