@@ -904,10 +904,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     #pragma unroll
                     for (uint32_t pw = 0; pw < kPackedWordsPerKG; ++ pw) {
                         const uint32_t packed = packed_row[kg * kPackedWordsPerKG + pw];
-                        const uint32_t lo = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(
-                            packed & 0xffffu, exp_offset);
-                        const uint32_t hi = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(
-                            packed >> 16,     exp_offset);
+                        const uint32_t lo = kFuseScaleBHummingDecode
+                            ? fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed & 0xffffu, exp_offset)
+                            : fp4_rs_detail::fp4x4_to_scaled_e4m3x4_offset(packed & 0xffffu, exp_offset);
+                        const uint32_t hi = kFuseScaleBHummingDecode
+                            ? fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed >> 16, exp_offset)
+                            : fp4_rs_detail::fp4x4_to_scaled_e4m3x4_offset(packed >> 16, exp_offset);
                         const uint64_t out8 =
                             static_cast<uint64_t>(lo) |
                             (static_cast<uint64_t>(hi) << 32);
