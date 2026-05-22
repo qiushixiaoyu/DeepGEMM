@@ -10,6 +10,7 @@
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_mega_moe_pre_dispatch.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mega_moe.hpp"
+#include "../jit_kernels/impls/sm90_fp8_fp4_mega_moe.hpp"
 #include "../utils/math.hpp"
 #include "../utils/system.hpp"
 
@@ -17,6 +18,37 @@ namespace deep_gemm::mega {
 
 static int get_token_alignment_for_mega_moe() {
     return layout::kLCMCandidateBlockM;
+}
+
+static bool is_packed_fp4_storage(const torch::Tensor& t) {
+    return t.scalar_type() == kPackedFP4 or t.scalar_type() == torch::kByte;
+}
+
+static bool is_packed_ue8m0_storage(const torch::Tensor& t) {
+    return t.scalar_type() == torch::kInt or t.scalar_type() == torch::kUInt32;
+}
+
+static std::tuple<int, int, int> check_grouped_ab_sm90_fp4_mega_moe(const torch::Tensor& ab) {
+    const auto [num_groups, mn, packed_k] = get_shape<3>(ab);
+    DG_HOST_ASSERT(is_packed_fp4_storage(ab));
+    DG_HOST_ASSERT(get_major_type_ab(ab) == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(packed_k > 0 and packed_k % 64 == 0);
+    return {num_groups, mn, packed_k * 2};
+}
+
+static void check_sm90_fp4_sfb_layout(const torch::Tensor& sf,
+                                      const int& mn, const int& k,
+                                      const int& num_groups) {
+    // SM90 FP4 MegaMoE reads SFB directly as:
+    //   base + expert * (MN * K/128) + n * (K/128) + k_block
+    // so unlike SM100's UTCCP/TMA layout, the required layout is ordinary
+    // contiguous [E, MN, K/128] int32/uint32.
+    DG_HOST_ASSERT(is_packed_ue8m0_storage(sf));
+    DG_HOST_ASSERT(sf.dim() == 3);
+    DG_HOST_ASSERT(sf.size(0) == num_groups);
+    DG_HOST_ASSERT(sf.size(1) == mn);
+    DG_HOST_ASSERT(sf.size(2) == ceil_div(k, 128));
+    DG_HOST_ASSERT(sf.is_contiguous());
 }
 
 static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
@@ -226,21 +258,30 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
     const auto arch_major = device_runtime->get_arch_major();
     const auto [num_experts_per_rank, intermediate_hidden_2, hidden] =
-        check_grouped_ab_fp8_fp4(l1_weights, cute::UMMA::Major::K, arch_major);
+        arch_major == 9 ? check_grouped_ab_sm90_fp4_mega_moe(l1_weights)
+                        : check_grouped_ab_fp8_fp4(l1_weights, cute::UMMA::Major::K, arch_major);
     const auto [num_experts_per_rank_, hidden_, intermediate_hidden] =
-        check_grouped_ab_fp8_fp4(l2_weights, cute::UMMA::Major::K, arch_major);
+        arch_major == 9 ? check_grouped_ab_sm90_fp4_mega_moe(l2_weights)
+                        : check_grouped_ab_fp8_fp4(l2_weights, cute::UMMA::Major::K, arch_major);
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
     DG_HOST_ASSERT(hidden == hidden_);
     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
     DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
 
-    // Check weight SF layout for UE8M0 packing, MN-major, and TMA alignment
+    // Check weight SF layout for UE8M0 packing.
     constexpr int kGranMN = 1, kGranK = 32;
-    check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
-                    num_experts_per_rank, true, false, torch::kInt);
-    check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
-                    num_experts_per_rank, true, false, torch::kInt);
+    if (arch_major == 9) {
+        check_sm90_fp4_sfb_layout(l1_weights_sf, intermediate_hidden * 2, hidden,
+                                  num_experts_per_rank);
+        check_sm90_fp4_sfb_layout(l2_weights_sf, hidden, intermediate_hidden,
+                                  num_experts_per_rank);
+    } else {
+        check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
+                        num_experts_per_rank, true, false, torch::kInt);
+        check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
+                        num_experts_per_rank, true, false, torch::kInt);
+    }
 
     // Check stats counter
     if (cumulative_local_expert_recv_stats.has_value()) {
@@ -298,6 +339,27 @@ static void fp8_fp4_mega_moe(
                                hidden, intermediate_hidden,
                                activation_clamp, fast_math,
                                use_fp4_acts, use_mxf4_kind, use_fp8_combine);
+    } else if (arch_major == 9) {
+        // SM90 (Hopper): FP8 acts × FP4 weights via decode-to-SMEM SS-mode
+        // WGMMA. The activation a2a stays FP8 (no `use_fp4_acts` on SM90 yet —
+        // there is no native FP4 WGMMA on Hopper, and FP4 acts would still need
+        // a per-tile dequant pass that bottlenecks on smem write bandwidth).
+        // The combine path likewise stays BF16 (Stream B is SM100-only).
+        DG_HOST_ASSERT(not use_fp4_acts and not use_mxf4_kind and not use_fp8_combine);
+        sm90_fp8_fp4_mega_moe(y,
+                              l1_acts, l1_acts_sf,
+                              l2_acts, l2_acts_sf,
+                              l1_weights, l2_weights,
+                              l1_weights_sf, l2_weights_sf,
+                              cumulative_local_expert_recv_stats,
+                              sym_buffer_ptrs,
+                              rank_idx, num_max_tokens_per_rank,
+                              num_experts_per_rank,
+                              num_tokens, num_topk,
+                              hidden, intermediate_hidden,
+                              activation_clamp, fast_math,
+                              /*fuse_scale_b_humming_decode=*/true,
+                              /*scale_b_pow2_promote=*/true);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
