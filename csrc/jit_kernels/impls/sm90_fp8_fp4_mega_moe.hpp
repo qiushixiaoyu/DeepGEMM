@@ -190,27 +190,19 @@ static void sm90_fp8_fp4_mega_moe(
                                                         config.block_m, kGranK,
                                                         1, 0);
 
-    // Packed FP4 weight tile: each byte = 2 nibbles. View the underlying
-    // weight tensor as `kPackedFP4` so `aten_dtype_to_tensor_map_dtype`
-    // selects the FP4 16U4 descriptor type. We pass
-    // `fp4_unpacked_smem=false` so smem inner stride is `BLOCK_K/2` bytes
-    // (matching `b_packed_dtype_t = int8_t` and the kernel's
-    // `SMEM_B_PACKED_SIZE_PER_STAGE = LOAD_BLOCK_N * (BLOCK_K/2)`).
-    //
-    // gmem inner dim is `hidden` U4 elements (= `hidden/2` storage bytes
-    // per row). The outer stride (`stride(-2)`) is in source bytes; for a
-    // dense `[E*2*IH, hidden/2]` int8 storage this is exactly `hidden/2`.
-    const auto l1_weights_fp4 = l1_weights.scalar_type() == kPackedFP4
-        ? l1_weights : l1_weights.view(kPackedFP4);
-    const auto l2_weights_fp4 = l2_weights.scalar_type() == kPackedFP4
-        ? l2_weights : l2_weights.view(kPackedFP4);
-    const auto tensor_map_l1_weights = make_tma_2d_desc(l1_weights_fp4,
-                                                        hidden, num_experts_per_rank * intermediate_hidden * 2,
-                                                        config.block_k, config.block_n,
-                                                        static_cast<int>(l1_weights_fp4.stride(-2)),
+    // Packed FP4 weight tile: each byte = 2 nibbles. SM90 loads these as raw
+    // bytes and software-decodes them before WGMMA, so the TensorMap must be a
+    // UINT8 view with a packed K axis rather than a native FP4 TensorMap.
+    const auto l1_weights_bytes = l1_weights.scalar_type() == torch::kByte
+        ? l1_weights : l1_weights.view(torch::kByte);
+    const auto l2_weights_bytes = l2_weights.scalar_type() == torch::kByte
+        ? l2_weights : l2_weights.view(torch::kByte);
+    const auto tensor_map_l1_weights = make_tma_2d_desc(l1_weights_bytes,
+                                                        hidden / 2, num_experts_per_rank * intermediate_hidden * 2,
+                                                        config.block_k / 2, config.block_n,
+                                                        static_cast<int>(l1_weights_bytes.stride(-2)),
                                                         config.swizzle_weights_mode, /*swizzle_base=*/0,
-                                                        /*allow_tf32=*/false,
-                                                        /*fp4_unpacked_smem=*/false);
+                                                        /*allow_tf32=*/false);
 
     // L1 output (post-SwiGLU FP8): N is halved.
     const int num_epilogue_warpgroups_h = config.num_epilogue_threads / 128;
@@ -230,13 +222,12 @@ static void sm90_fp8_fp4_mega_moe(
                                                         config.num_padded_sf_pool_tokens, intermediate_hidden,
                                                         config.block_m, kL2ActsSFGranK,
                                                         1, 0);
-    const auto tensor_map_l2_weights = make_tma_2d_desc(l2_weights_fp4,
-                                                        intermediate_hidden, num_experts_per_rank * hidden,
-                                                        config.block_k, config.block_n,
-                                                        static_cast<int>(l2_weights_fp4.stride(-2)),
+    const auto tensor_map_l2_weights = make_tma_2d_desc(l2_weights_bytes,
+                                                        intermediate_hidden / 2, num_experts_per_rank * hidden,
+                                                        config.block_k / 2, config.block_n,
+                                                        static_cast<int>(l2_weights_bytes.stride(-2)),
                                                         config.swizzle_weights_mode, /*swizzle_base=*/0,
-                                                        /*allow_tf32=*/false,
-                                                        /*fp4_unpacked_smem=*/false);
+                                                        /*allow_tf32=*/false);
 
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
