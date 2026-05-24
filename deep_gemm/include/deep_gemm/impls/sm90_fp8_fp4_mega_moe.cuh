@@ -897,19 +897,25 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         continue;
                     }
 
-                    const uint32_t exp_offset = (e8m0 > 121u) ? (e8m0 - 121u) : 0u;
-
                     // Each K-group covers kScaleBGranK=32 K-cols = 16 packed
                     // bytes = 4 packed uint32 words (8 nibbles each).
                     #pragma unroll
                     for (uint32_t pw = 0; pw < kPackedWordsPerKG; ++ pw) {
                         const uint32_t packed = packed_row[kg * kPackedWordsPerKG + pw];
-                        const uint32_t lo = kFuseScaleBHummingDecode
-                            ? fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed & 0xffffu, exp_offset)
-                            : fp4_rs_detail::fp4x4_to_scaled_e4m3x4_offset(packed & 0xffffu, exp_offset);
-                        const uint32_t hi = kFuseScaleBHummingDecode
-                            ? fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed >> 16, exp_offset)
-                            : fp4_rs_detail::fp4x4_to_scaled_e4m3x4_offset(packed >> 16, exp_offset);
+                        uint32_t lo, hi;
+                        if constexpr (kFuseScaleBHummingDecode) {
+                            if (e8m0 >= 121u) {
+                                const uint32_t exp_offset = e8m0 - 121u;
+                                lo = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed & 0xffffu, exp_offset);
+                                hi = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed >> 16, exp_offset);
+                            } else {
+                                lo = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0(packed & 0xffffu, e8m0);
+                                hi = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0(packed >> 16, e8m0);
+                            }
+                        } else {
+                            lo = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0(packed & 0xffffu, e8m0);
+                            hi = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0(packed >> 16, e8m0);
+                        }
                         const uint64_t out8 =
                             static_cast<uint64_t>(lo) |
                             (static_cast<uint64_t>(hi) << 32);

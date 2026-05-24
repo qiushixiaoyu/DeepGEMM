@@ -346,6 +346,8 @@ static void fp8_fp4_mega_moe(
         // a per-tile dequant pass that bottlenecks on smem write bandwidth).
         // The combine path likewise stays BF16 (Stream B is SM100-only).
         DG_HOST_ASSERT(not use_fp4_acts and not use_mxf4_kind and not use_fp8_combine);
+        const bool fuse_scale_b_humming_decode =
+            get_env<int>("DG_SM90_FP4_FUSE_SCALE_B_HUMMING_DECODE") != 0;
         sm90_fp8_fp4_mega_moe(y,
                               l1_acts, l1_acts_sf,
                               l2_acts, l2_acts_sf,
@@ -358,7 +360,7 @@ static void fp8_fp4_mega_moe(
                               num_tokens, num_topk,
                               hidden, intermediate_hidden,
                               activation_clamp, fast_math,
-                              /*fuse_scale_b_humming_decode=*/false,
+                              fuse_scale_b_humming_decode,
                               /*scale_b_pow2_promote=*/true);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
