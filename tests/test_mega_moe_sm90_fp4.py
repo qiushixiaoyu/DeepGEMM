@@ -15,12 +15,14 @@ precision plus the exact-FP32-vs-pow2-promote difference (small).
 """
 
 import argparse
+import json
 import math
 import os
 import random
 import sys
 import torch
 import torch.distributed as dist
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -79,6 +81,8 @@ def _dequant_fp4_per32(fp4: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
     val = table[mag]
     val = torch.where(sign & (mag != 0), -val, val)
     # Broadcast SF: each 32 K-cols share one SF.
+    if os.getenv('DSV4_FP4_REFERENCE_CLAMP_SF_MIN_2M6', '0') == '1':
+        sf = sf.clamp_min(2.0 ** -6)
     sf_broad = sf.unsqueeze(-1).expand(g, n, sf.size(-1), 32).reshape(g, n, k)
     return val * sf_broad
 
@@ -91,6 +95,51 @@ def _dequant_per_token_per_128_k(
     assert k % 128 == 0
     x_view = x_fp8.float().view(m, k // 128, 128)
     return (x_view * sf.unsqueeze(-1)).view(m, k)
+
+
+def _load_dsv4_checkpoint_layer_weights(
+    model_path: str,
+    layer_idx: int,
+    rank_idx: int,
+    num_ranks: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from safetensors import safe_open
+
+    model_dir = Path(model_path)
+    weight_map = json.loads((model_dir / 'model.safetensors.index.json').read_text())[
+        'weight_map'
+    ]
+    num_experts = 256
+    experts_per_rank = num_experts // num_ranks
+    start = rank_idx * experts_per_rank
+    end = start + experts_per_rank
+    cache: Dict[str, Any] = {}
+
+    def get_tensor(name: str) -> torch.Tensor:
+        file_name = weight_map[name]
+        if file_name not in cache:
+            cache[file_name] = safe_open(str(model_dir / file_name),
+                                         framework='pt', device='cpu')
+        return cache[file_name].get_tensor(name)
+
+    l1_w, l1_s, l2_w, l2_s = [], [], [], []
+    for expert_id in range(start, end):
+        prefix = f'layers.{layer_idx}.ffn.experts.{expert_id}'
+        w1 = get_tensor(f'{prefix}.w1.weight')
+        w3 = get_tensor(f'{prefix}.w3.weight')
+        s1 = get_tensor(f'{prefix}.w1.scale')
+        s3 = get_tensor(f'{prefix}.w3.scale')
+        l1_w.append(torch.cat([w1, w3], dim=0))
+        l1_s.append(torch.cat([s1.float(), s3.float()], dim=0))
+        l2_w.append(get_tensor(f'{prefix}.w2.weight'))
+        l2_s.append(get_tensor(f'{prefix}.w2.scale').float())
+
+    return (
+        torch.stack(l1_w, dim=0).cuda(),
+        torch.stack(l1_s, dim=0).cuda(),
+        torch.stack(l2_w, dim=0).cuda(),
+        torch.stack(l2_s, dim=0).cuda(),
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -240,12 +289,6 @@ def _run_scenario(
 
     # ---- Inputs (bf16) ------------------------------------------------------
     x_bf = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-    l1_bf = torch.randn(
-        (num_experts_per_rank, intermediate_hidden * 2, hidden),
-        dtype=torch.bfloat16, device='cuda') * 0.05
-    l2_bf = torch.randn(
-        (num_experts_per_rank, hidden, intermediate_hidden),
-        dtype=torch.bfloat16, device='cuda') * 0.05
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
     topk_w, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
     if masked_ratio > 0:
@@ -257,9 +300,23 @@ def _run_scenario(
     x_fp8, x_sf = per_token_cast_to_fp8(
         x_bf, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
 
-    # FP4 weights with per-32 K UE8M0 SF — DSV4 standard.
-    l1_w_fp4, l1_w_sf = _quantize_grouped_fp4_per32(l1_bf)
-    l2_w_fp4, l2_w_sf = _quantize_grouped_fp4_per32(l2_bf)
+    if cfg.get('checkpoint_model_path'):
+        l1_w_fp4, l1_w_sf, l2_w_fp4, l2_w_sf = _load_dsv4_checkpoint_layer_weights(
+            cfg['checkpoint_model_path'],
+            cfg.get('checkpoint_layer_idx', 0),
+            rank_idx,
+            num_ranks,
+        )
+    else:
+        l1_bf = torch.randn(
+            (num_experts_per_rank, intermediate_hidden * 2, hidden),
+            dtype=torch.bfloat16, device='cuda') * 0.05
+        l2_bf = torch.randn(
+            (num_experts_per_rank, hidden, intermediate_hidden),
+            dtype=torch.bfloat16, device='cuda') * 0.05
+        # FP4 weights with per-32 K UE8M0 SF — DSV4 standard.
+        l1_w_fp4, l1_w_sf = _quantize_grouped_fp4_per32(l1_bf)
+        l2_w_fp4, l2_w_sf = _quantize_grouped_fp4_per32(l2_bf)
 
     # SM90 FP4 weight transform: gate/up gran-8 N interleave + UE8M0 SFB k-major
     # packing into uint32. Both pieces are needed — see
@@ -370,6 +427,29 @@ def _layer4_edges(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
     return out
 
 
+def _layer5_dsv4_shape(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
+    assert num_ranks == 8, 'DSV4 shape test expects 8 ranks'
+    return [('L5.dsv4_h4096_ih2048_e256_k6', dict(
+        num_max_tokens_per_rank=128, num_tokens=64,
+        hidden=4096, intermediate_hidden=2048,
+        num_experts=256, num_topk=6,
+        activation_clamp=10.0,
+    ))]
+
+
+def _layer6_dsv4_checkpoint(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
+    assert num_ranks == 8, 'DSV4 checkpoint test expects 8 ranks'
+    model_path = os.getenv('DSV4_FP4_MODEL_PATH', '/data00/models/DeepSeek-V4-Flash')
+    return [('L6.dsv4_ckpt_layer0_h4096_ih2048_e256_k6', dict(
+        num_max_tokens_per_rank=128, num_tokens=64,
+        hidden=4096, intermediate_hidden=2048,
+        num_experts=256, num_topk=6,
+        activation_clamp=10.0,
+        checkpoint_model_path=model_path,
+        checkpoint_layer_idx=0,
+    ))]
+
+
 # ----------------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------------
@@ -393,6 +473,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         layers += _layer3_shape_sweep(num_ranks)
     if 4 in args.layers:
         layers += _layer4_edges(num_ranks)
+    if 5 in args.layers:
+        layers += _layer5_dsv4_shape(num_ranks)
+    if 6 in args.layers:
+        layers += _layer6_dsv4_checkpoint(num_ranks)
 
     if args.filter:
         layers = [(n, c) for n, c in layers if args.filter in n]
@@ -428,7 +512,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='SM90 FP4 MegaMoE tests')
     parser.add_argument('--num-processes', type=int, default=2)
     parser.add_argument('--layers', type=int, nargs='+', default=[1, 3, 4],
-                        help='Which layers to run (1, 3, 4). Default: 1 3 4.')
+                        help='Which layers to run (1, 3, 4, 5, 6). Default: 1 3 4.')
     parser.add_argument('--filter', type=str, default='')
     parser.add_argument('--diff-tol', type=float, default=0.10,
                         help='calc_diff tolerance (default 0.10; FP4 weights '

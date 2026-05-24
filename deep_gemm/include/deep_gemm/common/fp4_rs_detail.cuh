@@ -576,6 +576,29 @@ CUTLASS_DEVICE ScaledE4M3Lut make_scaled_e4m3_lut(uint32_t exp_offset) {
     return {mantissa_lo + exp_offset_buffer1, mantissa_hi + exp_offset_buffer2};
 }
 
+CUTLASS_DEVICE ScaledE4M3Lut make_scaled_e4m3_lut_from_e8m0(uint32_t e8m0) {
+    // For DSV4 MXFP4 checkpoints the expert scales frequently land below
+    // 2^-6 (UE8M0 <= 120). These values must be represented with E4M3
+    // subnormals after FP4 decode. The generic positive-offset path below
+    // intentionally starts at 2^-6, so use exact byte LUTs for the subnormal
+    // range instead of saturating all small scales to 2^-6.
+    if (e8m0 <= 114u)
+        return {0x00000000u, 0x00000000u};
+    if (e8m0 == 115u)
+        return {0x00000000u, 0x01000000u};
+    if (e8m0 == 116u)
+        return {0x00000000u, 0x02010100u};
+    if (e8m0 == 117u)
+        return {0x01000000u, 0x03020201u};
+    if (e8m0 == 118u)
+        return {0x02010000u, 0x06040302u};
+    if (e8m0 == 119u)
+        return {0x03020100u, 0x0c080604u};
+    if (e8m0 == 120u)
+        return {0x06040200u, 0x14100c08u};
+    return make_scaled_e4m3_lut(e8m0 - 121u);
+}
+
 CUTLASS_DEVICE uint32_t fp4x4_to_scaled_e4m3x4_lut(uint32_t packed, ScaledE4M3Lut lut) {
     const uint32_t lut_idx = packed & 0x7777u;
     const uint32_t sign_shifted = packed << 4;
@@ -592,6 +615,10 @@ CUTLASS_DEVICE uint32_t fp4x4_to_scaled_e4m3x4_lut(uint32_t packed, ScaledE4M3Lu
 
 CUTLASS_DEVICE uint32_t fp4x4_to_scaled_e4m3x4_offset(uint32_t packed, uint32_t exp_offset) {
     return fp4x4_to_scaled_e4m3x4_lut(packed, make_scaled_e4m3_lut(exp_offset));
+}
+
+CUTLASS_DEVICE uint32_t fp4x4_to_scaled_e4m3x4_e8m0(uint32_t packed, uint32_t e8m0) {
+    return fp4x4_to_scaled_e4m3x4_lut(packed, make_scaled_e4m3_lut_from_e8m0(e8m0));
 }
 
 // Hummingbird variant: rather than building a LUT and using `prmt`, this
