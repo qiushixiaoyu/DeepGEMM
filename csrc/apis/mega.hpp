@@ -383,7 +383,9 @@ static void fp8_fp4_mega_moe(
         const bool use_early_b_decode =
             get_env<int>("DG_SM90_FP4_EARLY_B_DECODE", 0) != 0;
         const bool use_decode_done_mbarrier =
-            get_env<int>("DG_SM90_FP4_DECODE_MBARRIER", 1) != 0;
+            // Small-batch SM90 FP4 runs were consistently faster with the
+            // decode-done rendezvous on the existing CTA barrier.
+            get_env<int>("DG_SM90_FP4_DECODE_MBARRIER", 0) != 0;
         sm90_fp8_fp4_mega_moe(y,
                               l1_acts, l1_acts_sf,
                               l2_acts, l2_acts_sf,
