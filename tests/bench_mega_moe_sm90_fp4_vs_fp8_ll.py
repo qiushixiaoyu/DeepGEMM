@@ -140,12 +140,15 @@ def benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_experts = args.num_experts
     num_topk = args.num_topk
     num_experts_per_rank = num_experts // num_ranks
+    run_fp8_ll_baseline_enabled = not args.skip_fp8_ll_baseline
 
     assert num_tokens <= num_max_tokens_per_rank
     assert num_experts % num_ranks == 0
     assert hidden % 128 == 0
     assert intermediate_hidden % 128 == 0
     assert intermediate_hidden // 64 <= 64
+    if args.fp4_mode == "predecode-fp8-ll" and not run_fp8_ll_baseline_enabled:
+        raise ValueError("--skip-fp8-ll-baseline is incompatible with --fp4-mode predecode-fp8-ll")
 
     x_bf16 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device="cuda")
@@ -259,31 +262,33 @@ def benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         fp4_prepare_inputs()
         return fp4_fused_kernel(clock_profile)
 
-    deep_ep = _import_deep_ep()
-    if deep_ep is None:
-        raise RuntimeError("deep_ep is required for the FP8 low-latency baseline")
+    ll_buffer = None
+    if run_fp8_ll_baseline_enabled:
+        deep_ep = _import_deep_ep()
+        if deep_ep is None:
+            raise RuntimeError("deep_ep is required for the FP8 low-latency baseline")
 
-    ll_buffer = _make_deep_ep_low_latency_buffer(
-        deep_ep, group, num_max_tokens_per_rank, hidden, num_experts
-    )
-    m_max_ll = num_max_tokens_per_rank * num_ranks
-    expected_m_ll = max(
-        1,
-        (num_max_tokens_per_rank * num_ranks * num_topk + num_experts - 1)
-        // num_experts,
-    )
-    ll_l1_y = torch.empty(
-        (num_experts_per_rank, m_max_ll, intermediate_hidden * 2),
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
-    ll_l2_y = torch.empty(
-        (num_experts_per_rank, m_max_ll, hidden),
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
-    ll_combined = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
-    ll_state = {}
+        ll_buffer = _make_deep_ep_low_latency_buffer(
+            deep_ep, group, num_max_tokens_per_rank, hidden, num_experts
+        )
+        m_max_ll = num_max_tokens_per_rank * num_ranks
+        expected_m_ll = max(
+            1,
+            (num_max_tokens_per_rank * num_ranks * num_topk + num_experts - 1)
+            // num_experts,
+        )
+        ll_l1_y = torch.empty(
+            (num_experts_per_rank, m_max_ll, intermediate_hidden * 2),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        ll_l2_y = torch.empty(
+            (num_experts_per_rank, m_max_ll, hidden),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        ll_combined = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+        ll_state = {}
 
     def fp8_ll_dispatch():
         (recv_x_data, recv_x_sf), masked_m, ll_handle, event, hook = (
@@ -388,9 +393,10 @@ def benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         if args.fp4_mode == "predecode-fp8-ll"
         else run_fp4_fused()
     )
-    ll_out = run_fp8_low_latency_baseline()
     assert fused_out.shape == (num_tokens, hidden)
-    assert ll_out.shape == (num_tokens, hidden)
+    if run_fp8_ll_baseline_enabled:
+        ll_out = run_fp8_low_latency_baseline()
+        assert ll_out.shape == (num_tokens, hidden)
     torch.cuda.synchronize()
 
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
@@ -465,13 +471,6 @@ def benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 ("fp4_prepare_inputs", fp4_prepare_inputs),
                 ("fp4_fused_kernel", fp4_fused_kernel),
             ]
-        fp8_ll_sections = [
-            ("fp8_ll_dispatch", fp8_ll_dispatch),
-            ("fp8_ll_l1_gemm", fp8_ll_l1_gemm),
-            ("fp8_ll_swiglu_quant", fp8_ll_swiglu_quant),
-            ("fp8_ll_l2_gemm", fp8_ll_l2_gemm),
-            ("fp8_ll_combine", fp8_ll_combine),
-        ]
         dist.barrier()
         fp4_profile, fp4_profile_total = _bench_cuda_event_sections(
             fp4_sections,
@@ -480,22 +479,26 @@ def benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             l2_flush_gb=args.profile_l2_flush_gb,
             barrier=dist.barrier,
         )
-        dist.barrier()
-        fp8_profile, fp8_profile_total = _bench_cuda_event_sections(
-            fp8_ll_sections,
-            num_warmup=args.profile_warmup,
-            num_repeat=args.profile_repeat,
-            l2_flush_gb=args.profile_l2_flush_gb,
-            barrier=dist.barrier,
-        )
-        profile_names = (
-            ["fp4_total", *[name for name, _ in fp4_sections]]
-            + ["fp8_ll_total", *[name for name, _ in fp8_ll_sections]]
-        )
-        profile_values = (
-            [fp4_profile_total, *[fp4_profile[name] for name, _ in fp4_sections]]
-            + [fp8_profile_total, *[fp8_profile[name] for name, _ in fp8_ll_sections]]
-        )
+        profile_names = ["fp4_total", *[name for name, _ in fp4_sections]]
+        profile_values = [fp4_profile_total, *[fp4_profile[name] for name, _ in fp4_sections]]
+        if run_fp8_ll_baseline_enabled:
+            fp8_ll_sections = [
+                ("fp8_ll_dispatch", fp8_ll_dispatch),
+                ("fp8_ll_l1_gemm", fp8_ll_l1_gemm),
+                ("fp8_ll_swiglu_quant", fp8_ll_swiglu_quant),
+                ("fp8_ll_l2_gemm", fp8_ll_l2_gemm),
+                ("fp8_ll_combine", fp8_ll_combine),
+            ]
+            dist.barrier()
+            fp8_profile, fp8_profile_total = _bench_cuda_event_sections(
+                fp8_ll_sections,
+                num_warmup=args.profile_warmup,
+                num_repeat=args.profile_repeat,
+                l2_flush_gb=args.profile_l2_flush_gb,
+                barrier=dist.barrier,
+            )
+            profile_names += ["fp8_ll_total", *[name for name, _ in fp8_ll_sections]]
+            profile_values += [fp8_profile_total, *[fp8_profile[name] for name, _ in fp8_ll_sections]]
         profile_metrics = _all_rank_metrics(tuple(profile_values))
         profile_count_metrics = _all_rank_metrics(
             (float(num_recv_tokens), float(num_touched_experts))
@@ -511,6 +514,7 @@ def benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 "profile_repeat": args.profile_repeat,
                 "profile_warmup": args.profile_warmup,
                 "profile_l2_flush_gb": args.profile_l2_flush_gb,
+                "fp8_ll_baseline_enabled": run_fp8_ll_baseline_enabled,
             }
             for i, name in enumerate(profile_names):
                 profile_result[f"{name}_us_max"] = round(float(profile_metrics[:, i].max().item() * 1e6), 3)
@@ -551,14 +555,16 @@ def benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 l2_flush_gb=args.l2_flush_gb,
             )
 
-    dist.barrier()
-    t_ll = _bench_cuda_events(
-        run_fp8_low_latency_baseline,
-        num_warmup=args.num_warmup,
-        num_repeat=args.num_repeat,
-        l2_flush_gb=args.l2_flush_gb,
-    )
-    dist.barrier()
+    t_ll = float("nan")
+    if run_fp8_ll_baseline_enabled:
+        dist.barrier()
+        t_ll = _bench_cuda_events(
+            run_fp8_low_latency_baseline,
+            num_warmup=args.num_warmup,
+            num_repeat=args.num_repeat,
+            l2_flush_gb=args.l2_flush_gb,
+        )
+        dist.barrier()
 
     metrics = _all_rank_metrics(
         (t_fused, t_ll, float(num_recv_tokens), float(num_touched_experts))
@@ -566,8 +572,13 @@ def benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     if rank_idx == 0:
         fused_us_max = float(metrics[:, 0].max().item() * 1e6)
         fused_us_mean = float(metrics[:, 0].mean().item() * 1e6)
-        ll_us_max = float(metrics[:, 1].max().item() * 1e6)
-        ll_us_mean = float(metrics[:, 1].mean().item() * 1e6)
+        ll_us_max = None
+        ll_us_mean = None
+        speedup_vs_fp8_ll_max = None
+        if run_fp8_ll_baseline_enabled:
+            ll_us_max = float(metrics[:, 1].max().item() * 1e6)
+            ll_us_mean = float(metrics[:, 1].mean().item() * 1e6)
+            speedup_vs_fp8_ll_max = round(_safe_div(ll_us_max, fused_us_max), 4)
         result = {
             "batch_per_rank": num_tokens,
             "num_ranks": num_ranks,
@@ -581,9 +592,10 @@ def benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             "fp4_megamoe_us_mean": round(fused_us_mean, 3),
             "fp4_mode": args.fp4_mode,
             "fp4_timing_method": fused_timing_method,
-            "fp8_ll_baseline_us_max": round(ll_us_max, 3),
-            "fp8_ll_baseline_us_mean": round(ll_us_mean, 3),
-            "speedup_vs_fp8_ll_max": round(_safe_div(ll_us_max, fused_us_max), 4),
+            "fp8_ll_baseline_enabled": run_fp8_ll_baseline_enabled,
+            "fp8_ll_baseline_us_max": None if ll_us_max is None else round(ll_us_max, 3),
+            "fp8_ll_baseline_us_mean": None if ll_us_mean is None else round(ll_us_mean, 3),
+            "speedup_vs_fp8_ll_max": speedup_vs_fp8_ll_max,
             "num_bench_tests": args.num_bench_tests,
             "num_warmup": args.num_warmup,
             "num_repeat": args.num_repeat,
@@ -594,7 +606,8 @@ def benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     dist.barrier()
     sym_buffer.destroy()
-    ll_buffer.destroy()
+    if ll_buffer is not None:
+        ll_buffer.destroy()
     dist.destroy_process_group()
 
 
@@ -637,6 +650,11 @@ if __name__ == "__main__":
         "--fp4-clock-profile",
         action="store_true",
         help="Emit CLOCK_PROFILE_JSON with in-kernel FP4 wait/decode, WGMMA, and promote cycle counters",
+    )
+    parser.add_argument(
+        "--skip-fp8-ll-baseline",
+        action="store_true",
+        help="Only measure the FP4 fused path; useful when DeepEP low-latency transport is unavailable",
     )
     parser.add_argument("--profile-warmup", type=int, default=3)
     parser.add_argument("--profile-repeat", type=int, default=10)
