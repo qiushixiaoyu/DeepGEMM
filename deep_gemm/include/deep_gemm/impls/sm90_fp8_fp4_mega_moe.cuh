@@ -1416,14 +1416,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 uint64_t rs_profile_t0 = 0;
                 uint64_t rs_profile_t1 = 0;
 
-                auto load_rs_a_reg = [&](uint32_t mat,
-                                         uint32_t cur_stage,
-                                         uint32_t cur_k_block_idx,
-                                         uint32_t k_inner,
-                                         uint32_t rs_n_slice,
-                                         const uint32_t* sfb_base_for_block_phase,
-                                         uint32_t sfb_per_expert,
-                                         uint32_t sfb_k_words) -> uint32_t {
+                auto load_rs_packed_nibbles = [&](uint32_t mat,
+                                                  uint32_t cur_stage,
+                                                  uint32_t k_inner) -> uint32_t {
                     DG_STATIC_ASSERT(BLOCK_K_PACKED == 64 and RSWGMMA::K == 32,
                                      "RS packed-B address path assumes 64-byte K tiles and K=32 WGMMA");
                     const uint32_t addr_lane = mat * 8 + rs_lane_row;
@@ -1437,14 +1432,29 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t swizzled_col = ((k_inner ^ swizzle_xor) << 4) + raw_col;
                     const uint32_t packed_word = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
                         smem_b_packed[cur_stage] + row_offset + swizzled_col));
-                    const uint32_t packed_shifted = (packed_word >> packed_shift) & 0xffffu;
+                    return (packed_word >> packed_shift) & 0xffffu;
+                };
 
+                auto load_rs_e8m0 = [&](uint32_t mat,
+                                        uint32_t cur_k_block_idx,
+                                        uint32_t k_inner,
+                                        uint32_t rs_n_slice,
+                                        const uint32_t* sfb_base_for_block_phase,
+                                        uint32_t sfb_per_expert,
+                                        uint32_t sfb_k_words) -> uint32_t {
+                    const uint32_t addr_lane = mat * 8 + rs_lane_row;
+                    const uint32_t addr_tid_g = warp_idx_in_wg * 32 + addr_lane;
+                    const uint32_t addr_t_row = (addr_tid_g & 15u) | ((addr_tid_g >> 5) << 4);
+                    const uint32_t n_row = rs_n_slice * RSWGMMA::M + addr_t_row;
                     const uint32_t n_global = n_block_idx * BLOCK_N + n_row;
                     const uint32_t sfb_word = __ldg(sfb_base_for_block_phase
                         + local_expert_idx * sfb_per_expert
                         + n_global * sfb_k_words
                         + cur_k_block_idx);
-                    const uint32_t e8m0 = (sfb_word >> (k_inner * 8)) & 0xffu;
+                    return (sfb_word >> (k_inner * 8)) & 0xffu;
+                };
+
+                auto decode_rs_a_reg = [&](uint32_t packed_shifted, uint32_t e8m0) -> uint32_t {
                     if (e8m0 == 0u) {
                         return 0u;
                     } else if constexpr (kFuseScaleBHummingDecode) {
@@ -1492,14 +1502,14 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 if (epilogue_thread_idx == 0)
                                     rs_profile_t0 = clock64();
                             }
-                            const uint32_t a0 = load_rs_a_reg(0, stage_idx, k_block_idx, k, rs_n_slice,
-                                                              sfb_base, sfb_per_expert, sfb_k_words);
-                            const uint32_t a1 = load_rs_a_reg(1, stage_idx, k_block_idx, k, rs_n_slice,
-                                                              sfb_base, sfb_per_expert, sfb_k_words);
-                            const uint32_t a2 = load_rs_a_reg(2, stage_idx, k_block_idx, k, rs_n_slice,
-                                                              sfb_base, sfb_per_expert, sfb_k_words);
-                            const uint32_t a3 = load_rs_a_reg(3, stage_idx, k_block_idx, k, rs_n_slice,
-                                                              sfb_base, sfb_per_expert, sfb_k_words);
+                            const uint32_t e8m0_02 = load_rs_e8m0(0, k_block_idx, k, rs_n_slice,
+                                                                  sfb_base, sfb_per_expert, sfb_k_words);
+                            const uint32_t e8m0_13 = load_rs_e8m0(1, k_block_idx, k, rs_n_slice,
+                                                                  sfb_base, sfb_per_expert, sfb_k_words);
+                            const uint32_t a0 = decode_rs_a_reg(load_rs_packed_nibbles(0, stage_idx, k), e8m0_02);
+                            const uint32_t a1 = decode_rs_a_reg(load_rs_packed_nibbles(1, stage_idx, k), e8m0_13);
+                            const uint32_t a2 = decode_rs_a_reg(load_rs_packed_nibbles(2, stage_idx, k), e8m0_02);
+                            const uint32_t a3 = decode_rs_a_reg(load_rs_packed_nibbles(3, stage_idx, k), e8m0_13);
                             if constexpr (kClockProfile) {
                                 if (epilogue_thread_idx == 0) {
                                     rs_profile_t1 = clock64();
