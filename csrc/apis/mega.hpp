@@ -370,6 +370,8 @@ static void fp8_fp4_mega_moe(
         const int num_math_wg_decode_warps =
             get_env<int>("DG_SM90_FP4_MATH_WG_DECODE_WARPS",
                          math_wg_participates_in_fp4_decode ? 4 : 0);
+        const int first_fp4_decode_assist_warp =
+            get_env<int>("DG_SM90_FP4_FIRST_DECODE_ASSIST_WARP", 0);
         const bool use_kg_pair_decode =
             get_env<int>("DG_SM90_FP4_KG_PAIR_DECODE", 0) != 0;
         const bool use_vector_store_decode =
@@ -380,8 +382,12 @@ static void fp8_fp4_mega_moe(
             get_env<int>("DG_SM90_FP4_COMMON_LUT_FASTPATH", 0) != 0;
         const bool use_kg_pipeline_decode =
             get_env<int>("DG_SM90_FP4_KG_PIPELINE_DECODE", 0) != 0;
+        const float expected_tokens_per_expert =
+            static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
+        const bool default_early_b_decode =
+            expected_tokens_per_expert >= 2.0f and expected_tokens_per_expert <= 4.0f;
         const bool use_early_b_decode =
-            get_env<int>("DG_SM90_FP4_EARLY_B_DECODE", 0) != 0;
+            get_env<int>("DG_SM90_FP4_EARLY_B_DECODE", default_early_b_decode ? 1 : 0) != 0;
         const bool use_decode_done_mbarrier =
             // Small-batch SM90 FP4 runs were consistently faster with the
             // decode-done rendezvous on the existing CTA barrier.
@@ -403,6 +409,7 @@ static void fp8_fp4_mega_moe(
                               use_rs_mode,
                               math_wg_participates_in_fp4_decode,
                               num_math_wg_decode_warps,
+                              first_fp4_decode_assist_warp,
                               use_kg_pair_decode,
                               use_vector_store_decode,
                               use_dynamic_lut_decode,
