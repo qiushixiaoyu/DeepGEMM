@@ -416,42 +416,57 @@ def benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         dist.all_reduce(fp4_clock_profile, op=dist.ReduceOp.SUM)
         if rank_idx == 0:
             values = [int(v) for v in fp4_clock_profile.cpu().tolist()]
-            clock_khz = float(torch.cuda.get_device_properties(0).clock_rate)
+            props = torch.cuda.get_device_properties(0)
+            clock_khz_value = getattr(props, "clock_rate", None)
+            if clock_khz_value is None:
+                clock_khz_value = getattr(props, "clockRate", None)
+            clock_khz = None if clock_khz_value is None else float(clock_khz_value)
 
             def cycles_per_block(slot_base: int, rel_slot: int) -> float:
                 count = values[slot_base]
                 return float("nan") if count == 0 else values[slot_base + rel_slot] / count
 
-            def us_per_block(slot_base: int, rel_slot: int) -> float:
+            def us_per_block(slot_base: int, rel_slot: int):
                 cycles = cycles_per_block(slot_base, rel_slot)
-                return float("nan") if math.isnan(cycles) else cycles * 1000.0 / clock_khz
+                if clock_khz is None or math.isnan(cycles):
+                    return None
+                return cycles * 1000.0 / clock_khz
+
+            def round_cycles(value: float):
+                return None if math.isnan(value) else round(value, 3)
+
+            def round_us(value):
+                return None if value is None else round(value, 6)
+
+            def sum_us(lhs, rhs):
+                return None if lhs is None or rhs is None else lhs + rhs
 
             clock_result = {
                 "batch_per_rank": num_tokens,
                 "num_ranks": num_ranks,
-                "clock_rate_khz": int(clock_khz),
+                "clock_rate_khz": None if clock_khz is None else int(clock_khz),
                 "l1_profiled_k_blocks": values[0],
-                "l1_full_wait_cycles_per_block": round(cycles_per_block(0, 1), 3),
-                "l1_decode_sync_cycles_per_block": round(cycles_per_block(0, 2), 3),
-                "l1_wait_decode_cycles_per_block": round(cycles_per_block(0, 1) + cycles_per_block(0, 2), 3),
-                "l1_wgmma_cycles_per_block": round(cycles_per_block(0, 3), 3),
-                "l1_promote_cycles_per_block": round(cycles_per_block(0, 4), 3),
-                "l1_full_wait_us_per_block": round(us_per_block(0, 1), 6),
-                "l1_decode_sync_us_per_block": round(us_per_block(0, 2), 6),
-                "l1_wait_decode_us_per_block": round(us_per_block(0, 1) + us_per_block(0, 2), 6),
-                "l1_wgmma_us_per_block": round(us_per_block(0, 3), 6),
-                "l1_promote_us_per_block": round(us_per_block(0, 4), 6),
+                "l1_full_wait_cycles_per_block": round_cycles(cycles_per_block(0, 1)),
+                "l1_decode_sync_cycles_per_block": round_cycles(cycles_per_block(0, 2)),
+                "l1_wait_decode_cycles_per_block": round_cycles(cycles_per_block(0, 1) + cycles_per_block(0, 2)),
+                "l1_wgmma_cycles_per_block": round_cycles(cycles_per_block(0, 3)),
+                "l1_promote_cycles_per_block": round_cycles(cycles_per_block(0, 4)),
+                "l1_full_wait_us_per_block": round_us(us_per_block(0, 1)),
+                "l1_decode_sync_us_per_block": round_us(us_per_block(0, 2)),
+                "l1_wait_decode_us_per_block": round_us(sum_us(us_per_block(0, 1), us_per_block(0, 2))),
+                "l1_wgmma_us_per_block": round_us(us_per_block(0, 3)),
+                "l1_promote_us_per_block": round_us(us_per_block(0, 4)),
                 "l2_profiled_k_blocks": values[8],
-                "l2_full_wait_cycles_per_block": round(cycles_per_block(8, 1), 3),
-                "l2_decode_sync_cycles_per_block": round(cycles_per_block(8, 2), 3),
-                "l2_wait_decode_cycles_per_block": round(cycles_per_block(8, 1) + cycles_per_block(8, 2), 3),
-                "l2_wgmma_cycles_per_block": round(cycles_per_block(8, 3), 3),
-                "l2_promote_cycles_per_block": round(cycles_per_block(8, 4), 3),
-                "l2_full_wait_us_per_block": round(us_per_block(8, 1), 6),
-                "l2_decode_sync_us_per_block": round(us_per_block(8, 2), 6),
-                "l2_wait_decode_us_per_block": round(us_per_block(8, 1) + us_per_block(8, 2), 6),
-                "l2_wgmma_us_per_block": round(us_per_block(8, 3), 6),
-                "l2_promote_us_per_block": round(us_per_block(8, 4), 6),
+                "l2_full_wait_cycles_per_block": round_cycles(cycles_per_block(8, 1)),
+                "l2_decode_sync_cycles_per_block": round_cycles(cycles_per_block(8, 2)),
+                "l2_wait_decode_cycles_per_block": round_cycles(cycles_per_block(8, 1) + cycles_per_block(8, 2)),
+                "l2_wgmma_cycles_per_block": round_cycles(cycles_per_block(8, 3)),
+                "l2_promote_cycles_per_block": round_cycles(cycles_per_block(8, 4)),
+                "l2_full_wait_us_per_block": round_us(us_per_block(8, 1)),
+                "l2_decode_sync_us_per_block": round_us(us_per_block(8, 2)),
+                "l2_wait_decode_us_per_block": round_us(sum_us(us_per_block(8, 1), us_per_block(8, 2))),
+                "l2_wgmma_us_per_block": round_us(us_per_block(8, 3)),
+                "l2_promote_us_per_block": round_us(us_per_block(8, 4)),
                 "raw_slots": values,
             }
             print("CLOCK_PROFILE_JSON " + json.dumps(clock_result, sort_keys=True), flush=True)
