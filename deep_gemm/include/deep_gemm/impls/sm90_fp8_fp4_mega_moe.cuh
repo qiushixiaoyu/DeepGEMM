@@ -1408,6 +1408,13 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t rs_lane_col_pair = lane_idx % 4;
                 const uint32_t packed_shift = (rs_lane_col_pair & 1u) * 16u;
                 const uint32_t rs_lane_pair_col = (rs_lane_col_pair & 2u) * 2u;
+                uint64_t rs_profile_count = 0;
+                uint64_t rs_profile_full_wait = 0;
+                uint64_t rs_profile_decode = 0;
+                uint64_t rs_profile_wgmma = 0;
+                uint64_t rs_profile_promote = 0;
+                uint64_t rs_profile_t0 = 0;
+                uint64_t rs_profile_t1 = 0;
 
                 auto load_rs_a_reg = [&](uint32_t mat,
                                          uint32_t cur_stage,
@@ -1455,7 +1462,20 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 };
 
                 for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                    uint64_t rs_stage_decode = 0;
+                    uint64_t rs_stage_wgmma = 0;
+                    uint64_t rs_stage_promote = 0;
+                    if constexpr (kClockProfile) {
+                        if (epilogue_thread_idx == 0)
+                            rs_profile_t0 = clock64();
+                    }
                     full_barriers[stage_idx]->wait(phase);
+                    if constexpr (kClockProfile) {
+                        if (epilogue_thread_idx == 0) {
+                            rs_profile_t1 = clock64();
+                            rs_profile_full_wait += rs_profile_t1 - rs_profile_t0;
+                        }
+                    }
                     const auto desc_b_base = mma::sm90::make_smem_desc(smem_a[stage_idx], 1);
                     const uint32_t desc_b_base_lo = __shfl_sync(0xffffffff, desc_b_base.reg32_[0], 0);
 
@@ -1468,6 +1488,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             const uint32_t* sfb_base = is_l1 ? l1_weights_sf : l2_weights_sf;
                             const uint32_t sfb_per_expert = is_l1 ? kL1SFBPerExpert : kL2SFBPerExpert;
                             const uint32_t sfb_k_words = is_l1 ? kL1SFBKWords : kL2SFBKWords;
+                            if constexpr (kClockProfile) {
+                                if (epilogue_thread_idx == 0)
+                                    rs_profile_t0 = clock64();
+                            }
                             const uint32_t a0 = load_rs_a_reg(0, stage_idx, k_block_idx, k, rs_n_slice,
                                                               sfb_base, sfb_per_expert, sfb_k_words);
                             const uint32_t a1 = load_rs_a_reg(1, stage_idx, k_block_idx, k, rs_n_slice,
@@ -1476,7 +1500,17 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                                               sfb_base, sfb_per_expert, sfb_k_words);
                             const uint32_t a3 = load_rs_a_reg(3, stage_idx, k_block_idx, k, rs_n_slice,
                                                               sfb_base, sfb_per_expert, sfb_k_words);
+                            if constexpr (kClockProfile) {
+                                if (epilogue_thread_idx == 0) {
+                                    rs_profile_t1 = clock64();
+                                    rs_stage_decode += rs_profile_t1 - rs_profile_t0;
+                                }
+                            }
 
+                            if constexpr (kClockProfile) {
+                                if (epilogue_thread_idx == 0)
+                                    rs_profile_t0 = clock64();
+                            }
                             #pragma unroll
                             for (uint32_t i = 0; i < kRSAccumPerThread; ++ i) {
                                 rs_accum[i] = 0.0f;
@@ -1491,9 +1525,19 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             for (uint32_t i = 0; i < kRSAccumPerThread; ++ i)
                                 ptx::warpgroup_fence_operand(rs_accum[i]);
                             ptx::warpgroup_wait<0>();
+                            if constexpr (kClockProfile) {
+                                if (epilogue_thread_idx == 0) {
+                                    rs_profile_t1 = clock64();
+                                    rs_stage_wgmma += rs_profile_t1 - rs_profile_t0;
+                                }
+                            }
 
                             const uint32_t sfa_half = k < 2 ? 0u : 1u;
                             const uint32_t rs_accum_base = rs_n_slice * kRSAccumPerThread;
+                            if constexpr (kClockProfile) {
+                                if (epilogue_thread_idx == 0)
+                                    rs_profile_t0 = clock64();
+                            }
                             #pragma unroll
                             for (uint32_t i = 0; i < kRSAccumPerThread / 4; ++ i) {
                                 const uint32_t token_0 = i * 8 + col_idx * 2;
@@ -1511,14 +1555,32 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 final_accum[rs_accum_base + i * 4 + 2] += scale_a_0 * rs_accum[i * 4 + 2];
                                 final_accum[rs_accum_base + i * 4 + 3] += scale_a_1 * rs_accum[i * 4 + 3];
                             }
+                            if constexpr (kClockProfile) {
+                                if (epilogue_thread_idx == 0) {
+                                    rs_profile_t1 = clock64();
+                                    rs_stage_promote += rs_profile_t1 - rs_profile_t0;
+                                }
+                            }
                         }
                     }
 
                     if (lane_idx == 0)
                         empty_barriers[stage_idx]->arrive();
+                    if constexpr (kClockProfile) {
+                        if (epilogue_thread_idx == 0) {
+                            ++ rs_profile_count;
+                            rs_profile_decode += rs_stage_decode;
+                            rs_profile_wgmma += rs_stage_wgmma;
+                            rs_profile_promote += rs_stage_promote;
+                        }
+                    }
                 }
 
                 if (block_phase == sched::BlockPhase::Linear1) {
+                    if constexpr (kClockProfile) {
+                        if (epilogue_thread_idx == 0)
+                            rs_profile_t0 = clock64();
+                    }
                     #pragma unroll
                     for (uint32_t rs_n_slice = 0; rs_n_slice < kNumRSNSlices; ++ rs_n_slice) {
                         const uint32_t rs_accum_base = rs_n_slice * kRSAccumPerThread;
@@ -1542,6 +1604,23 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             final_accum[out_chunk * 4 + 3] = smem_rs_accum[r_1 * RSWGMMA::M + out_col + 1];
                         }
                         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    }
+                    if constexpr (kClockProfile) {
+                        if (epilogue_thread_idx == 0) {
+                            rs_profile_t1 = clock64();
+                            rs_profile_promote += rs_profile_t1 - rs_profile_t0;
+                        }
+                    }
+                }
+
+                if constexpr (kClockProfile) {
+                    if (epilogue_thread_idx == 0) {
+                        const uint32_t slot_base = block_phase == sched::BlockPhase::Linear1 ? 0 : 8;
+                        fp4_profile_add(slot_base, rs_profile_count);
+                        fp4_profile_add(slot_base + 1, rs_profile_full_wait);
+                        fp4_profile_add(slot_base + 2, rs_profile_decode);
+                        fp4_profile_add(slot_base + 3, rs_profile_wgmma);
+                        fp4_profile_add(slot_base + 4, rs_profile_promote);
                     }
                 }
 
