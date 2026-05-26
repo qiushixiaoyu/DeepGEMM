@@ -39,6 +39,7 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
+        bool unit_weight_scale;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -83,6 +84,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
+        {},
         {}
     >);
 }};
@@ -98,7 +100,8 @@ static void __instantiate_kernel() {{
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
-    args.fast_math ? "true" : "false");
+    args.fast_math ? "true" : "false",
+    args.unit_weight_scale ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -138,6 +141,7 @@ static void sm90_fp8_mega_moe(
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
+    const bool unit_weight_scale = get_env<int>("DG_SM90_FP8_MEGA_MOE_UNIT_WEIGHT_SCALE") != 0;
 
     // Heuristics
     const auto config = get_mega_moe_config_sm90(
@@ -208,6 +212,7 @@ static void sm90_fp8_mega_moe(
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
+        .unit_weight_scale = unit_weight_scale,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

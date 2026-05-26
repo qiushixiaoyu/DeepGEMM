@@ -100,15 +100,22 @@ get_symm_buffer_size_for_mega_moe(
     const auto combine_sf_layout = layout::Data(combine_sf_bytes_per_token, false);
     const auto fp8_intermediate_token_layout = layout::Data(intermediate_hidden);
     const auto fp8_sf_layout = layout::Data(hidden / 32);
+    const int sm90_fp4_block_n = get_env<int>("DG_SM90_FP4_BLOCK_N", 128);
+    if (is_sm90)
+        DG_HOST_ASSERT(sm90_fp4_block_n == 64 or sm90_fp4_block_n == 128);
+    const int sm90_l2_act_sf_gran_k = sm90_fp4_block_n == 64 ? 32 : 64;
+
     // L2 acts SF granularity differs by arch:
     //   * SM100 packs 4 UE8M0 bytes per int along K, so each token uses
     //     `intermediate_hidden / 32` bytes (per-32 K).
     //   * SM90 stores per-64 K floats so that each L1 epilogue block (which
     //     produces 64 post-SwiGLU columns) can write its own SF independently
-    //     without cross-CTA amax synchronisation; bytes per token become
-    //     `intermediate_hidden / 64 * sizeof(float) = intermediate_hidden / 16`.
+    //     without cross-CTA amax synchronisation.  The experimental SM90 FP4
+    //     BLOCK_N=64 mode produces 32 post-SwiGLU columns per L1 block, so its
+    //     L2 SF view also switches to per-32.
     const int fp8_intermediate_sf_bytes_per_token =
-        is_sm90 ? (intermediate_hidden / 16) : (intermediate_hidden / 32);
+        is_sm90 ? (intermediate_hidden * static_cast<int>(sizeof(float)) / sm90_l2_act_sf_gran_k)
+                : (intermediate_hidden / 32);
     const auto fp8_intermediate_sf_layout = layout::Data(fp8_intermediate_sf_bytes_per_token);
     const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
     const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
@@ -217,7 +224,7 @@ get_symm_buffer_size_for_mega_moe(
             torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
         auto l2_acts_sf = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l2_sf_buffer.base)),
-            {num_max_padded_sf_pool_tokens, is_sm90 ? intermediate_hidden / 64 : intermediate_hidden / 128},
+            {num_max_padded_sf_pool_tokens, is_sm90 ? intermediate_hidden / sm90_l2_act_sf_gran_k : intermediate_hidden / 128},
             {1, num_max_padded_sf_pool_tokens},
             torch::TensorOptions().dtype(sf_dtype).device(buffer.device()));
         return std::make_tuple(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
@@ -237,7 +244,8 @@ static void fp8_fp4_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const std::optional<torch::Tensor>& fp4_clock_profile = std::nullopt
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -288,6 +296,12 @@ static void fp8_fp4_mega_moe(
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
+    }
+    if (fp4_clock_profile.has_value()) {
+        DG_HOST_ASSERT(fp4_clock_profile->is_cuda());
+        DG_HOST_ASSERT(fp4_clock_profile->scalar_type() == torch::kInt64);
+        DG_HOST_ASSERT(fp4_clock_profile->is_contiguous());
+        DG_HOST_ASSERT(fp4_clock_profile->numel() >= 16);
     }
 
     // Check buffer bytes
@@ -340,14 +354,36 @@ static void fp8_fp4_mega_moe(
                                activation_clamp, fast_math,
                                use_fp4_acts, use_mxf4_kind, use_fp8_combine);
     } else if (arch_major == 9) {
-        // SM90 (Hopper): FP8 acts × FP4 weights via decode-to-SMEM SS-mode
-        // WGMMA. The activation a2a stays FP8 (no `use_fp4_acts` on SM90 yet —
-        // there is no native FP4 WGMMA on Hopper, and FP4 acts would still need
-        // a per-tile dequant pass that bottlenecks on smem write bandwidth).
-        // The combine path likewise stays BF16 (Stream B is SM100-only).
+        // SM90 (Hopper): FP8 acts × FP4 weights. Default is decode-to-SMEM
+        // SS-mode WGMMA; `DG_SM90_FP4_RS_MODE=1` routes through the experimental
+        // RS-mode JIT/config plumbing. The activation a2a stays FP8 (no
+        // `use_fp4_acts` on SM90 yet — there is no native FP4 WGMMA on Hopper,
+        // and FP4 acts would still need a per-tile dequant pass that bottlenecks
+        // on smem write bandwidth). The combine path likewise stays BF16
+        // (Stream B is SM100-only).
         DG_HOST_ASSERT(not use_fp4_acts and not use_mxf4_kind and not use_fp8_combine);
         const bool fuse_scale_b_humming_decode =
             get_env<int>("DG_SM90_FP4_FUSE_SCALE_B_HUMMING_DECODE") != 0;
+        const bool use_rs_mode = get_env<int>("DG_SM90_FP4_RS_MODE") != 0;
+        const bool math_wg_participates_in_fp4_decode =
+            get_env<int>("DG_SM90_FP4_MATH_WG_DECODE", 1) != 0;
+        const int num_math_wg_decode_warps =
+            get_env<int>("DG_SM90_FP4_MATH_WG_DECODE_WARPS",
+                         math_wg_participates_in_fp4_decode ? 4 : 0);
+        const bool use_kg_pair_decode =
+            get_env<int>("DG_SM90_FP4_KG_PAIR_DECODE", 0) != 0;
+        const bool use_vector_store_decode =
+            get_env<int>("DG_SM90_FP4_VECTOR_STORE_DECODE", 1) != 0;
+        const bool use_dynamic_lut_decode =
+            get_env<int>("DG_SM90_FP4_DYNAMIC_LUT_DECODE", 0) != 0;
+        const bool use_common_lut_fast_path =
+            get_env<int>("DG_SM90_FP4_COMMON_LUT_FASTPATH", 0) != 0;
+        const bool use_kg_pipeline_decode =
+            get_env<int>("DG_SM90_FP4_KG_PIPELINE_DECODE", 0) != 0;
+        const bool use_early_b_decode =
+            get_env<int>("DG_SM90_FP4_EARLY_B_DECODE", 0) != 0;
+        const bool use_decode_done_mbarrier =
+            get_env<int>("DG_SM90_FP4_DECODE_MBARRIER", 1) != 0;
         sm90_fp8_fp4_mega_moe(y,
                               l1_acts, l1_acts_sf,
                               l2_acts, l2_acts_sf,
@@ -361,7 +397,18 @@ static void fp8_fp4_mega_moe(
                               hidden, intermediate_hidden,
                               activation_clamp, fast_math,
                               fuse_scale_b_humming_decode,
-                              /*scale_b_pow2_promote=*/true);
+                              /*scale_b_pow2_promote=*/true,
+                              use_rs_mode,
+                              math_wg_participates_in_fp4_decode,
+                              num_math_wg_decode_warps,
+                              use_kg_pair_decode,
+                              use_vector_store_decode,
+                              use_dynamic_lut_decode,
+                              use_common_lut_fast_path,
+                              use_kg_pipeline_decode,
+                              use_early_b_decode,
+                              use_decode_done_mbarrier,
+                              fp4_clock_profile);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -493,7 +540,8 @@ static void register_apis(pybind11::module_& m) {
              const std::tuple<int, int, int>& recipe,
              const std::string& activation,
              const std::optional<float>& activation_clamp_opt,
-             const bool& fast_math) {
+             const bool& fast_math,
+             const std::optional<torch::Tensor>& fp4_clock_profile) {
               fp8_fp4_mega_moe(
                   y,
                   std::make_tuple(l1_weights, l1_weights_sf),
@@ -501,7 +549,8 @@ static void register_apis(pybind11::module_& m) {
                   cumulative_local_expert_recv_stats,
                   sym_buffer, sym_buffer_ptrs, rank_idx,
                   num_max_tokens_per_rank, num_experts, num_topk,
-                  recipe, activation, activation_clamp_opt, fast_math);
+                  recipe, activation, activation_clamp_opt, fast_math,
+                  fp4_clock_profile);
           });
     m.def("mega_moe_pre_dispatch", &mega_moe_pre_dispatch,
           pybind11::arg("x"),

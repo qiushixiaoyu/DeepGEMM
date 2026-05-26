@@ -557,8 +557,10 @@ dg_get_symm_buffer_size_for_mega_moe(int64_t num_ranks, int64_t num_experts, int
 void dg_fp8_fp4_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weights_sf, TensorView l2_weights, TensorView l2_weights_sf,
                         Optional<TensorView> cumulative_local_expert_recv_stats, TensorView sym_buffer, Array<int64_t> sym_buffer_ptrs,
                         int64_t rank_idx, int64_t num_max_tokens_per_rank, int64_t num_experts, int64_t num_topk,
-                        Tuple<int64_t, int64_t, int64_t> recipe, std::string activation, Optional<double> activation_clamp_opt, bool fast_math) {
+                        Tuple<int64_t, int64_t, int64_t> recipe, std::string activation, Optional<double> activation_clamp_opt, bool fast_math,
+                        Optional<TensorView> fp4_clock_profile) {
     auto c_val = cumulative_local_expert_recv_stats.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(cumulative_local_expert_recv_stats.value())) : std::nullopt;
+    auto fp4_clock_profile_val = fp4_clock_profile.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(fp4_clock_profile.value())) : std::nullopt;
     auto act_clamp_opt_val = activation_clamp_opt.has_value()? std::optional<float>(static_cast<float>(activation_clamp_opt.value())) : std::nullopt;
     std::vector<int64_t> sym_buffer_ptrs_val;
     sym_buffer_ptrs_val.reserve(sym_buffer_ptrs.size());
@@ -575,7 +577,8 @@ void dg_fp8_fp4_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weig
         std::make_pair(convert_to_torch_tensor(l2_weights), convert_to_torch_tensor(l2_weights_sf)),
         c_val, convert_to_torch_tensor(sym_buffer), sym_buffer_ptrs_val, static_cast<int>(rank_idx),
         static_cast<int>(num_max_tokens_per_rank), static_cast<int>(num_experts),
-        static_cast<int>(num_topk), recipe_val, activation, act_clamp_opt_val, fast_math
+        static_cast<int>(num_topk), recipe_val, activation, act_clamp_opt_val, fast_math,
+        fp4_clock_profile_val
     );
 }
 

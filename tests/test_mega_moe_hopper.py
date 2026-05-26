@@ -64,6 +64,17 @@ WEIGHT_SF_GRAN_MN = 128
 WEIGHT_SF_GRAN_K = 128
 
 
+def _m_grouped_fp8_gemm_nt_masked(*args, **kwargs):
+    fn = (
+        getattr(deep_gemm, "m_grouped_fp8_gemm_nt_masked", None)
+        or getattr(deep_gemm, "fp8_m_grouped_gemm_nt_masked", None)
+        or getattr(deep_gemm, "m_grouped_fp8_fp4_gemm_nt_masked", None)
+    )
+    if fn is None:
+        raise AttributeError("no masked grouped FP8 GEMM API is exported by deep_gemm")
+    return fn(*args, **kwargs)
+
+
 # ============================================================================
 # Section 1: Triton SwiGLU + FP8 quantization kernel.
 # ----------------------------------------------------------------------------
@@ -836,7 +847,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
         # 2) L1 masked grouped FP8 GEMM:
         #    (E_local, M_max, hidden) @ (E_local, 2*IH, hidden)^T -> (E_local, M_max, 2*IH).
-        deep_gemm.m_grouped_fp8_gemm_nt_masked(
+        _m_grouped_fp8_gemm_nt_masked(
             (recv_x_data, recv_x_sf),
             l1_weights,
             ll_l1_y,
@@ -857,7 +868,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
         # 4) L2 masked grouped FP8 GEMM:
         #    (E_local, M_max, IH) @ (E_local, H, IH)^T -> (E_local, M_max, H).
-        deep_gemm.m_grouped_fp8_gemm_nt_masked(
+        _m_grouped_fp8_gemm_nt_masked(
             (l1_fp8, l1_sf),
             l2_weights,
             ll_l2_y,

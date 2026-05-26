@@ -14,12 +14,12 @@ namespace deep_gemm::mma::sm90 {
 template <int N_, typename MMA>
 struct FP8MMA {
     template <size_t ...Idx>
-    CUTLASS_DEVICE static void call_fma_impl(uint64_t const& desc_a, uint64_t const& desc_b, float* d, bool scale_d, cute::index_sequence<Idx...>) {
+    __forceinline__ __device__ static void call_fma_impl(uint64_t const& desc_a, uint64_t const& desc_b, float* d, bool scale_d, cute::index_sequence<Idx...>) {
         using namespace cute::SM90::GMMA;
         MMA::fma(desc_a, desc_b, d[Idx]..., (scale_d ? ScaleOut::One : ScaleOut::Zero));
     }
 
-    CUTLASS_DEVICE static void wgmma(uint64_t const& desc_a, uint64_t const& desc_b, float* d, bool scale_d) {
+    __forceinline__ __device__ static void wgmma(uint64_t const& desc_a, uint64_t const& desc_b, float* d, bool scale_d) {
         call_fma_impl(desc_a, desc_b, d, scale_d, cute::make_index_sequence<N_ / 2>{});
     }
 
@@ -81,13 +81,26 @@ struct FP8MMASelector {
 template <int N_, typename MMA>
 struct FP8MMARS {
     template <size_t ...Idx>
-    CUTLASS_DEVICE static void call_fma_impl(uint32_t* a, uint64_t const& desc_b, float* d, bool scale_d, cute::index_sequence<Idx...>) {
+    __forceinline__ __device__ static void call_fma_impl(uint32_t* a, uint64_t const& desc_b, float* d, bool scale_d, cute::index_sequence<Idx...>) {
         using namespace cute::SM90::GMMA;
         MMA::fma(a[0], a[1], a[2], a[3], desc_b, d[Idx]..., (scale_d ? ScaleOut::One : ScaleOut::Zero));
     }
 
-    CUTLASS_DEVICE static void wgmma(uint32_t* a, uint64_t const& desc_b, float* d, bool scale_d) {
+    __forceinline__ __device__ static void wgmma(uint32_t* a, uint64_t const& desc_b, float* d, bool scale_d) {
         call_fma_impl(a, desc_b, d, scale_d, cute::make_index_sequence<N_ / 2>{});
+    }
+
+    template <size_t ...Idx>
+    __forceinline__ __device__ static void call_fma_impl(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                             uint64_t const& desc_b, float* d, bool scale_d,
+                                             cute::index_sequence<Idx...>) {
+        using namespace cute::SM90::GMMA;
+        MMA::fma(a0, a1, a2, a3, desc_b, d[Idx]..., (scale_d ? ScaleOut::One : ScaleOut::Zero));
+    }
+
+    __forceinline__ __device__ static void wgmma(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                     uint64_t const& desc_b, float* d, bool scale_d) {
+        call_fma_impl(a0, a1, a2, a3, desc_b, d, scale_d, cute::make_index_sequence<N_ / 2>{});
     }
 
     static constexpr int M = 64;
@@ -147,12 +160,12 @@ struct FP8MMASelectorRS {
 template <int N_, typename MMA>
 struct BF16MMA {
     template <size_t ...Idx>
-    CUTLASS_DEVICE static void call_fma_impl(uint64_t const& desc_a, uint64_t const& desc_b, float* d, bool scale_d, cute::index_sequence<Idx...>) {
+    __forceinline__ __device__ static void call_fma_impl(uint64_t const& desc_a, uint64_t const& desc_b, float* d, bool scale_d, cute::index_sequence<Idx...>) {
         using namespace cute::SM90::GMMA;
         MMA::fma(desc_a, desc_b, d[Idx]..., (scale_d ? ScaleOut::One : ScaleOut::Zero));
     }
 
-    CUTLASS_DEVICE static void wgmma(uint64_t const& desc_a, uint64_t const& desc_b, float* d, bool scale_d) {
+    __forceinline__ __device__ static void wgmma(uint64_t const& desc_a, uint64_t const& desc_b, float* d, bool scale_d) {
         call_fma_impl(desc_a, desc_b, d, scale_d, cute::make_index_sequence<N_/2>{});
     }
 
@@ -220,12 +233,12 @@ struct BF16MMASelector {
 template <int N_, typename MMA>
 struct TF32MMARS {
     template <size_t ...Idx>
-    CUTLASS_DEVICE static void call_fma_impl(uint32_t* a, uint64_t const& desc_b, float* d, bool scale_d, cute::index_sequence<Idx...>) {
+    __forceinline__ __device__ static void call_fma_impl(uint32_t* a, uint64_t const& desc_b, float* d, bool scale_d, cute::index_sequence<Idx...>) {
         using namespace cute::SM90::GMMA;
         MMA::fma(a[0], a[1], a[2], a[3], desc_b, d[Idx]..., (scale_d ? ScaleOut::One : ScaleOut::Zero));
     }
 
-    CUTLASS_DEVICE static void wgmma(float* a, uint64_t const& desc_b, float* d, bool scale_d) {
+    __forceinline__ __device__ static void wgmma(float* a, uint64_t const& desc_b, float* d, bool scale_d) {
         call_fma_impl(reinterpret_cast<uint32_t*>(a), desc_b, d, scale_d, cute::make_index_sequence<N_/2>{});
     }
 
