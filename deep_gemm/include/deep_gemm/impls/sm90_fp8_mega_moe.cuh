@@ -95,6 +95,7 @@ template <
     bool kL2ArrivalCounter,
     bool kL2EpilogueRequiresFullSync,
     bool kSplitPhaseHotPath,
+    bool kUnitWeightScale = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -1242,16 +1243,18 @@ sm90_fp8_mega_moe_impl(void* y,
                 constexpr uint32_t kL1SFGateBlks  = kIntermediateHidden / 128;
                 constexpr uint32_t kL1SFPerExpert = (kIntermediateHidden * 2 / 128) * kL1SFKBlocks;
                 constexpr uint32_t kL2SFPerExpert = (kHidden / 128) * kL2SFKBlocks;
-                float gate_sf = 0.0f, up_sf = 0.0f, l2_sf = 0.0f;
-                if (block_phase == sched::BlockPhase::Linear1) {
-                    const uint32_t gate_n = sf_n_block_idx / 2u;
-                    const uint32_t up_n   = kL1SFGateBlks + gate_n;
-                    const float* base = l1_weights_sf + local_expert_idx * kL1SFPerExpert + k_block_idx;
-                    gate_sf = __ldg(base + gate_n * kL1SFKBlocks);
-                    up_sf   = __ldg(base + up_n   * kL1SFKBlocks);
-                } else {
-                    l2_sf = __ldg(l2_weights_sf + local_expert_idx * kL2SFPerExpert
-                                                + sf_n_block_idx * kL2SFKBlocks + k_block_idx);
+                float gate_sf = 1.0f, up_sf = 1.0f, l2_sf = 1.0f;
+                if constexpr (!kUnitWeightScale) {
+                    if (block_phase == sched::BlockPhase::Linear1) {
+                        const uint32_t gate_n = sf_n_block_idx / 2u;
+                        const uint32_t up_n   = kL1SFGateBlks + gate_n;
+                        const float* base = l1_weights_sf + local_expert_idx * kL1SFPerExpert + k_block_idx;
+                        gate_sf = __ldg(base + gate_n * kL1SFKBlocks);
+                        up_sf   = __ldg(base + up_n   * kL1SFKBlocks);
+                    } else {
+                        l2_sf = __ldg(l2_weights_sf + local_expert_idx * kL2SFPerExpert
+                                                    + sf_n_block_idx * kL2SFKBlocks + k_block_idx);
+                    }
                 }
 
                 if (block_phase == sched::BlockPhase::Linear1) {
@@ -1278,13 +1281,23 @@ sm90_fp8_mega_moe_impl(void* y,
                     // L1: gate/up alternate at gran=8 along N; each `i` block of 8
                     // cols belongs entirely to one of {gate, up}, so .x and .y
                     // share the same scalar.
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
-                        const float sb = (i & 1u) ? up_sf : gate_sf;
-                        final_accum[i*4+0] += scale_a_0_lo * sb * accum[i*4+0];
-                        final_accum[i*4+1] += scale_a_0_lo * sb * accum[i*4+1];
-                        final_accum[i*4+2] += scale_a_1_lo * sb * accum[i*4+2];
-                        final_accum[i*4+3] += scale_a_1_lo * sb * accum[i*4+3];
+                    if constexpr (kUnitWeightScale) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                            final_accum[i*4+0] += scale_a_0_lo * accum[i*4+0];
+                            final_accum[i*4+1] += scale_a_0_lo * accum[i*4+1];
+                            final_accum[i*4+2] += scale_a_1_lo * accum[i*4+2];
+                            final_accum[i*4+3] += scale_a_1_lo * accum[i*4+3];
+                        }
+                    } else {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                            const float sb = (i & 1u) ? up_sf : gate_sf;
+                            final_accum[i*4+0] += scale_a_0_lo * sb * accum[i*4+0];
+                            final_accum[i*4+1] += scale_a_0_lo * sb * accum[i*4+1];
+                            final_accum[i*4+2] += scale_a_1_lo * sb * accum[i*4+2];
+                            final_accum[i*4+3] += scale_a_1_lo * sb * accum[i*4+3];
+                        }
                     }
                 } else {
                     // L2: split BLOCK_K=128 into two halves (per-64 SFA), each 2 WGMMAs.
@@ -1306,12 +1319,22 @@ sm90_fp8_mega_moe_impl(void* y,
                     ptx::warpgroup_wait<0>();
 
                     // L2 first half: single scalar `l2_sf` broadcast across N.
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
-                        final_accum[i*4+0] += scale_a_0_lo * l2_sf * accum[i*4+0];
-                        final_accum[i*4+1] += scale_a_0_lo * l2_sf * accum[i*4+1];
-                        final_accum[i*4+2] += scale_a_1_lo * l2_sf * accum[i*4+2];
-                        final_accum[i*4+3] += scale_a_1_lo * l2_sf * accum[i*4+3];
+                    if constexpr (kUnitWeightScale) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                            final_accum[i*4+0] += scale_a_0_lo * accum[i*4+0];
+                            final_accum[i*4+1] += scale_a_0_lo * accum[i*4+1];
+                            final_accum[i*4+2] += scale_a_1_lo * accum[i*4+2];
+                            final_accum[i*4+3] += scale_a_1_lo * accum[i*4+3];
+                        }
+                    } else {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                            final_accum[i*4+0] += scale_a_0_lo * l2_sf * accum[i*4+0];
+                            final_accum[i*4+1] += scale_a_0_lo * l2_sf * accum[i*4+1];
+                            final_accum[i*4+2] += scale_a_1_lo * l2_sf * accum[i*4+2];
+                            final_accum[i*4+3] += scale_a_1_lo * l2_sf * accum[i*4+3];
+                        }
                     }
 
                     // Second half: K=64..127, SFA = scale_a_*_hi
@@ -1336,12 +1359,22 @@ sm90_fp8_mega_moe_impl(void* y,
                         empty_barriers[stage_idx]->arrive();
 
                     // L2 second half: same broadcast scalar `l2_sf`.
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
-                        final_accum[i*4+0] += scale_a_0_hi * l2_sf * accum[i*4+0];
-                        final_accum[i*4+1] += scale_a_0_hi * l2_sf * accum[i*4+1];
-                        final_accum[i*4+2] += scale_a_1_hi * l2_sf * accum[i*4+2];
-                        final_accum[i*4+3] += scale_a_1_hi * l2_sf * accum[i*4+3];
+                    if constexpr (kUnitWeightScale) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                            final_accum[i*4+0] += scale_a_0_hi * accum[i*4+0];
+                            final_accum[i*4+1] += scale_a_0_hi * accum[i*4+1];
+                            final_accum[i*4+2] += scale_a_1_hi * accum[i*4+2];
+                            final_accum[i*4+3] += scale_a_1_hi * accum[i*4+3];
+                        }
+                    } else {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                            final_accum[i*4+0] += scale_a_0_hi * l2_sf * accum[i*4+0];
+                            final_accum[i*4+1] += scale_a_0_hi * l2_sf * accum[i*4+1];
+                            final_accum[i*4+2] += scale_a_1_hi * l2_sf * accum[i*4+2];
+                            final_accum[i*4+3] += scale_a_1_hi * l2_sf * accum[i*4+3];
+                        }
                     }
                 }
             }

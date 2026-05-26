@@ -13,6 +13,14 @@
 
 #include "exception.hpp"
 
+// CUDA 13 names the FP4 TensorMap data types, while CUDA 12.x headers used on
+// some H20 test hosts do not. Keep the numeric values aligned with CUDA 13 so
+// the runtime can probe whether the installed driver accepts FP4 TensorMaps.
+#ifndef CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B
+#define CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B static_cast<CUtensorMapDataType>(13)
+#define CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B static_cast<CUtensorMapDataType>(14)
+#endif
+
 namespace deep_gemm {
 
 // ---------------------------------------------------------------------------

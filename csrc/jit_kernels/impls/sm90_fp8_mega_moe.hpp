@@ -44,6 +44,7 @@ public:
         bool l2_arrival_counter;
         bool l2_epilogue_requires_full_sync;
         bool split_phase_hot_path;
+        bool unit_weight_scale;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -93,6 +94,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -113,7 +115,8 @@ static void __instantiate_kernel() {{
     args.reuse_accum_as_final ? "true" : "false",
     args.l2_arrival_counter ? "true" : "false",
     args.l2_epilogue_requires_full_sync ? "true" : "false",
-    args.split_phase_hot_path ? "true" : "false");
+    args.split_phase_hot_path ? "true" : "false",
+    args.unit_weight_scale ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -153,6 +156,7 @@ static void sm90_fp8_mega_moe(
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
+    const bool unit_weight_scale = get_env<int>("DG_SM90_FP8_MEGA_MOE_UNIT_WEIGHT_SCALE") != 0;
 
     // Heuristics
     const auto config = get_mega_moe_config_sm90(
@@ -264,6 +268,7 @@ static void sm90_fp8_mega_moe(
         .l2_arrival_counter = l2_arrival_counter,
         .l2_epilogue_requires_full_sync = l2_epilogue_requires_full_sync,
         .split_phase_hot_path = split_phase_hot_path,
+        .unit_weight_scale = unit_weight_scale,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

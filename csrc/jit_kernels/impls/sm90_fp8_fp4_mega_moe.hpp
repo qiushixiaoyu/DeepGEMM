@@ -50,6 +50,23 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
+        // A/B knob: decode two consecutive K/32 groups in one work item. Keep
+        // this as a JIT-time specialization so the default helper does not
+        // carry both code paths and pollute small-batch codegen.
+        bool use_kg_pair_decode;
+        // A/B knob: reduce decoded-tile shared-store instruction count by
+        // writing two adjacent u64 outputs with one st.shared.v2.u64.
+        bool use_vector_store_decode;
+        // A/B knob: build the scaled E4M3 LUT in registers from UE8M0 instead
+        // of loading the 64-bit LUT from constant memory.
+        bool use_dynamic_lut_decode;
+        // A/B knob: bypass the constant LUT for the common UE8M0 scale values
+        // seen in small-batch FP4 expert weights.
+        bool use_common_lut_fast_path;
+        // A/B knob: decode one K/32 group at a time and let the math warpgroup
+        // consume each group immediately, overlapping the next group's decode
+        // with the current WGMMA batch.
+        bool use_kg_pipeline_decode;
         // Plan-C / humming decode: fold SFB exponent into the FP4 → E4M3 LUT.
         // Keep as a JIT-time knob so we can A/B against Plan B (post-MMA
         // promote) without recompiling the host runtime.
@@ -58,6 +75,28 @@ public:
         // Currently always true (DSV4 standard); exposed for parity with
         // future FP32 SFB experiments.
         bool scale_b_pow2_promote;
+        // Experimental RS-mode plumbing. When enabled, the JIT instantiates a
+        // distinct kernel/config intended to keep decoded FP4 weight fragments
+        // in registers instead of writing an E4M3 B tile back to shared memory.
+        bool use_rs_mode;
+        // A/B knob for overlapping FP4 decode with WGMMA. When false, the math
+        // warpgroup only waits on the decode barrier; non-epilogue warps do the
+        // decode work and can run ahead through pipeline stages.
+        bool math_wg_participates_in_fp4_decode;
+        // A/B knob: limit how many warps inside the math warpgroup help decode.
+        // This keeps CTA size fixed while testing whether reducing math-side
+        // non-tensor-core work improves WGMMA feed.
+        int num_math_wg_decode_warps;
+        // A/B knob: split packed-B readiness from the A+B full barrier so the
+        // assist warps can start FP4 decode while A/SFA TMA is still in flight.
+        bool use_early_b_decode;
+        // A/B knob: replace the FP4 decode rendezvous sync with a per-stage
+        // mbarrier so assist warps can run ahead after publishing a decoded tile.
+        bool use_decode_done_mbarrier;
+        // Debug-only instrumentation. This is a JIT-time knob so normal
+        // performance builds do not carry clock64 instructions or hot-path
+        // branches.
+        bool use_clock_profile;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -77,6 +116,7 @@ public:
         CUtensorMap tensor_map_l2_acts_sf;
         CUtensorMap tensor_map_l2_weights;
         const uint32_t* l2_weights_sf;
+        uint64_t* fp4_clock_profile;
 
         // Launch configs
         LaunchArgs launch_args;
@@ -88,6 +128,7 @@ public:
 
 using namespace deep_gemm;
 
+// JIT cache version: sm90_fp8_fp4_mega_moe_mbarrier_profile_v1
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm90_fp8_fp4_mega_moe_impl<
         {},
@@ -102,7 +143,18 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
-        {}, {}
+        {},
+        {},
+        {},
+        {},
+        {},
+        {},
+        {}, {},
+        {},
+        {},
+        {},
+        {},
+        {}
     >);
 }};
 )",
@@ -118,8 +170,19 @@ static void __instantiate_kernel() {{
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
+    args.use_kg_pair_decode ? "true" : "false",
+    args.use_vector_store_decode ? "true" : "false",
+    args.use_dynamic_lut_decode ? "true" : "false",
+    args.use_common_lut_fast_path ? "true" : "false",
+    args.use_kg_pipeline_decode ? "true" : "false",
     args.fuse_scale_b_humming_decode ? "true" : "false",
-    args.scale_b_pow2_promote        ? "true" : "false");
+    args.scale_b_pow2_promote        ? "true" : "false",
+    args.use_rs_mode                 ? "true" : "false",
+    args.math_wg_participates_in_fp4_decode ? "true" : "false",
+    args.num_math_wg_decode_warps,
+    args.use_early_b_decode ? "true" : "false",
+    args.use_decode_done_mbarrier ? "true" : "false",
+    args.use_clock_profile ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -136,7 +199,8 @@ static void __instantiate_kernel() {{
             args.tensor_map_l2_acts,
             args.tensor_map_l2_acts_sf,
             args.tensor_map_l2_weights,
-            args.l2_weights_sf
+            args.l2_weights_sf,
+            args.fp4_clock_profile
         ));
     }
 };
@@ -156,7 +220,18 @@ static void sm90_fp8_fp4_mega_moe(
     const float& activation_clamp,
     const bool& fast_math,
     const bool& fuse_scale_b_humming_decode = true,
-    const bool& scale_b_pow2_promote        = true
+    const bool& scale_b_pow2_promote        = true,
+    const bool& use_rs_mode                 = false,
+    const bool& math_wg_participates_in_fp4_decode = true,
+    const int& num_math_wg_decode_warps = 4,
+    const bool& use_kg_pair_decode = false,
+    const bool& use_vector_store_decode = false,
+    const bool& use_dynamic_lut_decode = false,
+    const bool& use_common_lut_fast_path = false,
+    const bool& use_kg_pipeline_decode = false,
+    const bool& use_early_b_decode = false,
+    const bool& use_decode_done_mbarrier = false,
+    const std::optional<torch::Tensor>& fp4_clock_profile = std::nullopt
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -168,16 +243,19 @@ static void sm90_fp8_fp4_mega_moe(
                    l1_weights_sf.scalar_type() == torch::kUInt32);
     DG_HOST_ASSERT(l2_weights_sf.scalar_type() == torch::kInt32 or
                    l2_weights_sf.scalar_type() == torch::kUInt32);
+    DG_HOST_ASSERT(num_math_wg_decode_warps >= 0 and num_math_wg_decode_warps <= 4);
+    DG_HOST_ASSERT(math_wg_participates_in_fp4_decode or num_math_wg_decode_warps == 0);
 
     // Heuristics
     const auto config = get_mega_moe_config_sm90_fp4(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk,
-        hidden, intermediate_hidden, num_padded_sf_pool_tokens);
+        hidden, intermediate_hidden, num_padded_sf_pool_tokens,
+        use_rs_mode, use_early_b_decode, use_decode_done_mbarrier);
 
     // Tensormap construction
     constexpr int kGranK         = 128;  // L1 acts SF granularity (per-128 K)
-    constexpr int kL2ActsSFGranK = 64;   // L2 acts SF granularity (per-64 K)
+    const int kL2ActsSFGranK = config.block_n == 64 ? 32 : 64;
 
     // Acts: FP8 e4m3, identical to FP8 path
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
@@ -233,6 +311,9 @@ static void sm90_fp8_fp4_mega_moe(
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
     if (cumulative_local_expert_recv_stats.has_value())
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
+    uint64_t* fp4_clock_profile_ptr = nullptr;
+    if (fp4_clock_profile.has_value())
+        fp4_clock_profile_ptr = reinterpret_cast<uint64_t*>(fp4_clock_profile->data_ptr<int64_t>());
 
     // Launch
     const auto num_sms = device_runtime->get_num_sms();
@@ -243,8 +324,19 @@ static void sm90_fp8_fp4_mega_moe(
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
+        .use_kg_pair_decode = use_kg_pair_decode,
+        .use_vector_store_decode = use_vector_store_decode,
+        .use_dynamic_lut_decode = use_dynamic_lut_decode,
+        .use_common_lut_fast_path = use_common_lut_fast_path,
+        .use_kg_pipeline_decode = use_kg_pipeline_decode,
         .fuse_scale_b_humming_decode = fuse_scale_b_humming_decode,
         .scale_b_pow2_promote        = scale_b_pow2_promote,
+        .use_rs_mode                 = use_rs_mode,
+        .math_wg_participates_in_fp4_decode = math_wg_participates_in_fp4_decode,
+        .num_math_wg_decode_warps = num_math_wg_decode_warps,
+        .use_early_b_decode = use_early_b_decode,
+        .use_decode_done_mbarrier = use_decode_done_mbarrier,
+        .use_clock_profile = fp4_clock_profile_ptr != nullptr,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -259,11 +351,15 @@ static void sm90_fp8_fp4_mega_moe(
         .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
         .tensor_map_l2_weights = tensor_map_l2_weights,
         .l2_weights_sf = reinterpret_cast<const uint32_t*>(l2_weights_sf.data_ptr()),
+        .fp4_clock_profile = fp4_clock_profile_ptr,
         .launch_args = LaunchArgs(num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, config.cluster_size)
     };
     const auto code = SM90FP8FP4MegaMoERuntime::generate(args);
-    const auto runtime = compiler->build("sm90_fp8_fp4_mega_moe", code);
+    const auto runtime_name = use_rs_mode
+        ? (args.use_clock_profile ? "sm90_fp8_fp4_mega_moe_rs_clock_profile" : "sm90_fp8_fp4_mega_moe_rs")
+        : (args.use_clock_profile ? "sm90_fp8_fp4_mega_moe_clock_profile" : "sm90_fp8_fp4_mega_moe");
+    const auto runtime = compiler->build(runtime_name, code);
     SM90FP8FP4MegaMoERuntime::launch(runtime, args);
 }
 

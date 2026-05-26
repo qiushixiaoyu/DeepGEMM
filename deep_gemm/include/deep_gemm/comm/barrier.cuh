@@ -6,6 +6,10 @@
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
 
+#ifndef DG_NVLINK_BARRIER_VERBOSE_TIMEOUT
+#define DG_NVLINK_BARRIER_VERBOSE_TIMEOUT 0
+#endif
+
 namespace deep_gemm::comm {
 
 #ifndef DG_NVLINK_BARRIER_VERBOSE_TIMEOUT

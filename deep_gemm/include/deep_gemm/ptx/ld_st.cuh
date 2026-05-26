@@ -148,7 +148,15 @@ CUTLASS_DEVICE void st_shared(const void* ptr, uint32_t x, uint32_t y, uint32_t 
 }
 
 CUTLASS_DEVICE void st_shared(const __int128_t* ptr, __int128_t val) {
+#if defined(CUDART_VERSION) and CUDART_VERSION < 13000
+    const auto bits = static_cast<unsigned __int128>(val);
+    const auto lo = static_cast<uint64_t>(bits);
+    const auto hi = static_cast<uint64_t>(bits >> 64);
+    asm volatile("st.shared.v2.u64 [%0], {%1, %2};" ::
+                 "l"(__cvta_generic_to_shared(ptr)), "l"(lo), "l"(hi));
+#else
     asm volatile("st.shared.b128 [%0], %1;" :: "l"(__cvta_generic_to_shared(ptr)), "q"(val));
+#endif
 }
 
 CUTLASS_DEVICE void st_shared(const float4* ptr, float4 val) {
