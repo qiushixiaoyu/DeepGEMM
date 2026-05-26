@@ -491,6 +491,7 @@ template <
     bool kUseRSMode               = false,  // correctness-first RS mainloop
     bool kMathWGParticipatesInFP4Decode = true,
     uint32_t kNumMathWGDecodeWarps = kMathWGParticipatesInFP4Decode ? (kNumEpilogueThreads / 32) : 0,
+    uint32_t kFirstFP4DecodeAssistWarp = 0,  // A/B: skip early non-epilogue warps as decode helpers
     bool kEarlyBDecode            = false,  // A/B: overlap assist decode with A/SFA TMA
     bool kDecodeDoneMBarrier      = false,  // A/B: one-way decode-done mbarrier instead of rendezvous sync
     bool kClockProfile            = false,  // debug-only clock64 phase counters
@@ -538,6 +539,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                      "Math decode warps cannot exceed epilogue warps");
     DG_STATIC_ASSERT(kMathWGParticipatesInFP4Decode or kNumMathWGDecodeWarps == 0,
                      "Math decode warp count requires math WG decode participation");
+    DG_STATIC_ASSERT(kFirstFP4DecodeAssistWarp <= kNumMMANonEpilogueWarps,
+                     "First FP4 decode assist warp is out of range");
     DG_STATIC_ASSERT(!kUseKGPipelineDecode or !kUseRSMode,
                      "Per-KG pipeline is only implemented for decode-to-SMEM mode");
     DG_STATIC_ASSERT(!kUseRSMode or (BLOCK_M == 64 and kNumEpilogueWarpgroups == 1),
@@ -856,7 +859,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kL2SFBKWords     = kIntermediateHidden / 128;
     constexpr uint32_t kL1SFBPerExpert  = (kIntermediateHidden * 2) * kL1SFBKWords;
     constexpr uint32_t kL2SFBPerExpert  = kHidden * kL2SFBKWords;
-    constexpr uint32_t kFirstFP4DecodeAssistWarp = 0;
     constexpr uint32_t kNumFP4DecodeAssistWarps =
         kNumMMANonEpilogueWarps - kFirstFP4DecodeAssistWarp;
     constexpr uint32_t kNumFP4DecodeAssistThreads = kNumFP4DecodeAssistWarps * 32;
@@ -1318,9 +1320,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
 
-                if constexpr (!kUseRSMode and kFirstFP4DecodeAssistWarp == 0) {
+                if constexpr (!kUseRSMode and kFirstFP4DecodeAssistWarp <= 1) {
                     const uint32_t decode_thread_idx =
-                        (warp_idx - kNumDispatchWarps) * 32 + lane_idx;
+                        (1u - kFirstFP4DecodeAssistWarp) * 32 + lane_idx;
                     wait_fp4_decode_input_ready(stage_idx, phase);
                     decode_fp4_b_stage(stage_idx, decode_thread_idx);
                 }

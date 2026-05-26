@@ -87,6 +87,10 @@ public:
         // This keeps CTA size fixed while testing whether reducing math-side
         // non-tensor-core work improves WGMMA feed.
         int num_math_wg_decode_warps;
+        // A/B knob: skip early non-epilogue warps as FP4 decode helpers.
+        // 0 keeps the existing 4 assist warps; 2 skips the two TMA loader
+        // warps; 4 leaves all decode work to the math warpgroup.
+        int first_fp4_decode_assist_warp;
         // A/B knob: split packed-B readiness from the A+B full barrier so the
         // assist warps can start FP4 decode while A/SFA TMA is still in flight.
         bool use_early_b_decode;
@@ -128,7 +132,7 @@ public:
 
 using namespace deep_gemm;
 
-// JIT cache version: sm90_fp8_fp4_mega_moe_mbarrier_profile_v1
+// JIT cache version: sm90_fp8_fp4_mega_moe_decode_assist_warp_v1
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm90_fp8_fp4_mega_moe_impl<
         {},
@@ -150,6 +154,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {}, {},
+        {},
         {},
         {},
         {},
@@ -180,6 +185,7 @@ static void __instantiate_kernel() {{
     args.use_rs_mode                 ? "true" : "false",
     args.math_wg_participates_in_fp4_decode ? "true" : "false",
     args.num_math_wg_decode_warps,
+    args.first_fp4_decode_assist_warp,
     args.use_early_b_decode ? "true" : "false",
     args.use_decode_done_mbarrier ? "true" : "false",
     args.use_clock_profile ? "true" : "false");
@@ -224,6 +230,7 @@ static void sm90_fp8_fp4_mega_moe(
     const bool& use_rs_mode                 = false,
     const bool& math_wg_participates_in_fp4_decode = true,
     const int& num_math_wg_decode_warps = 4,
+    const int& first_fp4_decode_assist_warp = 0,
     const bool& use_kg_pair_decode = false,
     const bool& use_vector_store_decode = false,
     const bool& use_dynamic_lut_decode = false,
@@ -245,6 +252,7 @@ static void sm90_fp8_fp4_mega_moe(
                    l2_weights_sf.scalar_type() == torch::kUInt32);
     DG_HOST_ASSERT(num_math_wg_decode_warps >= 0 and num_math_wg_decode_warps <= 4);
     DG_HOST_ASSERT(math_wg_participates_in_fp4_decode or num_math_wg_decode_warps == 0);
+    DG_HOST_ASSERT(first_fp4_decode_assist_warp >= 0 and first_fp4_decode_assist_warp <= 4);
 
     // Heuristics
     const auto config = get_mega_moe_config_sm90_fp4(
@@ -334,6 +342,7 @@ static void sm90_fp8_fp4_mega_moe(
         .use_rs_mode                 = use_rs_mode,
         .math_wg_participates_in_fp4_decode = math_wg_participates_in_fp4_decode,
         .num_math_wg_decode_warps = num_math_wg_decode_warps,
+        .first_fp4_decode_assist_warp = first_fp4_decode_assist_warp,
         .use_early_b_decode = use_early_b_decode,
         .use_decode_done_mbarrier = use_decode_done_mbarrier,
         .use_clock_profile = fp4_clock_profile_ptr != nullptr,
