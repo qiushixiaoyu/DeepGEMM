@@ -1418,7 +1418,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
                 auto load_rs_packed_nibbles = [&](uint32_t mat,
                                                   uint32_t cur_stage,
-                                                  uint32_t k_inner) -> uint32_t {
+                                                  uint32_t k_inner,
+                                                  uint32_t rs_n_slice) -> uint32_t {
                     DG_STATIC_ASSERT(BLOCK_K_PACKED == 64 and RSWGMMA::K == 32,
                                      "RS packed-B address path assumes 64-byte K tiles and K=32 WGMMA");
                     const uint32_t addr_lane = mat * 8 + rs_lane_row;
@@ -1506,10 +1507,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                                                   sfb_base, sfb_per_expert, sfb_k_words);
                             const uint32_t e8m0_13 = load_rs_e8m0(1, k_block_idx, k, rs_n_slice,
                                                                   sfb_base, sfb_per_expert, sfb_k_words);
-                            const uint32_t a0 = decode_rs_a_reg(load_rs_packed_nibbles(0, stage_idx, k), e8m0_02);
-                            const uint32_t a1 = decode_rs_a_reg(load_rs_packed_nibbles(1, stage_idx, k), e8m0_13);
-                            const uint32_t a2 = decode_rs_a_reg(load_rs_packed_nibbles(2, stage_idx, k), e8m0_02);
-                            const uint32_t a3 = decode_rs_a_reg(load_rs_packed_nibbles(3, stage_idx, k), e8m0_13);
+                            const uint32_t a0 = decode_rs_a_reg(load_rs_packed_nibbles(0, stage_idx, k, rs_n_slice), e8m0_02);
+                            const uint32_t a1 = decode_rs_a_reg(load_rs_packed_nibbles(1, stage_idx, k, rs_n_slice), e8m0_13);
+                            const uint32_t a2 = decode_rs_a_reg(load_rs_packed_nibbles(2, stage_idx, k, rs_n_slice), e8m0_02);
+                            const uint32_t a3 = decode_rs_a_reg(load_rs_packed_nibbles(3, stage_idx, k, rs_n_slice), e8m0_13);
                             if constexpr (kClockProfile) {
                                 if (epilogue_thread_idx == 0) {
                                     rs_profile_t1 = clock64();
