@@ -335,7 +335,8 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
 
 static int get_num_experts_per_wave_for_mega_moe_sm90(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
-    const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms) {
+    const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms,
+    const bool& use_rs_mode = false) {
     if (const int override_value = get_env<int>("DG_SM90_NUM_EXPERTS_PER_WAVE", 0);
         override_value > 0) {
         DG_HOST_ASSERT(override_value <= num_experts_per_rank and
@@ -351,6 +352,10 @@ static int get_num_experts_per_wave_for_mega_moe_sm90(
     // keep enough work resident without fragmenting expert scheduling.
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
+    if (use_rs_mode and block_m == 64 and block_n == 64 and
+        expected_tokens_per_expert >= 1.0f and expected_tokens_per_expert < 2.0f) {
+        return num_experts_per_rank;
+    }
     if (block_m == 64 and (expected_tokens_per_expert < 1.0f or expected_tokens_per_expert > 4.0f)) {
         return num_experts_per_rank;
     }
@@ -429,6 +434,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int& block_m, const int& block_n, const int& block_k,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
     const bool& use_rs_mode = false,
+    const bool& use_rs_stage_sfb = false,
     const bool& use_early_b_decode = false,
     const bool& use_decode_done_mbarrier = false) {
     constexpr int kSmemAlignment = 1024;
@@ -444,14 +450,17 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int smem_cd_l1 = num_epilogue_warpgroups * block_m * (block_n / 2);
     const int smem_cd_l2 = num_epilogue_warpgroups * block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
     const int smem_cd = align(std::max(smem_cd_l1, smem_cd_l2), kSmemAlignment);
+    // RS L1 uses a shared-memory transpose bridge indexed as
+    // token[BLOCK_M] x rs_row[64].  This is independent of BLOCK_N; BLOCK_N=64
+    // has one RS N-slice, while BLOCK_N=128 has two.
     const int smem_rs_accum = use_rs_mode
-        ? align(block_m * (block_n / 2) * static_cast<int>(sizeof(float)), kSmemAlignment)
+        ? align(block_m * 64 * static_cast<int>(sizeof(float)), kSmemAlignment)
         : 0;
 
     const int l2_sfa_groups_per_block_k = block_n == 64 ? 4 : 2;
     const int smem_sfa_per_stage =
         align(l2_sfa_groups_per_block_k * block_m * static_cast<int>(sizeof(float)), 128);
-    const int smem_sfb_per_stage = use_rs_mode
+    const int smem_sfb_per_stage = (use_rs_mode and not use_rs_stage_sfb)
         ? 0
         : align(block_n * static_cast<int>(sizeof(uint32_t)), 128);
 
@@ -463,8 +472,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
                                smem_sfa_per_stage + smem_sfb_per_stage;
 
     const int smem_barriers_fixed = (num_dispatch_warps + 2 * num_epilogue_warps) * 8;
-    const int smem_decode_full_per_stage =
-        (!use_rs_mode and use_early_b_decode) ? 8 : 0;
+    const int smem_decode_full_per_stage = use_early_b_decode ? 8 : 0;
     const int smem_decode_done_per_stage =
         (!use_rs_mode and use_decode_done_mbarrier) ? 8 : 0;
     const int smem_barriers_per_stage =
@@ -488,11 +496,13 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const int& hidden, const int& intermediate_hidden,
     const int& num_padded_sf_pool_tokens,
     const bool& use_rs_mode = false,
+    const bool& use_rs_stage_sfb = false,
     const bool& use_early_b_decode = false,
     const bool& use_decode_done_mbarrier = false) {
     const auto [block_m, num_epilogue_threads] = get_block_config_for_mega_moe_sm90(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens);
-    const int block_n = get_env<int>("DG_SM90_FP4_BLOCK_N", 128);
+    const int default_block_n = use_rs_mode ? 64 : 128;
+    const int block_n = get_env<int>("DG_SM90_FP4_BLOCK_N", default_block_n);
     DG_HOST_ASSERT(block_n == 64 or block_n == 128);
     const int block_k = 128;
     const int cluster_size = 1;
@@ -509,7 +519,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const int num_sms = device_runtime->get_num_sms();
     const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90(
         num_experts_per_rank, num_tokens, num_topk,
-        intermediate_hidden, block_m, block_n, num_sms);
+        intermediate_hidden, block_m, block_n, num_sms, use_rs_mode);
 
     const int num_dispatch_threads = 128;
     const int num_non_epilogue_threads = 128;
@@ -519,7 +529,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         num_experts, hidden,
         block_m, block_n, block_k,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
-        use_rs_mode, use_early_b_decode, use_decode_done_mbarrier);
+        use_rs_mode, use_rs_stage_sfb, use_early_b_decode, use_decode_done_mbarrier);
 
     const auto config = MegaMoESM90Config {
         block_m, block_n, block_k,

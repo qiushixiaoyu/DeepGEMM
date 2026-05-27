@@ -1217,7 +1217,7 @@ sm90_fp8_mega_moe_impl(void* y,
         DG_STATIC_ASSERT(kNumChunkUint4 % 32 == 0, "Combine chunk must be a multiple of 32 16-byte elements");
         DG_STATIC_ASSERT(kNumTopk <= 32, "Top-k must fit in a single warp");
 
-        DG_DEVICE_ASSERT(kNumChunkSlots * kNumEpilogueWarps * kNumChunkBytes <= static_cast<uint32_t>(
+        DG_TRAP_ONLY_DEVICE_ASSERT(kNumChunkSlots * kNumEpilogueWarps * kNumChunkBytes <= static_cast<uint32_t>(
             reinterpret_cast<uint8_t*>(barrier_start_ptr) - smem_buffer));
 
         const auto combine_load_buffer = utils::PatternVisitor([&](const uint32_t& i) {
