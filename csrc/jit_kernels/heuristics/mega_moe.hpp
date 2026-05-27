@@ -527,7 +527,10 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         intermediate_hidden, block_m, block_n, num_sms, use_rs_mode);
 
     const int num_dispatch_threads = 128;
-    const int num_non_epilogue_threads = 128;
+    const int num_non_epilogue_threads =
+        get_env<int>("DG_SM90_FP4_NUM_NON_EPILOGUE_THREADS", 128);
+    DG_HOST_ASSERT(num_non_epilogue_threads >= 128 and
+                   num_non_epilogue_threads % 128 == 0);
 
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90_fp4(
         SM90ArchSpec::smem_capacity,

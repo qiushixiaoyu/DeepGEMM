@@ -560,7 +560,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // Template checks
     // =====================================================================
     DG_STATIC_ASSERT(kNumDispatchThreads % 128 == 0, "Invalid number of dispatch threads");
-    DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of GEMM TMA warps (4 warps expected)");
+    DG_STATIC_ASSERT(kNumNonEpilogueThreads >= 128 and kNumNonEpilogueThreads % 128 == 0,
+                     "Invalid number of GEMM TMA/decode-assist warps");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of math/epilogue threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
     DG_STATIC_ASSERT(BLOCK_M % 64 == 0, "BLOCK_M must be a multiple of WGMMA::M (64)");
