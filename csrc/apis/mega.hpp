@@ -100,7 +100,11 @@ get_symm_buffer_size_for_mega_moe(
     const auto combine_sf_layout = layout::Data(combine_sf_bytes_per_token, false);
     const auto fp8_intermediate_token_layout = layout::Data(intermediate_hidden);
     const auto fp8_sf_layout = layout::Data(hidden / 32);
-    const int sm90_fp4_block_n = get_env<int>("DG_SM90_FP4_BLOCK_N", 128);
+    const bool host_use_sm90_fp4_rs_mode =
+        is_sm90 and get_env<int>("DG_SM90_FP4_RS_MODE") != 0;
+    const int default_sm90_fp4_block_n = host_use_sm90_fp4_rs_mode ? 64 : 128;
+    const int sm90_fp4_block_n =
+        get_env<int>("DG_SM90_FP4_BLOCK_N", default_sm90_fp4_block_n);
     if (is_sm90)
         DG_HOST_ASSERT(sm90_fp4_block_n == 64 or sm90_fp4_block_n == 128);
     const int sm90_l2_act_sf_gran_k = sm90_fp4_block_n == 64 ? 32 : 64;
@@ -376,22 +380,92 @@ static void fp8_fp4_mega_moe(
             get_env<int>("DG_SM90_FP4_KG_PAIR_DECODE", 0) != 0;
         const bool use_vector_store_decode =
             get_env<int>("DG_SM90_FP4_VECTOR_STORE_DECODE", 1) != 0;
+        const bool use_skip_zero_sfb_decode =
+            get_env<int>("DG_SM90_FP4_SKIP_ZERO_DECODE", 0) != 0;
         const bool use_dynamic_lut_decode =
             get_env<int>("DG_SM90_FP4_DYNAMIC_LUT_DECODE", 0) != 0;
         const bool use_common_lut_fast_path =
             get_env<int>("DG_SM90_FP4_COMMON_LUT_FASTPATH", 0) != 0;
         const bool use_kg_pipeline_decode =
             get_env<int>("DG_SM90_FP4_KG_PIPELINE_DECODE", 0) != 0;
+        const bool default_rs_group_k_promote =
+            // Batch the four Linear1 RS K/32 WGMMAs into one commit/wait for
+            // small batches. This is a measured win for batch/rank <= 16.
+            use_rs_mode and num_tokens <= 16;
+        const bool use_rs_group_k_promote =
+            get_env<int>("DG_SM90_FP4_RS_GROUP_K_PROMOTE",
+                         default_rs_group_k_promote ? 1 : 0) != 0;
+        const bool use_rs_l2_group_k2_promote =
+            get_env<int>("DG_SM90_FP4_RS_L2_GROUP_K2_PROMOTE", 0) != 0;
+        const bool default_rs_transpose_vec_load =
+            // Paired A/B on H20 showed this is a stable tiny-batch win for
+            // batch/rank 1 and 2, but it regresses or becomes noisy at 4+.
+            use_rs_mode and num_tokens <= 2;
+        const bool use_rs_transpose_vec_load =
+            get_env<int>("DG_SM90_FP4_RS_TRANSPOSE_VEC_LOAD",
+                         default_rs_transpose_vec_load ? 1 : 0) != 0;
+        const bool default_rs_guard_transpose_valid =
+            // A/B on H20 showed the extra valid-row predicates regress small
+            // batches. Keep the knob for diagnostics, but leave it off by default.
+            false;
+        const bool use_rs_guard_transpose_valid =
+            get_env<int>("DG_SM90_FP4_RS_GUARD_TRANSPOSE_VALID",
+                         default_rs_guard_transpose_valid ? 1 : 0) != 0;
+        const bool default_rs_sfa_vec_load =
+            // Adjacent SFA entries are naturally 8-byte aligned in the RS
+            // promote loop. Vectorized shared loads are a measured win for
+            // small-batch RS mode and remain neutral in register/spill usage.
+            use_rs_mode and num_tokens <= 16;
+        const bool use_rs_sfa_vec_load =
+            get_env<int>("DG_SM90_FP4_RS_SFA_VEC_LOAD",
+                         default_rs_sfa_vec_load ? 1 : 0) != 0;
+        const bool use_rs_sfa_bcast_load =
+            get_env<int>("DG_SM90_FP4_RS_SFA_BCAST_LOAD", 0) != 0;
+        const bool default_rs_sfb_word_reuse =
+            // One packed UE8M0 word feeds four RS K/32 slices. Reusing it
+            // cuts repeated SFB global loads without increasing ptxas
+            // register count or spill in small-batch RS A/B runs.
+            use_rs_mode and num_tokens <= 16;
+        const bool use_rs_sfb_word_reuse =
+            get_env<int>("DG_SM90_FP4_RS_SFB_WORD_REUSE",
+                         default_rs_sfb_word_reuse ? 1 : 0) != 0;
+        const bool use_rs_sfb_bcast_load =
+            get_env<int>("DG_SM90_FP4_RS_SFB_BCAST_LOAD", 0) != 0;
+        const bool default_rs_stage_sfb =
+            // Staging packed SFB in shared memory is a stable win once the
+            // small batch has enough expert work (batch/rank 4..16). Batch 1
+            // and 2 are noisy or regressive, so keep the env knob for those.
+            use_rs_mode and num_tokens >= 4 and num_tokens <= 16;
+        const bool use_rs_stage_sfb =
+            get_env<int>("DG_SM90_FP4_RS_STAGE_SFB",
+                         default_rs_stage_sfb ? 1 : 0) != 0;
+        const bool default_rs_decode_pair_shfl =
+            // Accuracy is clean, but ptxas spills 8B with pair-shuffle on the
+            // current RS kernel. Keep this as a diagnostic knob, not a default.
+            false;
+        const bool use_rs_decode_pair_shfl =
+            get_env<int>("DG_SM90_FP4_RS_DECODE_PAIR_SHFL",
+                         default_rs_decode_pair_shfl ? 1 : 0) != 0;
+        const bool use_rs_direct_l2_scatter =
+            get_env<int>("DG_SM90_FP4_RS_DIRECT_L2_SCATTER", 0) != 0;
         const float expected_tokens_per_expert =
             static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
         const bool default_early_b_decode =
-            expected_tokens_per_expert >= 2.0f and expected_tokens_per_expert <= 4.0f;
+            // RS A/B on DSV4 small batches showed real packed-B/activation
+            // overlap is useful across batch/rank 1..16 once the RS kernel
+            // waits the split barriers correctly. Keep this RS-only so the
+            // faster SS small-batch path does not inherit the scheduling knob.
+            use_rs_mode and num_tokens > 0 and num_tokens <= 16;
         const bool use_early_b_decode =
             get_env<int>("DG_SM90_FP4_EARLY_B_DECODE", default_early_b_decode ? 1 : 0) != 0;
         const bool use_decode_done_mbarrier =
             // Small-batch SM90 FP4 runs were consistently faster with the
             // decode-done rendezvous on the existing CTA barrier.
             get_env<int>("DG_SM90_FP4_DECODE_MBARRIER", 0) != 0;
+        const bool use_l2_arrival_counter =
+            get_env<int>("DG_SM90_FP4_L2_ARRIVAL_COUNTER", 0) != 0;
+        const bool skip_l2_epilogue_sync =
+            get_env<int>("DG_SM90_FP4_SKIP_L2_EPILOGUE_SYNC", 0) != 0;
         sm90_fp8_fp4_mega_moe(y,
                               l1_acts, l1_acts_sf,
                               l2_acts, l2_acts_sf,
@@ -412,11 +486,25 @@ static void fp8_fp4_mega_moe(
                               first_fp4_decode_assist_warp,
                               use_kg_pair_decode,
                               use_vector_store_decode,
+                              use_skip_zero_sfb_decode,
                               use_dynamic_lut_decode,
                               use_common_lut_fast_path,
                               use_kg_pipeline_decode,
+                              use_rs_group_k_promote,
+                              use_rs_l2_group_k2_promote,
+                              use_rs_transpose_vec_load,
+                              use_rs_guard_transpose_valid,
+                              use_rs_sfa_vec_load,
+                              use_rs_sfa_bcast_load,
+                              use_rs_sfb_word_reuse,
+                              use_rs_sfb_bcast_load,
+                              use_rs_stage_sfb,
+                              use_rs_decode_pair_shfl,
+                              use_rs_direct_l2_scatter,
                               use_early_b_decode,
                               use_decode_done_mbarrier,
+                              use_l2_arrival_counter,
+                              skip_l2_epilogue_sync,
                               fp4_clock_profile);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");

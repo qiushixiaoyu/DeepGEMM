@@ -114,6 +114,7 @@ template <
     uint32_t kNumSFBPerBlockK,
     bool kUseDynamicLutDecode,
     bool kUseCommonLutFastPath,
+    bool kSkipZeroSFBDecode,
     bool kFuseScaleBHummingDecode,
     typename PackedT,
     typename DecodedT>
@@ -139,6 +140,19 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_vec_store(
         auto* decoded_row_u64 = reinterpret_cast<uint64_t*>(
             smem_b_stage + n_row * BLOCK_K);
         const uint32_t row_swizzle = n_row & 7u;
+
+        if constexpr (kSkipZeroSFBDecode) {
+            if (e8m0 == 0u) {
+                #pragma unroll
+                for (uint32_t pair = 0; pair < kPackedWordPairsPerKG; ++ pair) {
+                    const uint32_t pw_global_0 = kg * kPackedWordsPerKG + pair * 2u;
+                    const uint32_t seg_id = pw_global_0 >> 1;
+                    const uint32_t swz_seg = seg_id ^ row_swizzle;
+                    ptx::st_shared_v2_u64(decoded_row_u64 + swz_seg * 2u, 0ull, 0ull);
+                }
+                continue;
+            }
+        }
 
         uint32_t scaled_lut_lo = 0;
         uint32_t scaled_lut_hi = 0;
@@ -330,60 +344,61 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_kg_pair(
                     const uint32_t swz_seg = seg_id ^ row_swizzle;
                     ptx::st_shared_v2_u64(decoded_row_u64 + swz_seg * 2u, 0ull, 0ull);
                 }
-            } else {
-                uint32_t scaled_lut_lo = 0;
-                uint32_t scaled_lut_hi = 0;
-                if constexpr (!kFuseScaleBHummingDecode) {
-                    if constexpr (kUseDynamicLutDecode) {
-                        const auto scaled_lut =
-                            fp4_rs_detail::make_scaled_e4m3_lut_from_e8m0_fast(e8m0);
-                        scaled_lut_lo = scaled_lut.lo;
-                        scaled_lut_hi = scaled_lut.hi;
-                    } else {
-                        const uint64_t scaled_lut =
-                            kUseCommonLutFastPath ?
-                            fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_common_const(e8m0) :
-                            fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_const(e8m0);
-                        scaled_lut_lo = static_cast<uint32_t>(scaled_lut);
-                        scaled_lut_hi = static_cast<uint32_t>(scaled_lut >> 32);
-                    }
-                }
+                continue;
+            }
 
-                #pragma unroll
-                for (uint32_t pair_idx = 0; pair_idx < kPackedWordPairsPerKG; ++ pair_idx) {
-                    const uint32_t pw_global_0 = kg * kPackedWordsPerKG + pair_idx * 2u;
-                    const uint32_t packed_0 = packed_row[pw_global_0];
-                    const uint32_t packed_1 = packed_row[pw_global_0 + 1u];
-                    uint32_t lo_0, hi_0, lo_1, hi_1;
-                    if constexpr (kFuseScaleBHummingDecode) {
-                        if (e8m0 >= 121u and e8m0 <= 149u) {
-                            const uint32_t exp_offset = e8m0 - 121u;
-                            lo_0 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed_0 & 0xffffu, exp_offset);
-                            hi_0 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed_0 >> 16, exp_offset);
-                            lo_1 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed_1 & 0xffffu, exp_offset);
-                            hi_1 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed_1 >> 16, exp_offset);
-                        } else {
-                            lo_0 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0_fast(packed_0 & 0xffffu, e8m0);
-                            hi_0 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0_fast(packed_0 >> 16, e8m0);
-                            lo_1 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0_fast(packed_1 & 0xffffu, e8m0);
-                            hi_1 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0_fast(packed_1 >> 16, e8m0);
-                        }
-                    } else {
-                        lo_0 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_lut(
-                            packed_0 & 0xffffu, scaled_lut_lo, scaled_lut_hi);
-                        hi_0 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_lut(
-                            packed_0 >> 16, scaled_lut_lo, scaled_lut_hi);
-                        lo_1 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_lut(
-                            packed_1 & 0xffffu, scaled_lut_lo, scaled_lut_hi);
-                        hi_1 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_lut(
-                            packed_1 >> 16, scaled_lut_lo, scaled_lut_hi);
-                    }
-                    const uint32_t seg_id = pw_global_0 >> 1;
-                    const uint32_t swz_seg = seg_id ^ row_swizzle;
-                    ptx::st_shared(
-                        decoded_row_u64 + swz_seg * 2u,
-                        lo_0, hi_0, lo_1, hi_1);
+            uint32_t scaled_lut_lo = 0;
+            uint32_t scaled_lut_hi = 0;
+            if constexpr (!kFuseScaleBHummingDecode) {
+                if constexpr (kUseDynamicLutDecode) {
+                    const auto scaled_lut =
+                        fp4_rs_detail::make_scaled_e4m3_lut_from_e8m0_fast(e8m0);
+                    scaled_lut_lo = scaled_lut.lo;
+                    scaled_lut_hi = scaled_lut.hi;
+                } else {
+                    const uint64_t scaled_lut =
+                        kUseCommonLutFastPath ?
+                        fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_common_const(e8m0) :
+                        fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_const(e8m0);
+                    scaled_lut_lo = static_cast<uint32_t>(scaled_lut);
+                    scaled_lut_hi = static_cast<uint32_t>(scaled_lut >> 32);
                 }
+            }
+
+            #pragma unroll
+            for (uint32_t pair_idx = 0; pair_idx < kPackedWordPairsPerKG; ++ pair_idx) {
+                const uint32_t pw_global_0 = kg * kPackedWordsPerKG + pair_idx * 2u;
+                const uint32_t packed_0 = packed_row[pw_global_0];
+                const uint32_t packed_1 = packed_row[pw_global_0 + 1u];
+                uint32_t lo_0, hi_0, lo_1, hi_1;
+                if constexpr (kFuseScaleBHummingDecode) {
+                    if (e8m0 >= 121u and e8m0 <= 149u) {
+                        const uint32_t exp_offset = e8m0 - 121u;
+                        lo_0 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed_0 & 0xffffu, exp_offset);
+                        hi_0 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed_0 >> 16, exp_offset);
+                        lo_1 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed_1 & 0xffffu, exp_offset);
+                        hi_1 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed_1 >> 16, exp_offset);
+                    } else {
+                        lo_0 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0_fast(packed_0 & 0xffffu, e8m0);
+                        hi_0 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0_fast(packed_0 >> 16, e8m0);
+                        lo_1 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0_fast(packed_1 & 0xffffu, e8m0);
+                        hi_1 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0_fast(packed_1 >> 16, e8m0);
+                    }
+                } else {
+                    lo_0 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_lut(
+                        packed_0 & 0xffffu, scaled_lut_lo, scaled_lut_hi);
+                    hi_0 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_lut(
+                        packed_0 >> 16, scaled_lut_lo, scaled_lut_hi);
+                    lo_1 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_lut(
+                        packed_1 & 0xffffu, scaled_lut_lo, scaled_lut_hi);
+                    hi_1 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_lut(
+                        packed_1 >> 16, scaled_lut_lo, scaled_lut_hi);
+                }
+                const uint32_t seg_id = pw_global_0 >> 1;
+                const uint32_t swz_seg = seg_id ^ row_swizzle;
+                ptx::st_shared(
+                    decoded_row_u64 + swz_seg * 2u,
+                    lo_0, hi_0, lo_1, hi_1);
             }
         }
     }
@@ -396,6 +411,7 @@ template <
     uint32_t kNumSFBPerBlockK,
     bool kUseKGPairDecode,
     bool kUseVectorStoreDecode,
+    bool kSkipZeroSFBDecode,
     bool kUseDynamicLutDecode,
     bool kUseCommonLutFastPath,
     bool kFuseScaleBHummingDecode,
@@ -416,7 +432,8 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_dispatch(
     } else if constexpr (kUseVectorStoreDecode) {
         dequant_fp4_b_tile_to_e4m3_smem_vec_store<
             LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
-            kUseDynamicLutDecode, kUseCommonLutFastPath, kFuseScaleBHummingDecode>(
+            kUseDynamicLutDecode, kUseCommonLutFastPath,
+            kSkipZeroSFBDecode, kFuseScaleBHummingDecode>(
             decode_thread_idx, num_decode_threads,
             smem_b_packed_stage, smem_b_stage, smem_sfb_stage);
     } else {
@@ -483,9 +500,21 @@ template <
     // FP4-specific knobs (all defaults match the design doc's "Plan C" path).
     bool kUseKGPairDecode          = false,  // A/B: decode two consecutive K-groups per work item
     bool kUseVectorStoreDecode     = false,  // A/B: write adjacent decoded u64 values with one v2.u64 store
+    bool kSkipZeroSFBDecode        = false,  // A/B: skip LUT decode when UE8M0 scale byte is zero
     bool kUseDynamicLutDecode      = false,  // A/B: build per-SFB LUT in registers instead of constant-cache lookup
     bool kUseCommonLutFastPath     = false,  // A/B: immediate LUTs for common UE8M0 values
     bool kUseKGPipelineDecode      = false,  // A/B: overlap per-K-group decode with each WGMMA issue
+    bool kRSGroupKPromote          = false,  // A/B: RS Linear1 batches four K/32 WGMMA slices, then promotes once
+    bool kRSL2GroupK2Promote       = false,  // A/B: RS Linear2 batches two K/32 WGMMA slices per wait
+    bool kRSUseTransposeVecLoad    = false,  // A/B: vectorize RS L1 scratch readback into SS epilogue layout
+    bool kRSGuardTransposeValid    = false,  // A/B: skip RS L1 transpose rows outside valid_m
+    bool kRSUseSFAVecLoad          = false,  // A/B: vectorize adjacent RS SFA loads in promote loops
+    bool kRSBroadcastSFALoad       = false,  // A/B: one row lane loads SFA, then shuffles to same-col lanes
+    bool kRSReuseSFBWord           = false,  // A/B: reuse one packed SFB word across four K/32 slices
+    bool kRSBroadcastSFBLoad       = false,  // A/B: one col-pair lane loads SFB, then shuffles to same-row lanes
+    bool kRSStageSFB               = false,  // A/B: stage packed SFB words in SMEM for RS decode
+    bool kRSDecodePairShfl         = false,  // A/B: share one packed FP4 load across adjacent low/high lanes
+    bool kRSDirectL2Scatter        = false,  // A/B: skip RS L2 BF16 SMEM staging and scatter from registers
     bool kFuseScaleBHummingDecode = true,   // Plan C: bake SFB into decode LUT
     bool kScaleBPow2Promote       = true,   // UE8M0 SFB: exponent-shift promote
     bool kUseRSMode               = false,  // correctness-first RS mainloop
@@ -494,6 +523,8 @@ template <
     uint32_t kFirstFP4DecodeAssistWarp = 0,  // A/B: skip early non-epilogue warps as decode helpers
     bool kEarlyBDecode            = false,  // A/B: overlap assist decode with A/SFA TMA
     bool kDecodeDoneMBarrier      = false,  // A/B: one-way decode-done mbarrier instead of rendezvous sync
+    bool kL2ArrivalCounter        = false,  // A/B: count ready L1 output slices instead of bitmask + CTA sync
+    bool kSkipL2EpilogueSync      = false,  // A/B: rely on following grid/NVLink sync after L2 scatter
     bool kClockProfile            = false,  // debug-only clock64 phase counters
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -681,7 +712,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // SFB UE8M0 per-32: the decode-to-SMEM path stages one packed uint32 per
     // N row per BLOCK_K in SMEM. Each word contains the 4 K/32 scale bytes, so
     // dequant avoids reloading the same word once per K group.
-    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = kUseRSMode ? 0 :
+    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = (kUseRSMode and !kRSStageSFB) ? 0 :
         math::constexpr_align<uint32_t>(LOAD_BLOCK_N * sizeof(uint32_t), 128u);
 
     // CD output: max of L1 FP8 (BLOCK_M * (BLOCK_N/2) * 1 byte * num_wg) and
@@ -745,7 +776,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     });
 
     // Barriers live after SFA and staged SFB.
-    constexpr bool kUseEarlyBDecode = (!kUseRSMode and kEarlyBDecode);
+    constexpr bool kUseEarlyBDecode = kEarlyBDecode;
     constexpr uint32_t kNumDecodeFullBarriers = kUseEarlyBDecode ? kNumStages : 0;
     constexpr bool kUseDecodeDoneMBarrier = (!kUseRSMode and kDecodeDoneMBarrier);
     constexpr uint32_t kNumDecodeDoneBarriers = kUseDecodeDoneMBarrier ? kNumStages : 0;
@@ -907,7 +938,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             dequant_fp4_b_tile_to_e4m3_smem_dispatch<
                 LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
                 kUseKGPairDecode, kUseVectorStoreDecode,
-                kUseDynamicLutDecode, kUseCommonLutFastPath, kFuseScaleBHummingDecode>(
+                kSkipZeroSFBDecode, kUseDynamicLutDecode,
+                kUseCommonLutFastPath, kFuseScaleBHummingDecode>(
                 decode_thread_idx, kNumFP4DecodeWorkerThreads,
                 smem_b_packed[cur_stage_idx], smem_b[cur_stage_idx], smem_sfb[cur_stage_idx]);
             arrive_or_sync_fp4_decode_done(cur_stage_idx);
@@ -1205,12 +1237,19 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 const auto expected = scheduler.template get_valid_m<false>();
                 while (ptx::ld_acq(ptr) != expected);
             } else {
-                const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
-                // Each L1 N block sets one bit; total bits = L1_SHAPE_N / BLOCK_N.
                 constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
-                const uint64_t expected = (kNumL1BlockNs >= 64)
-                    ? ~0ull : ((1ull << kNumL1BlockNs) - 1ull);
-                while (ptx::ld_acq_gpu(ptr) != expected);
+                if constexpr (kL2ArrivalCounter) {
+                    const auto ptr = reinterpret_cast<const uint32_t*>(
+                        workspace.get_l2_arrival_mask_ptr(pool_block_idx));
+                    const uint32_t expected = kNumL1BlockNs * kNumEpilogueWarpgroups;
+                    while (ptx::ld_acq(ptr) != expected);
+                } else {
+                    const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
+                    // Each L1 N block sets one bit; total bits = L1_SHAPE_N / BLOCK_N.
+                    const uint64_t expected = (kNumL1BlockNs >= 64)
+                        ? ~0ull : ((1ull << kNumL1BlockNs) - 1ull);
+                    while (ptx::ld_acq_gpu(ptr) != expected);
+                }
             }
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 empty_barriers[stage_idx]->wait(phase ^ 1);
@@ -1295,7 +1334,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
 
-                if constexpr (!kUseRSMode) {
+                if constexpr (!kUseRSMode or kRSStageSFB) {
                     const bool is_l1 = block_phase == sched::BlockPhase::Linear1;
                     const uint32_t* sfb_base = is_l1 ? l1_weights_sf : l2_weights_sf;
                     const uint32_t sfb_per_expert = is_l1 ? kL1SFBPerExpert : kL2SFBPerExpert;
@@ -1400,7 +1439,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 using RSWGMMA = L1RSWGMMA;
                 constexpr uint32_t kRSAccumPerThread = RSWGMMA::kNumAccum;  // M=64(weight), N=64(tokens)
                 constexpr uint32_t kNumRSNSlices = BLOCK_N / RSWGMMA::M;
-                DG_STATIC_ASSERT(kNumRSNSlices == 2, "Initial RS path expects BLOCK_N=128");
+                DG_STATIC_ASSERT(kNumRSNSlices == 1 or kNumRSNSlices == 2,
+                                 "RS path expects BLOCK_N=64 or BLOCK_N=128");
                 DG_STATIC_ASSERT(RSWGMMA::N == BLOCK_M, "RS WGMMA N dimension must cover the token block");
                 DG_STATIC_ASSERT(kAccumPerThread == kRSAccumPerThread * kNumRSNSlices,
                                  "RS slices must cover the SS epilogue accumulator layout");
@@ -1433,11 +1473,55 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t raw_col = addr_t_col / 2 + rs_lane_pair_col;
                     const uint32_t swizzle_xor = (addr_t_row & 7u) >> 1;
                     const uint32_t swizzled_col = ((k_inner ^ swizzle_xor) << 4) + raw_col;
-                    const uint32_t packed_word = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
-                        smem_b_packed[cur_stage] + row_offset + swizzled_col));
+                    uint32_t packed_word = 0;
+                    if constexpr (kRSDecodePairShfl) {
+                        if ((rs_lane_col_pair & 1u) == 0)
+                            packed_word = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
+                                smem_b_packed[cur_stage] + row_offset + swizzled_col));
+                        packed_word = __shfl_sync(0xffffffff, packed_word, lane_idx & ~1u);
+                    } else {
+                        packed_word = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
+                            smem_b_packed[cur_stage] + row_offset + swizzled_col));
+                    }
                     return (packed_word >> packed_shift) & 0xffffu;
                 };
 
+                auto load_rs_sfb_word = [&](uint32_t mat,
+                                            uint32_t cur_k_block_idx,
+                                            uint32_t rs_n_slice,
+                                            const uint32_t* sfb_base_for_block_phase,
+                                            uint32_t sfb_per_expert,
+                                            uint32_t sfb_k_words) -> uint32_t {
+                    const uint32_t addr_lane = mat * 8 + rs_lane_row;
+                    const uint32_t addr_tid_g = warp_idx_in_wg * 32 + addr_lane;
+                    const uint32_t addr_t_row = (addr_tid_g & 15u) | ((addr_tid_g >> 5) << 4);
+                    const uint32_t n_row = rs_n_slice * RSWGMMA::M + addr_t_row;
+                    const uint32_t n_global = n_block_idx * BLOCK_N + n_row;
+                    uint32_t sfb_word = 0;
+                    if constexpr (kRSBroadcastSFBLoad) {
+                        if (rs_lane_col_pair == 0) {
+                            if constexpr (kRSStageSFB) {
+                                sfb_word = ptx::ld_shared(smem_sfb[stage_idx] + n_row);
+                            } else {
+                                sfb_word = __ldg(sfb_base_for_block_phase
+                                    + local_expert_idx * sfb_per_expert
+                                    + n_global * sfb_k_words
+                                    + cur_k_block_idx);
+                            }
+                        }
+                        return __shfl_sync(0xffffffff, sfb_word, lane_idx & ~3u);
+                    } else {
+                        if constexpr (kRSStageSFB)
+                            return ptx::ld_shared(smem_sfb[stage_idx] + n_row);
+                        return __ldg(sfb_base_for_block_phase
+                            + local_expert_idx * sfb_per_expert
+                            + n_global * sfb_k_words
+                            + cur_k_block_idx);
+                    }
+                };
+                auto unpack_rs_e8m0 = [](uint32_t sfb_word, uint32_t k_inner) -> uint32_t {
+                    return (sfb_word >> (k_inner * 8)) & 0xffu;
+                };
                 auto load_rs_e8m0 = [&](uint32_t mat,
                                         uint32_t cur_k_block_idx,
                                         uint32_t k_inner,
@@ -1445,16 +1529,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                         const uint32_t* sfb_base_for_block_phase,
                                         uint32_t sfb_per_expert,
                                         uint32_t sfb_k_words) -> uint32_t {
-                    const uint32_t addr_lane = mat * 8 + rs_lane_row;
-                    const uint32_t addr_tid_g = warp_idx_in_wg * 32 + addr_lane;
-                    const uint32_t addr_t_row = (addr_tid_g & 15u) | ((addr_tid_g >> 5) << 4);
-                    const uint32_t n_row = rs_n_slice * RSWGMMA::M + addr_t_row;
-                    const uint32_t n_global = n_block_idx * BLOCK_N + n_row;
-                    const uint32_t sfb_word = __ldg(sfb_base_for_block_phase
-                        + local_expert_idx * sfb_per_expert
-                        + n_global * sfb_k_words
-                        + cur_k_block_idx);
-                    return (sfb_word >> (k_inner * 8)) & 0xffu;
+                    return unpack_rs_e8m0(
+                        load_rs_sfb_word(mat, cur_k_block_idx, rs_n_slice,
+                                         sfb_base_for_block_phase, sfb_per_expert, sfb_k_words),
+                        k_inner);
                 };
 
                 auto decode_rs_a_reg = [&](uint32_t packed_shifted, uint32_t e8m0) -> uint32_t {
@@ -1473,6 +1551,31 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             packed_shifted, e8m0);
                     }
                 };
+                auto decode_rs_a_reg_lut = [&](uint32_t packed_shifted,
+                                               uint32_t scaled_lut_lo,
+                                               uint32_t scaled_lut_hi) -> uint32_t {
+                    return fp4_rs_detail::fp4x4_to_scaled_e4m3x4_lut(
+                        packed_shifted, scaled_lut_lo, scaled_lut_hi);
+                };
+                auto load_rs_sfa_pair = [&](const float* ptr) -> float2 {
+                    if constexpr (kRSBroadcastSFALoad) {
+                        float2 scale = make_float2(0.0f, 0.0f);
+                        if (row_idx == 0) {
+                            if constexpr (kRSUseSFAVecLoad) {
+                                scale = ptx::ld_shared(reinterpret_cast<const float2*>(ptr));
+                            } else {
+                                scale = make_float2(ptx::ld_shared(ptr), ptx::ld_shared(ptr + 1));
+                            }
+                        }
+                        scale.x = __shfl_sync(0xffffffff, scale.x, col_idx);
+                        scale.y = __shfl_sync(0xffffffff, scale.y, col_idx);
+                        return scale;
+                    } else if constexpr (kRSUseSFAVecLoad) {
+                        return ptx::ld_shared(reinterpret_cast<const float2*>(ptr));
+                    } else {
+                        return make_float2(ptx::ld_shared(ptr), ptx::ld_shared(ptr + 1));
+                    }
+                };
 
                 for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                     uint64_t rs_stage_decode = 0;
@@ -1482,7 +1585,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         if (epilogue_thread_idx == 0)
                             rs_profile_t0 = clock64();
                     }
-                    full_barriers[stage_idx]->wait(phase);
+                    wait_fp4_decode_input_ready(stage_idx, phase);
                     if constexpr (kClockProfile) {
                         if (epilogue_thread_idx == 0) {
                             rs_profile_t1 = clock64();
@@ -1491,28 +1594,368 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     }
                     const auto desc_b_base = mma::sm90::make_smem_desc(smem_a[stage_idx], 1);
                     const uint32_t desc_b_base_lo = __shfl_sync(0xffffffff, desc_b_base.reg32_[0], 0);
+                    bool rs_acts_ready = !kUseEarlyBDecode;
+                    auto wait_rs_acts_ready = [&]() {
+                        if constexpr (kUseEarlyBDecode) {
+                            if (!rs_acts_ready) {
+                                if constexpr (kClockProfile) {
+                                    if (epilogue_thread_idx == 0)
+                                        rs_profile_t0 = clock64();
+                                }
+                                full_barriers[stage_idx]->wait(phase);
+                                if constexpr (kClockProfile) {
+                                    if (epilogue_thread_idx == 0) {
+                                        rs_profile_t1 = clock64();
+                                        rs_profile_full_wait += rs_profile_t1 - rs_profile_t0;
+                                    }
+                                }
+                                rs_acts_ready = true;
+                            }
+                        }
+                    };
 
                     #pragma unroll
                     for (uint32_t rs_n_slice = 0; rs_n_slice < kNumRSNSlices; ++ rs_n_slice) {
-                        #pragma unroll
-                        for (uint32_t k = 0; k < BLOCK_K / RSWGMMA::K; ++ k) {
+                        const bool group_k_promote =
+                            kRSGroupKPromote and block_phase == sched::BlockPhase::Linear1;
+                        if (group_k_promote) {
+                            // Linear1 has one SFA value per 128-K stage. Batch the
+                            // four RS K/32 WGMMA slices into one warpgroup commit/wait,
+                            // then apply SFA once.
                             float rs_accum[kRSAccumPerThread];
-                            const bool is_l1 = block_phase == sched::BlockPhase::Linear1;
-                            const uint32_t* sfb_base = is_l1 ? l1_weights_sf : l2_weights_sf;
-                            const uint32_t sfb_per_expert = is_l1 ? kL1SFBPerExpert : kL2SFBPerExpert;
-                            const uint32_t sfb_k_words = is_l1 ? kL1SFBKWords : kL2SFBKWords;
+                            const uint32_t rs_accum_base = rs_n_slice * kRSAccumPerThread;
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kRSAccumPerThread; ++ i)
+                                rs_accum[i] = 0.0f;
+
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kRSAccumPerThread; ++ i)
+                                ptx::warpgroup_fence_operand(rs_accum[i]);
+
+                            uint32_t sfb_word_02 = 0;
+                            uint32_t sfb_word_13 = 0;
+                            if constexpr (kRSReuseSFBWord) {
+                                sfb_word_02 = load_rs_sfb_word(
+                                    0, k_block_idx, rs_n_slice,
+                                    l1_weights_sf, kL1SFBPerExpert, kL1SFBKWords);
+                                sfb_word_13 = load_rs_sfb_word(
+                                    1, k_block_idx, rs_n_slice,
+                                    l1_weights_sf, kL1SFBPerExpert, kL1SFBKWords);
+                            }
+
+                            #pragma unroll
+                            for (uint32_t k = 0; k < BLOCK_K / RSWGMMA::K; ++ k) {
+                                if constexpr (kClockProfile) {
+                                    if (epilogue_thread_idx == 0)
+                                        rs_profile_t0 = clock64();
+                                }
+                                uint32_t e8m0_02, e8m0_13;
+                                if constexpr (kRSReuseSFBWord) {
+                                    e8m0_02 = unpack_rs_e8m0(sfb_word_02, k);
+                                    e8m0_13 = unpack_rs_e8m0(sfb_word_13, k);
+                                } else {
+                                    e8m0_02 = load_rs_e8m0(0, k_block_idx, k, rs_n_slice,
+                                                          l1_weights_sf, kL1SFBPerExpert, kL1SFBKWords);
+                                    e8m0_13 = load_rs_e8m0(1, k_block_idx, k, rs_n_slice,
+                                                          l1_weights_sf, kL1SFBPerExpert, kL1SFBKWords);
+                                }
+                                uint32_t a0, a1, a2, a3;
+                                if constexpr (kFuseScaleBHummingDecode or kUseDynamicLutDecode) {
+                                    a0 = decode_rs_a_reg(load_rs_packed_nibbles(0, stage_idx, k, rs_n_slice), e8m0_02);
+                                    a1 = decode_rs_a_reg(load_rs_packed_nibbles(1, stage_idx, k, rs_n_slice), e8m0_13);
+                                    a2 = decode_rs_a_reg(load_rs_packed_nibbles(2, stage_idx, k, rs_n_slice), e8m0_02);
+                                    a3 = decode_rs_a_reg(load_rs_packed_nibbles(3, stage_idx, k, rs_n_slice), e8m0_13);
+                                } else {
+                                    const uint64_t scaled_lut_02 =
+                                        kUseCommonLutFastPath ?
+                                        fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_common_const(e8m0_02) :
+                                        fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_const(e8m0_02);
+                                    const uint64_t scaled_lut_13 =
+                                        kUseCommonLutFastPath ?
+                                        fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_common_const(e8m0_13) :
+                                        fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_const(e8m0_13);
+                                    const uint32_t lut_02_lo = static_cast<uint32_t>(scaled_lut_02);
+                                    const uint32_t lut_02_hi = static_cast<uint32_t>(scaled_lut_02 >> 32);
+                                    const uint32_t lut_13_lo = static_cast<uint32_t>(scaled_lut_13);
+                                    const uint32_t lut_13_hi = static_cast<uint32_t>(scaled_lut_13 >> 32);
+                                    a0 = decode_rs_a_reg_lut(load_rs_packed_nibbles(0, stage_idx, k, rs_n_slice),
+                                                             lut_02_lo, lut_02_hi);
+                                    a1 = decode_rs_a_reg_lut(load_rs_packed_nibbles(1, stage_idx, k, rs_n_slice),
+                                                             lut_13_lo, lut_13_hi);
+                                    a2 = decode_rs_a_reg_lut(load_rs_packed_nibbles(2, stage_idx, k, rs_n_slice),
+                                                             lut_02_lo, lut_02_hi);
+                                    a3 = decode_rs_a_reg_lut(load_rs_packed_nibbles(3, stage_idx, k, rs_n_slice),
+                                                             lut_13_lo, lut_13_hi);
+                                }
+                                if constexpr (kClockProfile) {
+                                    if (epilogue_thread_idx == 0) {
+                                        rs_profile_t1 = clock64();
+                                        rs_stage_decode += rs_profile_t1 - rs_profile_t0;
+                                    }
+                                }
+
+                                wait_rs_acts_ready();
+                                if constexpr (kClockProfile) {
+                                    if (epilogue_thread_idx == 0)
+                                        rs_profile_t0 = clock64();
+                                }
+                                auto desc_b = desc_b_base;
+                                desc_b.reg32_[0] = desc_b_base_lo + k * RSWGMMA::K / 16;
+                                // Each RS slice rewrites the register-backed A operand.
+                                // Fence it explicitly while still keeping one commit/wait
+                                // for the four K slices.
+                                ptx::warpgroup_arrive();
+                                RSWGMMA::wgmma(a0, a1, a2, a3, desc_b, rs_accum, k != 0);
+                                if constexpr (kClockProfile) {
+                                    if (epilogue_thread_idx == 0) {
+                                        rs_profile_t1 = clock64();
+                                        rs_stage_wgmma += rs_profile_t1 - rs_profile_t0;
+                                    }
+                                }
+                            }
+                            ptx::warpgroup_commit_batch();
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kRSAccumPerThread; ++ i)
+                                ptx::warpgroup_fence_operand(rs_accum[i]);
+                            ptx::warpgroup_wait<0>();
+
                             if constexpr (kClockProfile) {
                                 if (epilogue_thread_idx == 0)
                                     rs_profile_t0 = clock64();
                             }
-                            const uint32_t e8m0_02 = load_rs_e8m0(0, k_block_idx, k, rs_n_slice,
-                                                                  sfb_base, sfb_per_expert, sfb_k_words);
-                            const uint32_t e8m0_13 = load_rs_e8m0(1, k_block_idx, k, rs_n_slice,
-                                                                  sfb_base, sfb_per_expert, sfb_k_words);
-                            const uint32_t a0 = decode_rs_a_reg(load_rs_packed_nibbles(0, stage_idx, k, rs_n_slice), e8m0_02);
-                            const uint32_t a1 = decode_rs_a_reg(load_rs_packed_nibbles(1, stage_idx, k, rs_n_slice), e8m0_13);
-                            const uint32_t a2 = decode_rs_a_reg(load_rs_packed_nibbles(2, stage_idx, k, rs_n_slice), e8m0_02);
-                            const uint32_t a3 = decode_rs_a_reg(load_rs_packed_nibbles(3, stage_idx, k, rs_n_slice), e8m0_13);
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kRSAccumPerThread / 4; ++ i) {
+                                const uint32_t token_0 = i * 8 + col_idx * 2;
+                                const float2 scale_a = load_rs_sfa_pair(smem_sfa[stage_idx] + token_0);
+                                final_accum[rs_accum_base + i * 4 + 0] += scale_a.x * rs_accum[i * 4 + 0];
+                                final_accum[rs_accum_base + i * 4 + 1] += scale_a.y * rs_accum[i * 4 + 1];
+                                final_accum[rs_accum_base + i * 4 + 2] += scale_a.x * rs_accum[i * 4 + 2];
+                                final_accum[rs_accum_base + i * 4 + 3] += scale_a.y * rs_accum[i * 4 + 3];
+                            }
+                            if constexpr (kClockProfile) {
+                                if (epilogue_thread_idx == 0) {
+                                    rs_profile_t1 = clock64();
+                                    rs_stage_promote += rs_profile_t1 - rs_profile_t0;
+                                }
+                            }
+                        } else if (kRSL2GroupK2Promote and kL2ActsSFGranK == 32 and
+                                   block_phase == sched::BlockPhase::Linear2) {
+                            // Diagnostic path: keep two independent K/32
+                            // accumulators live so two L2 WGMMAs can share one
+                            // commit/wait while preserving per-K activation
+                            // scale application.
+                            const uint32_t rs_accum_base = rs_n_slice * kRSAccumPerThread;
+                            #pragma unroll
+                            for (uint32_t k_pair = 0; k_pair < BLOCK_K / RSWGMMA::K; k_pair += 2) {
+                                float rs_accum_0[kRSAccumPerThread];
+                                float rs_accum_1[kRSAccumPerThread];
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kRSAccumPerThread; ++ i) {
+                                    rs_accum_0[i] = 0.0f;
+                                    rs_accum_1[i] = 0.0f;
+                                    ptx::warpgroup_fence_operand(rs_accum_0[i]);
+                                    ptx::warpgroup_fence_operand(rs_accum_1[i]);
+                                }
+
+                                if constexpr (kClockProfile) {
+                                    if (epilogue_thread_idx == 0)
+                                        rs_profile_t0 = clock64();
+                                }
+                                const uint32_t e8m0_02_0 = load_rs_e8m0(
+                                    0, k_block_idx, k_pair, rs_n_slice,
+                                    l2_weights_sf, kL2SFBPerExpert, kL2SFBKWords);
+                                const uint32_t e8m0_13_0 = load_rs_e8m0(
+                                    1, k_block_idx, k_pair, rs_n_slice,
+                                    l2_weights_sf, kL2SFBPerExpert, kL2SFBKWords);
+                                uint32_t a0_0, a1_0, a2_0, a3_0;
+                                if constexpr (kFuseScaleBHummingDecode or kUseDynamicLutDecode) {
+                                    a0_0 = decode_rs_a_reg(load_rs_packed_nibbles(0, stage_idx, k_pair, rs_n_slice), e8m0_02_0);
+                                    a1_0 = decode_rs_a_reg(load_rs_packed_nibbles(1, stage_idx, k_pair, rs_n_slice), e8m0_13_0);
+                                    a2_0 = decode_rs_a_reg(load_rs_packed_nibbles(2, stage_idx, k_pair, rs_n_slice), e8m0_02_0);
+                                    a3_0 = decode_rs_a_reg(load_rs_packed_nibbles(3, stage_idx, k_pair, rs_n_slice), e8m0_13_0);
+                                } else {
+                                    const uint64_t scaled_lut_02 =
+                                        kUseCommonLutFastPath ?
+                                        fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_common_const(e8m0_02_0) :
+                                        fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_const(e8m0_02_0);
+                                    const uint64_t scaled_lut_13 =
+                                        kUseCommonLutFastPath ?
+                                        fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_common_const(e8m0_13_0) :
+                                        fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_const(e8m0_13_0);
+                                    const uint32_t lut_02_lo = static_cast<uint32_t>(scaled_lut_02);
+                                    const uint32_t lut_02_hi = static_cast<uint32_t>(scaled_lut_02 >> 32);
+                                    const uint32_t lut_13_lo = static_cast<uint32_t>(scaled_lut_13);
+                                    const uint32_t lut_13_hi = static_cast<uint32_t>(scaled_lut_13 >> 32);
+                                    a0_0 = decode_rs_a_reg_lut(load_rs_packed_nibbles(0, stage_idx, k_pair, rs_n_slice),
+                                                               lut_02_lo, lut_02_hi);
+                                    a1_0 = decode_rs_a_reg_lut(load_rs_packed_nibbles(1, stage_idx, k_pair, rs_n_slice),
+                                                               lut_13_lo, lut_13_hi);
+                                    a2_0 = decode_rs_a_reg_lut(load_rs_packed_nibbles(2, stage_idx, k_pair, rs_n_slice),
+                                                               lut_02_lo, lut_02_hi);
+                                    a3_0 = decode_rs_a_reg_lut(load_rs_packed_nibbles(3, stage_idx, k_pair, rs_n_slice),
+                                                               lut_13_lo, lut_13_hi);
+                                }
+                                const uint32_t k_next = k_pair + 1;
+                                const uint32_t e8m0_02_1 = load_rs_e8m0(
+                                    0, k_block_idx, k_next, rs_n_slice,
+                                    l2_weights_sf, kL2SFBPerExpert, kL2SFBKWords);
+                                const uint32_t e8m0_13_1 = load_rs_e8m0(
+                                    1, k_block_idx, k_next, rs_n_slice,
+                                    l2_weights_sf, kL2SFBPerExpert, kL2SFBKWords);
+                                uint32_t a0_1, a1_1, a2_1, a3_1;
+                                if constexpr (kFuseScaleBHummingDecode or kUseDynamicLutDecode) {
+                                    a0_1 = decode_rs_a_reg(load_rs_packed_nibbles(0, stage_idx, k_next, rs_n_slice), e8m0_02_1);
+                                    a1_1 = decode_rs_a_reg(load_rs_packed_nibbles(1, stage_idx, k_next, rs_n_slice), e8m0_13_1);
+                                    a2_1 = decode_rs_a_reg(load_rs_packed_nibbles(2, stage_idx, k_next, rs_n_slice), e8m0_02_1);
+                                    a3_1 = decode_rs_a_reg(load_rs_packed_nibbles(3, stage_idx, k_next, rs_n_slice), e8m0_13_1);
+                                } else {
+                                    const uint64_t scaled_lut_02 =
+                                        kUseCommonLutFastPath ?
+                                        fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_common_const(e8m0_02_1) :
+                                        fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_const(e8m0_02_1);
+                                    const uint64_t scaled_lut_13 =
+                                        kUseCommonLutFastPath ?
+                                        fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_common_const(e8m0_13_1) :
+                                        fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_const(e8m0_13_1);
+                                    const uint32_t lut_02_lo = static_cast<uint32_t>(scaled_lut_02);
+                                    const uint32_t lut_02_hi = static_cast<uint32_t>(scaled_lut_02 >> 32);
+                                    const uint32_t lut_13_lo = static_cast<uint32_t>(scaled_lut_13);
+                                    const uint32_t lut_13_hi = static_cast<uint32_t>(scaled_lut_13 >> 32);
+                                    a0_1 = decode_rs_a_reg_lut(load_rs_packed_nibbles(0, stage_idx, k_next, rs_n_slice),
+                                                               lut_02_lo, lut_02_hi);
+                                    a1_1 = decode_rs_a_reg_lut(load_rs_packed_nibbles(1, stage_idx, k_next, rs_n_slice),
+                                                               lut_13_lo, lut_13_hi);
+                                    a2_1 = decode_rs_a_reg_lut(load_rs_packed_nibbles(2, stage_idx, k_next, rs_n_slice),
+                                                               lut_02_lo, lut_02_hi);
+                                    a3_1 = decode_rs_a_reg_lut(load_rs_packed_nibbles(3, stage_idx, k_next, rs_n_slice),
+                                                               lut_13_lo, lut_13_hi);
+                                }
+                                if constexpr (kClockProfile) {
+                                    if (epilogue_thread_idx == 0) {
+                                        rs_profile_t1 = clock64();
+                                        rs_stage_decode += rs_profile_t1 - rs_profile_t0;
+                                    }
+                                }
+
+                                wait_rs_acts_ready();
+                                if constexpr (kClockProfile) {
+                                    if (epilogue_thread_idx == 0)
+                                        rs_profile_t0 = clock64();
+                                }
+                                auto desc_b_0 = desc_b_base;
+                                desc_b_0.reg32_[0] = desc_b_base_lo + k_pair * RSWGMMA::K / 16;
+                                ptx::warpgroup_arrive();
+                                RSWGMMA::wgmma(a0_0, a1_0, a2_0, a3_0, desc_b_0, rs_accum_0, false);
+                                auto desc_b_1 = desc_b_base;
+                                desc_b_1.reg32_[0] = desc_b_base_lo + k_next * RSWGMMA::K / 16;
+                                ptx::warpgroup_arrive();
+                                RSWGMMA::wgmma(a0_1, a1_1, a2_1, a3_1, desc_b_1, rs_accum_1, false);
+                                ptx::warpgroup_commit_batch();
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kRSAccumPerThread; ++ i) {
+                                    ptx::warpgroup_fence_operand(rs_accum_0[i]);
+                                    ptx::warpgroup_fence_operand(rs_accum_1[i]);
+                                }
+                                ptx::warpgroup_wait<0>();
+                                if constexpr (kClockProfile) {
+                                    if (epilogue_thread_idx == 0) {
+                                        rs_profile_t1 = clock64();
+                                        rs_stage_wgmma += rs_profile_t1 - rs_profile_t0;
+                                    }
+                                }
+
+                                if constexpr (kClockProfile) {
+                                    if (epilogue_thread_idx == 0)
+                                        rs_profile_t0 = clock64();
+                                }
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kRSAccumPerThread / 4; ++ i) {
+                                    const uint32_t token_0 = i * 8 + col_idx * 2;
+                                    const float2 scale_a = load_rs_sfa_pair(
+                                        smem_sfa[stage_idx] + k_pair * BLOCK_M + token_0);
+                                    final_accum[rs_accum_base + i * 4 + 0] += scale_a.x * rs_accum_0[i * 4 + 0];
+                                    final_accum[rs_accum_base + i * 4 + 1] += scale_a.y * rs_accum_0[i * 4 + 1];
+                                    final_accum[rs_accum_base + i * 4 + 2] += scale_a.x * rs_accum_0[i * 4 + 2];
+                                    final_accum[rs_accum_base + i * 4 + 3] += scale_a.y * rs_accum_0[i * 4 + 3];
+                                }
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kRSAccumPerThread / 4; ++ i) {
+                                    const uint32_t token_0 = i * 8 + col_idx * 2;
+                                    const float2 scale_a = load_rs_sfa_pair(
+                                        smem_sfa[stage_idx] + k_next * BLOCK_M + token_0);
+                                    final_accum[rs_accum_base + i * 4 + 0] += scale_a.x * rs_accum_1[i * 4 + 0];
+                                    final_accum[rs_accum_base + i * 4 + 1] += scale_a.y * rs_accum_1[i * 4 + 1];
+                                    final_accum[rs_accum_base + i * 4 + 2] += scale_a.x * rs_accum_1[i * 4 + 2];
+                                    final_accum[rs_accum_base + i * 4 + 3] += scale_a.y * rs_accum_1[i * 4 + 3];
+                                }
+                                if constexpr (kClockProfile) {
+                                    if (epilogue_thread_idx == 0) {
+                                        rs_profile_t1 = clock64();
+                                        rs_stage_promote += rs_profile_t1 - rs_profile_t0;
+                                    }
+                                }
+                            }
+                        } else {
+                        const bool is_l1 = block_phase == sched::BlockPhase::Linear1;
+                        const uint32_t* sfb_base = is_l1 ? l1_weights_sf : l2_weights_sf;
+                        const uint32_t sfb_per_expert = is_l1 ? kL1SFBPerExpert : kL2SFBPerExpert;
+                        const uint32_t sfb_k_words = is_l1 ? kL1SFBKWords : kL2SFBKWords;
+                        uint32_t sfb_word_02 = 0;
+                        uint32_t sfb_word_13 = 0;
+                        if constexpr (kRSReuseSFBWord) {
+                            sfb_word_02 = load_rs_sfb_word(
+                                0, k_block_idx, rs_n_slice,
+                                sfb_base, sfb_per_expert, sfb_k_words);
+                            sfb_word_13 = load_rs_sfb_word(
+                                1, k_block_idx, rs_n_slice,
+                                sfb_base, sfb_per_expert, sfb_k_words);
+                        }
+
+                        #pragma unroll
+                        for (uint32_t k = 0; k < BLOCK_K / RSWGMMA::K; ++ k) {
+                            float rs_accum[kRSAccumPerThread];
+                            if constexpr (kClockProfile) {
+                                if (epilogue_thread_idx == 0)
+                                    rs_profile_t0 = clock64();
+                            }
+                            uint32_t e8m0_02, e8m0_13;
+                            if constexpr (kRSReuseSFBWord) {
+                                e8m0_02 = unpack_rs_e8m0(sfb_word_02, k);
+                                e8m0_13 = unpack_rs_e8m0(sfb_word_13, k);
+                            } else {
+                                e8m0_02 = load_rs_e8m0(0, k_block_idx, k, rs_n_slice,
+                                                      sfb_base, sfb_per_expert, sfb_k_words);
+                                e8m0_13 = load_rs_e8m0(1, k_block_idx, k, rs_n_slice,
+                                                      sfb_base, sfb_per_expert, sfb_k_words);
+                            }
+                            uint32_t a0, a1, a2, a3;
+                            if constexpr (kFuseScaleBHummingDecode or kUseDynamicLutDecode) {
+                                a0 = decode_rs_a_reg(load_rs_packed_nibbles(0, stage_idx, k, rs_n_slice), e8m0_02);
+                                a1 = decode_rs_a_reg(load_rs_packed_nibbles(1, stage_idx, k, rs_n_slice), e8m0_13);
+                                a2 = decode_rs_a_reg(load_rs_packed_nibbles(2, stage_idx, k, rs_n_slice), e8m0_02);
+                                a3 = decode_rs_a_reg(load_rs_packed_nibbles(3, stage_idx, k, rs_n_slice), e8m0_13);
+                            } else {
+                                const uint64_t scaled_lut_02 =
+                                    kUseCommonLutFastPath ?
+                                    fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_common_const(e8m0_02) :
+                                    fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_const(e8m0_02);
+                                const uint64_t scaled_lut_13 =
+                                    kUseCommonLutFastPath ?
+                                    fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_common_const(e8m0_13) :
+                                    fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_const(e8m0_13);
+                                const uint32_t lut_02_lo = static_cast<uint32_t>(scaled_lut_02);
+                                const uint32_t lut_02_hi = static_cast<uint32_t>(scaled_lut_02 >> 32);
+                                const uint32_t lut_13_lo = static_cast<uint32_t>(scaled_lut_13);
+                                const uint32_t lut_13_hi = static_cast<uint32_t>(scaled_lut_13 >> 32);
+                                a0 = decode_rs_a_reg_lut(load_rs_packed_nibbles(0, stage_idx, k, rs_n_slice),
+                                                         lut_02_lo, lut_02_hi);
+                                a1 = decode_rs_a_reg_lut(load_rs_packed_nibbles(1, stage_idx, k, rs_n_slice),
+                                                         lut_13_lo, lut_13_hi);
+                                a2 = decode_rs_a_reg_lut(load_rs_packed_nibbles(2, stage_idx, k, rs_n_slice),
+                                                         lut_02_lo, lut_02_hi);
+                                a3 = decode_rs_a_reg_lut(load_rs_packed_nibbles(3, stage_idx, k, rs_n_slice),
+                                                         lut_13_lo, lut_13_hi);
+                            }
                             if constexpr (kClockProfile) {
                                 if (epilogue_thread_idx == 0) {
                                     rs_profile_t1 = clock64();
@@ -1520,6 +1963,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 }
                             }
 
+                            wait_rs_acts_ready();
                             if constexpr (kClockProfile) {
                                 if (epilogue_thread_idx == 0)
                                     rs_profile_t0 = clock64();
@@ -1545,7 +1989,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 }
                             }
 
-                            const uint32_t sfa_half = k < 2 ? 0u : 1u;
+                            const uint32_t sfa_group =
+                                kL2ActsSFGranK == 32 ? k : (k < 2 ? 0u : 1u);
                             const uint32_t rs_accum_base = rs_n_slice * kRSAccumPerThread;
                             if constexpr (kClockProfile) {
                                 if (epilogue_thread_idx == 0)
@@ -1554,19 +1999,16 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             #pragma unroll
                             for (uint32_t i = 0; i < kRSAccumPerThread / 4; ++ i) {
                                 const uint32_t token_0 = i * 8 + col_idx * 2;
-                                const uint32_t token_1 = token_0 + 1;
-                                float scale_a_0, scale_a_1;
+                                float2 scale_a;
                                 if (block_phase == sched::BlockPhase::Linear1) {
-                                    scale_a_0 = ptx::ld_shared(smem_sfa[stage_idx] + token_0);
-                                    scale_a_1 = ptx::ld_shared(smem_sfa[stage_idx] + token_1);
+                                    scale_a = load_rs_sfa_pair(smem_sfa[stage_idx] + token_0);
                                 } else {
-                                    scale_a_0 = ptx::ld_shared(smem_sfa[stage_idx] + sfa_half * BLOCK_M + token_0);
-                                    scale_a_1 = ptx::ld_shared(smem_sfa[stage_idx] + sfa_half * BLOCK_M + token_1);
+                                    scale_a = load_rs_sfa_pair(smem_sfa[stage_idx] + sfa_group * BLOCK_M + token_0);
                                 }
-                                final_accum[rs_accum_base + i * 4 + 0] += scale_a_0 * rs_accum[i * 4 + 0];
-                                final_accum[rs_accum_base + i * 4 + 1] += scale_a_1 * rs_accum[i * 4 + 1];
-                                final_accum[rs_accum_base + i * 4 + 2] += scale_a_0 * rs_accum[i * 4 + 2];
-                                final_accum[rs_accum_base + i * 4 + 3] += scale_a_1 * rs_accum[i * 4 + 3];
+                                final_accum[rs_accum_base + i * 4 + 0] += scale_a.x * rs_accum[i * 4 + 0];
+                                final_accum[rs_accum_base + i * 4 + 1] += scale_a.y * rs_accum[i * 4 + 1];
+                                final_accum[rs_accum_base + i * 4 + 2] += scale_a.x * rs_accum[i * 4 + 2];
+                                final_accum[rs_accum_base + i * 4 + 3] += scale_a.y * rs_accum[i * 4 + 3];
                             }
                             if constexpr (kClockProfile) {
                                 if (epilogue_thread_idx == 0) {
@@ -1574,6 +2016,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                     rs_stage_promote += rs_profile_t1 - rs_profile_t0;
                                 }
                             }
+                        }
                         }
                     }
 
@@ -1601,20 +2044,68 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         for (uint32_t i = 0; i < kRSAccumPerThread / 4; ++ i) {
                             const uint32_t token_0 = i * 8 + col_idx * 2;
                             const uint32_t token_1 = token_0 + 1;
-                            smem_rs_accum[token_0 * RSWGMMA::M + r_0] = final_accum[rs_accum_base + i * 4 + 0];
-                            smem_rs_accum[token_1 * RSWGMMA::M + r_0] = final_accum[rs_accum_base + i * 4 + 1];
-                            smem_rs_accum[token_0 * RSWGMMA::M + r_1] = final_accum[rs_accum_base + i * 4 + 2];
-                            smem_rs_accum[token_1 * RSWGMMA::M + r_1] = final_accum[rs_accum_base + i * 4 + 3];
+                            if constexpr (kRSGuardTransposeValid) {
+                                if (token_0 < valid_m) {
+                                    smem_rs_accum[token_0 * RSWGMMA::M + r_0] = final_accum[rs_accum_base + i * 4 + 0];
+                                    smem_rs_accum[token_0 * RSWGMMA::M + r_1] = final_accum[rs_accum_base + i * 4 + 2];
+                                }
+                                if (token_1 < valid_m) {
+                                    smem_rs_accum[token_1 * RSWGMMA::M + r_0] = final_accum[rs_accum_base + i * 4 + 1];
+                                    smem_rs_accum[token_1 * RSWGMMA::M + r_1] = final_accum[rs_accum_base + i * 4 + 3];
+                                }
+                            } else {
+                                smem_rs_accum[token_0 * RSWGMMA::M + r_0] = final_accum[rs_accum_base + i * 4 + 0];
+                                smem_rs_accum[token_1 * RSWGMMA::M + r_0] = final_accum[rs_accum_base + i * 4 + 1];
+                                smem_rs_accum[token_0 * RSWGMMA::M + r_1] = final_accum[rs_accum_base + i * 4 + 2];
+                                smem_rs_accum[token_1 * RSWGMMA::M + r_1] = final_accum[rs_accum_base + i * 4 + 3];
+                            }
                         }
                         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                         #pragma unroll
                         for (uint32_t i = 0; i < kRSAccumPerThread / 4; ++ i) {
                             const uint32_t out_col = i * 8 + col_idx * 2;
                             const uint32_t out_chunk = rs_n_slice * (kRSAccumPerThread / 4) + i;
-                            final_accum[out_chunk * 4 + 0] = smem_rs_accum[r_0 * RSWGMMA::M + out_col + 0];
-                            final_accum[out_chunk * 4 + 1] = smem_rs_accum[r_0 * RSWGMMA::M + out_col + 1];
-                            final_accum[out_chunk * 4 + 2] = smem_rs_accum[r_1 * RSWGMMA::M + out_col + 0];
-                            final_accum[out_chunk * 4 + 3] = smem_rs_accum[r_1 * RSWGMMA::M + out_col + 1];
+                            if constexpr (kRSGuardTransposeValid) {
+                                const bool valid_out_r0 = r_0 < valid_m;
+                                const bool valid_out_r1 = r_1 < valid_m;
+                                if constexpr (kRSUseTransposeVecLoad) {
+                                    const float2 row_0 = valid_out_r0
+                                        ? ptx::ld_shared(reinterpret_cast<const float2*>(
+                                            smem_rs_accum + r_0 * RSWGMMA::M + out_col))
+                                        : make_float2(0.0f, 0.0f);
+                                    const float2 row_1 = valid_out_r1
+                                        ? ptx::ld_shared(reinterpret_cast<const float2*>(
+                                            smem_rs_accum + r_1 * RSWGMMA::M + out_col))
+                                        : make_float2(0.0f, 0.0f);
+                                    final_accum[out_chunk * 4 + 0] = row_0.x;
+                                    final_accum[out_chunk * 4 + 1] = row_0.y;
+                                    final_accum[out_chunk * 4 + 2] = row_1.x;
+                                    final_accum[out_chunk * 4 + 3] = row_1.y;
+                                } else {
+                                    final_accum[out_chunk * 4 + 0] = valid_out_r0
+                                        ? smem_rs_accum[r_0 * RSWGMMA::M + out_col + 0] : 0.0f;
+                                    final_accum[out_chunk * 4 + 1] = valid_out_r0
+                                        ? smem_rs_accum[r_0 * RSWGMMA::M + out_col + 1] : 0.0f;
+                                    final_accum[out_chunk * 4 + 2] = valid_out_r1
+                                        ? smem_rs_accum[r_1 * RSWGMMA::M + out_col + 0] : 0.0f;
+                                    final_accum[out_chunk * 4 + 3] = valid_out_r1
+                                        ? smem_rs_accum[r_1 * RSWGMMA::M + out_col + 1] : 0.0f;
+                                }
+                            } else if constexpr (kRSUseTransposeVecLoad) {
+                                const auto row_0 = ptx::ld_shared(reinterpret_cast<const float2*>(
+                                    smem_rs_accum + r_0 * RSWGMMA::M + out_col));
+                                const auto row_1 = ptx::ld_shared(reinterpret_cast<const float2*>(
+                                    smem_rs_accum + r_1 * RSWGMMA::M + out_col));
+                                final_accum[out_chunk * 4 + 0] = row_0.x;
+                                final_accum[out_chunk * 4 + 1] = row_0.y;
+                                final_accum[out_chunk * 4 + 2] = row_1.x;
+                                final_accum[out_chunk * 4 + 3] = row_1.y;
+                            } else {
+                                final_accum[out_chunk * 4 + 0] = smem_rs_accum[r_0 * RSWGMMA::M + out_col + 0];
+                                final_accum[out_chunk * 4 + 1] = smem_rs_accum[r_0 * RSWGMMA::M + out_col + 1];
+                                final_accum[out_chunk * 4 + 2] = smem_rs_accum[r_1 * RSWGMMA::M + out_col + 0];
+                                final_accum[out_chunk * 4 + 3] = smem_rs_accum[r_1 * RSWGMMA::M + out_col + 1];
+                            }
                         }
                         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                     }
@@ -1701,7 +2192,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             dequant_fp4_b_tile_to_e4m3_smem_dispatch<
                                 LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
                                 kUseKGPairDecode, kUseVectorStoreDecode,
-                                kUseDynamicLutDecode, kUseCommonLutFastPath, kFuseScaleBHummingDecode>(
+                                kSkipZeroSFBDecode, kUseDynamicLutDecode,
+                                kUseCommonLutFastPath, kFuseScaleBHummingDecode>(
                                 decode_thread_idx, kNumFP4DecodeWorkerThreads,
                                 smem_b_packed[stage_idx], smem_b[stage_idx], smem_sfb[stage_idx]);
                         }
@@ -2171,18 +2663,62 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 ptx::tma_store_wait<0>();
 
                 // Notify L2 that this N block's L1 output (and SF) is ready
-                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                    ptx::red_or_rel_gpu(
-                        workspace.get_l2_arrival_mask_ptr(pool_block_idx),
-                        1ull << n_block_idx);
+                if constexpr (kL2ArrivalCounter) {
+                    if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
+                        ptx::red_add_rel(
+                            reinterpret_cast<uint32_t*>(workspace.get_l2_arrival_mask_ptr(pool_block_idx)), 1);
+                    }
+                } else {
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                        ptx::red_or_rel_gpu(
+                            workspace.get_l2_arrival_mask_ptr(pool_block_idx),
+                            1ull << n_block_idx);
+                    }
                 }
                 __syncwarp();
             } else {
                 // ---------------- L2 EPILOGUE: BF16 cast + NVLink scatter ----------------
                 constexpr uint32_t kNumRowsPerWarp = WG_BLOCK_M / 8;
 
-                if constexpr (kUseRSMode) {
+                if constexpr (kUseRSMode and kRSDirectL2Scatter) {
+                    using RSWGMMA = L2RSWGMMA;
+                    constexpr uint32_t kRSAccumPerThread = RSWGMMA::kNumAccum;
+                    constexpr uint32_t kNumRSNSlices = BLOCK_N / RSWGMMA::M;
+
+                    auto write_remote_bf16_scalar = [&](uint32_t row, uint32_t col, float value) {
+                        const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + row);
+                        const auto dst_token = combine_token_buffer.get_rank_buffer(src_metadata.topk_idx)
+                                               .get_data_buffer(src_metadata.token_idx);
+                        auto dst_ptr = math::advance_ptr<uint16_t>(
+                            dst_token.get_base_ptr(),
+                            n_idx * sizeof(nv_bfloat16) + col * sizeof(nv_bfloat16));
+                        float value_copy = value;
+                        float value_dup = value;
+                        const uint32_t packed = math::cast_into_bf16_and_pack(value_copy, value_dup);
+                        *sym_buffer.map(dst_ptr, src_metadata.rank_idx) = static_cast<uint16_t>(packed);
+                    };
+
+                    #pragma unroll
+                    for (uint32_t rs_n_slice = 0; rs_n_slice < kNumRSNSlices; ++ rs_n_slice) {
+                        const uint32_t n_row_0 = rs_n_slice * RSWGMMA::M + r_0;
+                        const uint32_t n_row_1 = n_row_0 + 8;
+                        const uint32_t rs_accum_base = rs_n_slice * kRSAccumPerThread;
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kRSAccumPerThread / 4; ++ i) {
+                            const uint32_t token_0 = i * 8 + col_idx * 2;
+                            const uint32_t token_1 = token_0 + 1;
+                            if (token_0 < valid_m) {
+                                write_remote_bf16_scalar(token_0, n_row_0, final_accum[rs_accum_base + i * 4 + 0]);
+                                write_remote_bf16_scalar(token_0, n_row_1, final_accum[rs_accum_base + i * 4 + 2]);
+                            }
+                            if (token_1 < valid_m) {
+                                write_remote_bf16_scalar(token_1, n_row_0, final_accum[rs_accum_base + i * 4 + 1]);
+                                write_remote_bf16_scalar(token_1, n_row_1, final_accum[rs_accum_base + i * 4 + 3]);
+                            }
+                        }
+                    }
+                } else if constexpr (kUseRSMode) {
                     using RSWGMMA = L2RSWGMMA;
                     constexpr uint32_t kRSAccumPerThread = RSWGMMA::kNumAccum;
                     constexpr uint32_t kNumRSNSlices = BLOCK_N / RSWGMMA::M;
@@ -2258,54 +2794,57 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
 
-                ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+                if constexpr (!(kUseRSMode and kRSDirectL2Scatter)) {
+                    ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
-                // Scatter to remote ranks via NVLink (one row per warp-pair)
-                // Each warpgroup-warp covers 8 unique rows × 2 (r_0 + r_1 doubled by warps)
-                // Lane group of 16 within a warp → 1 row.
-                const uint32_t row_in_warp_block = lane_idx / 16;  // 0 or 1
-                const uint32_t lane_in_row = lane_idx % 16;
-                constexpr uint32_t kColsPerScatterLane = BLOCK_N / 16;
-                static_assert(BLOCK_N % 16 == 0, "Scatter layout expects an even lane partition");
-                static_assert(kColsPerScatterLane == 4 or kColsPerScatterLane == 8,
-                              "L2 scatter currently supports BLOCK_N=64 or 128");
+                    // Scatter to remote ranks via NVLink (one row per warp-pair)
+                    // Each warpgroup-warp covers 8 unique rows × 2 (r_0 + r_1 doubled by warps)
+                    // Lane group of 16 within a warp → 1 row.
+                    const uint32_t row_in_warp_block = lane_idx / 16;  // 0 or 1
+                    const uint32_t lane_in_row = lane_idx % 16;
+                    constexpr uint32_t kColsPerScatterLane = BLOCK_N / 16;
+                    static_assert(BLOCK_N % 16 == 0, "Scatter layout expects an even lane partition");
+                    static_assert(kColsPerScatterLane == 4 or kColsPerScatterLane == 8,
+                                  "L2 scatter currently supports BLOCK_N=64 or 128");
 
-                #pragma unroll
-                for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
-                    const uint32_t row_in_wg = warp_idx_in_wg * 16 + j * 2 + row_in_warp_block;
-                    const uint32_t m_idx_in_block = epilogue_wg_idx * WG_BLOCK_M + row_in_wg;
-                    if (m_idx_in_block >= valid_m) break;
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
+                        const uint32_t row_in_wg = warp_idx_in_wg * 16 + j * 2 + row_in_warp_block;
+                        const uint32_t m_idx_in_block = epilogue_wg_idx * WG_BLOCK_M + row_in_wg;
+                        if (m_idx_in_block >= valid_m) break;
 
-                    const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + m_idx_in_block);
-                    const uint32_t dst_rank_idx = src_metadata.rank_idx;
-                    const uint32_t dst_token_idx = src_metadata.token_idx;
-                    const uint32_t dst_topk_idx = src_metadata.topk_idx;
+                        const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + m_idx_in_block);
+                        const uint32_t dst_rank_idx = src_metadata.rank_idx;
+                        const uint32_t dst_token_idx = src_metadata.token_idx;
+                        const uint32_t dst_topk_idx = src_metadata.topk_idx;
 
-                    // BLOCK_N=128 scatters 8 BF16s/lane (=16B, uint4).  For
-                    // BLOCK_N=64 each lane owns 4 BF16s (=8B), so use uint2;
-                    // a uint4 load would be misaligned for odd lanes.
-                    auto smem_ptr = smem_cd_l2
-                        + epilogue_wg_idx * WG_BLOCK_M * BLOCK_N
-                        + row_in_wg * BLOCK_N
-                        + lane_in_row * kColsPerScatterLane;
-                    const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
-                                           .get_data_buffer(dst_token_idx);
-                    if constexpr (kColsPerScatterLane == 8) {
-                        const auto packed = *reinterpret_cast<uint4*>(smem_ptr);
-                        auto dst_ptr = math::advance_ptr<uint4>(
-                            dst_token.get_base_ptr(),
-                            n_idx * sizeof(nv_bfloat16) + lane_in_row * sizeof(uint4));
-                        *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
-                    } else {
-                        const auto packed = *reinterpret_cast<uint2*>(smem_ptr);
-                        auto dst_ptr = math::advance_ptr<uint2>(
-                            dst_token.get_base_ptr(),
-                            n_idx * sizeof(nv_bfloat16) + lane_in_row * sizeof(uint2));
-                        *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        // BLOCK_N=128 scatters 8 BF16s/lane (=16B, uint4).  For
+                        // BLOCK_N=64 each lane owns 4 BF16s (=8B), so use uint2;
+                        // a uint4 load would be misaligned for odd lanes.
+                        auto smem_ptr = smem_cd_l2
+                            + epilogue_wg_idx * WG_BLOCK_M * BLOCK_N
+                            + row_in_wg * BLOCK_N
+                            + lane_in_row * kColsPerScatterLane;
+                        const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
+                                               .get_data_buffer(dst_token_idx);
+                        if constexpr (kColsPerScatterLane == 8) {
+                            const auto packed = *reinterpret_cast<uint4*>(smem_ptr);
+                            auto dst_ptr = math::advance_ptr<uint4>(
+                                dst_token.get_base_ptr(),
+                                n_idx * sizeof(nv_bfloat16) + lane_in_row * sizeof(uint4));
+                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        } else {
+                            const auto packed = *reinterpret_cast<uint2*>(smem_ptr);
+                            auto dst_ptr = math::advance_ptr<uint2>(
+                                dst_token.get_base_ptr(),
+                                n_idx * sizeof(nv_bfloat16) + lane_in_row * sizeof(uint2));
+                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        }
                     }
                 }
 
-                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                if constexpr (not kSkipL2EpilogueSync)
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             }
         });
 
