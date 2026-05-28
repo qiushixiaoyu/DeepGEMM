@@ -559,9 +559,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // =====================================================================
     // Template checks
     // =====================================================================
-    DG_STATIC_ASSERT(kNumDispatchThreads % 128 == 0, "Invalid number of dispatch threads");
-    DG_STATIC_ASSERT(kNumNonEpilogueThreads >= 128 and kNumNonEpilogueThreads % 128 == 0,
+    DG_STATIC_ASSERT(kNumDispatchThreads == 64 or kNumDispatchThreads == 128,
+                     "Dispatch supports 2 or 4 warps");
+    DG_STATIC_ASSERT(kNumNonEpilogueThreads >= 128 and kNumNonEpilogueThreads % 64 == 0,
                      "Invalid number of GEMM TMA/decode-assist warps");
+    DG_STATIC_ASSERT((kNumDispatchThreads + kNumNonEpilogueThreads) % 128 == 0,
+                     "Math warps must start on a warpgroup boundary");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of math/epilogue threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
     DG_STATIC_ASSERT(BLOCK_M % 64 == 0, "BLOCK_M must be a multiple of WGMMA::M (64)");
@@ -1215,8 +1218,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
     // =====================================================================
     // ROLE 2: GEMM TMA LOAD warps (load A+SFA, B+SFB)
-    //   Warps inside `kNumNonEpilogueThreads` (= 4 warps): warp 0 loads
-    //   A + SFA, warp 1 loads B + SFB, warps 2..3 idle.
+    //   Warps inside `kNumNonEpilogueThreads`: warp 0 loads A + SFA,
+    //   warp 1 loads B + SFB, remaining warps are decode-assist only.
     // =====================================================================
     } else if (warp_idx == kNumDispatchWarps) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
