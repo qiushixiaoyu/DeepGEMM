@@ -120,12 +120,14 @@ struct MegaMoEScheduler {
         const auto wave_end_expert_idx = get_wave_expert_end_idx();
         while (current_local_expert_idx < wave_end_expert_idx) {
             const auto num_m_blocks = get_current_num_m_blocks();
-            m_block_idx = block_idx / kNumL1BlockNs;
-            if (m_block_idx < num_m_blocks)
+            const auto num_blocks = num_m_blocks * kNumL1BlockNs;
+            if (block_idx < num_blocks) {
+                m_block_idx = block_idx / kNumL1BlockNs;
                 return true;
+            }
 
             // Current expert is fully assigned, move to the next
-            block_idx -= num_m_blocks * kNumL1BlockNs;
+            block_idx -= num_blocks;
             advance_expert_idx();
         }
         return false;
@@ -135,13 +137,14 @@ struct MegaMoEScheduler {
         const auto wave_end_expert_idx = get_wave_expert_end_idx();
         while (current_local_expert_idx < wave_end_expert_idx) {
             const auto num_m_blocks = get_current_num_m_blocks();
-            if (block_idx < num_m_blocks * kNumL2BlockNs) {
+            const auto num_blocks = num_m_blocks * kNumL2BlockNs;
+            if (block_idx < num_blocks) {
                 m_block_idx = block_idx / kNumL2BlockNs;
                 return true;
             }
 
             // Current expert is fully assigned, move to the next
-            block_idx -= num_m_blocks * kNumL2BlockNs;
+            block_idx -= num_blocks;
             advance_expert_idx();
         }
         return false;
@@ -217,6 +220,27 @@ struct MegaMoEScheduler {
             func(block_phase, current_local_expert_idx,
                  block_phase == BlockPhase::Linear2 ? kNumL2BlockKs : kNumL1BlockKs,
                  m_block_idx, n_block_idx);
+        }
+    }
+
+    template <typename L1Func, typename L2Func>
+    CUTLASS_DEVICE void for_each_block_split(L1Func&& l1_func, L2Func&& l2_func) {
+        // Same scheduling order as `for_each_block`, but the phase-specific
+        // call sites let hot kernels instantiate separate L1/L2 bodies.
+        fetch_expert_recv_count();
+
+        set_expert_idx(0);
+
+        while (true) {
+            CUTE_TIE_DECL(get_next_block(), block_phase, current_local_expert_idx, m_block_idx, n_block_idx);
+            if (block_phase == BlockPhase::None)
+                break;
+
+            if (block_phase == BlockPhase::Linear1) {
+                l1_func(current_local_expert_idx, kNumL1BlockKs, m_block_idx, n_block_idx);
+            } else {
+                l2_func(current_local_expert_idx, kNumL2BlockKs, m_block_idx, n_block_idx);
+            }
         }
     }
 };
