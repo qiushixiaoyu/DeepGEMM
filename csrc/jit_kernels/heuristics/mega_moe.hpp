@@ -315,7 +315,7 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
     // i.e. (block_m / num_epilogue_warpgroups) >= 64.
     //
     // Keep the historical 1-WG path for decode-ish small batches, but use the
-    // 4-WG split-MN BLOCK_M=128/BLOCK_N=256 path once each global expert has
+    // 2-WG split-MN BLOCK_M=128 path once each global expert has
     // enough routed tokens. On H20, the crossover is already around 64
     // tokens/expert: below that the extra warpgroups add overhead, while at and
     // above that point the larger split-MN tile cuts scheduling overhead.
@@ -323,7 +323,7 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
         static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
     const bool auto_split_mn = expected_tokens_per_expert >= 64.0f;
     int block_m = auto_split_mn ? 128 : (expected_tokens_per_expert >= 128.0f ? 128 : 64);
-    int num_epilogue_warpgroups = auto_split_mn ? 4 : block_m / 64;
+    int num_epilogue_warpgroups = auto_split_mn ? 2 : block_m / 64;
     block_m = get_env<int>("DG_SM90_BLOCK_M", block_m);
     num_epilogue_warpgroups =
         get_env<int>("DG_SM90_NUM_EPILOGUE_WARPGROUPS", num_epilogue_warpgroups);
@@ -441,7 +441,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const bool& use_rs_mode = false,
     const bool& use_rs_stage_sfb = false,
     const bool& use_early_b_decode = false,
-    const bool& use_decode_done_mbarrier = false) {
+    const bool& use_decode_done_mbarrier = false,
+    const int& default_num_stages_cap = 0) {
     constexpr int kSmemAlignment = 1024;
 
     const int smem_expert_count_size = align(
@@ -484,11 +485,20 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
         2 * 8 + smem_decode_full_per_stage + smem_decode_done_per_stage;
     const int smem_fixed = smem_dispatch_size + smem_cd + smem_rs_accum + smem_barriers_fixed;
 
-    int num_stages = (smem_capacity - smem_fixed) /
-                     (smem_per_stage + smem_barriers_per_stage);
-    if (const int override_num_stages = get_env<int>("DG_SM90_NUM_STAGES", 0);
+    const int max_num_stages = (smem_capacity - smem_fixed) /
+                               (smem_per_stage + smem_barriers_per_stage);
+    int num_stages = max_num_stages;
+    if (default_num_stages_cap > 0) {
+        num_stages = std::min(num_stages, default_num_stages_cap);
+    }
+    if (const int override_num_stages = get_env<int>("DG_SM90_FP4_NUM_STAGES", 0);
         override_num_stages > 0) {
-        num_stages = std::min(num_stages, override_num_stages);
+        num_stages = std::min(max_num_stages, override_num_stages);
+    } else if (const int override_num_stages = get_env<int>("DG_SM90_NUM_STAGES", 0);
+               override_num_stages > 0) {
+        // Keep the legacy global knob as a fallback, but prefer the FP4-only
+        // override for clean A/B against an unchanged FP8 low-latency baseline.
+        num_stages = std::min(max_num_stages, override_num_stages);
     }
     DG_HOST_ASSERT(num_stages >= 2);
     return {num_stages,
@@ -526,21 +536,54 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms, use_rs_mode);
 
+    const float expected_tokens_per_expert =
+        static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
+    // Runtime FP4 decode is CUDA-core heavy on SM90. For the sparse small-batch
+    // band, A/B on H20 showed that trimming dispatch from 4 warps to 2 and
+    // giving the decode/GEMM side 6 warps helps b1 plus the b4-b128 band.
+    // Keep b2 on the lean 4/4/4 layout: it regressed when forced to 2/6/4.
+    const bool fp4_decode_heavy_small_batch =
+        !use_rs_mode and block_m == 64 and block_n == 128 and
+        ((expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f) or
+         (expected_tokens_per_expert >= 0.75f and expected_tokens_per_expert <= 24.0f));
+    const int default_num_dispatch_threads = fp4_decode_heavy_small_batch ? 64 : 128;
     const int num_dispatch_threads =
-        get_env<int>("DG_SM90_FP4_NUM_DISPATCH_THREADS", 128);
+        get_env<int>("DG_SM90_FP4_NUM_DISPATCH_THREADS", default_num_dispatch_threads);
     DG_HOST_ASSERT(num_dispatch_threads == 64 or num_dispatch_threads == 128);
+    const int default_num_non_epilogue_threads =
+        fp4_decode_heavy_small_batch ? 192 : 128;
     const int num_non_epilogue_threads =
-        get_env<int>("DG_SM90_FP4_NUM_NON_EPILOGUE_THREADS", 128);
+        get_env<int>("DG_SM90_FP4_NUM_NON_EPILOGUE_THREADS", default_num_non_epilogue_threads);
     DG_HOST_ASSERT(num_non_epilogue_threads >= 128 and
                    num_non_epilogue_threads % 64 == 0);
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);
+
+    // FP4-only stage-depth A/B on H20: stage5 helps the broad decode-heavy
+    // band, a narrower stage4 cap is a useful b32 local win, and stage6 helps
+    // sparse b2/b8-style batches by giving TMA/decode/WGMMA one more stage of
+    // slack. Keep b64+ off stage6 after source-tree _C repair exposed a real
+    // regression once this heuristic actually reached the host extension.
+    const bool fp4_stage4_decode_band =
+        !use_rs_mode and block_m == 64 and block_n == 128 and
+        expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f;
+    const bool fp4_stage6_decode_band =
+        !use_rs_mode and block_m == 64 and block_n == 128 and
+        ((expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f) or
+         (expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f));
+    const bool fp4_stage5_decode_heavy_batch =
+        !use_rs_mode and block_m == 64 and block_n == 128 and
+        expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert <= 24.0f;
+    const int default_num_stages_cap =
+        fp4_stage4_decode_band ? 4 :
+        (fp4_stage6_decode_band ? 6 : (fp4_stage5_decode_heavy_batch ? 5 : 0));
 
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90_fp4(
         SM90ArchSpec::smem_capacity,
         num_experts, hidden,
         block_m, block_n, block_k,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
-        use_rs_mode, use_rs_stage_sfb, use_early_b_decode, use_decode_done_mbarrier);
+        use_rs_mode, use_rs_stage_sfb, use_early_b_decode, use_decode_done_mbarrier,
+        default_num_stages_cap);
 
     const auto config = MegaMoESM90Config {
         block_m, block_n, block_k,

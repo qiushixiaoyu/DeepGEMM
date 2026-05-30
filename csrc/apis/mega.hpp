@@ -369,13 +369,24 @@ static void fp8_fp4_mega_moe(
         const bool fuse_scale_b_humming_decode =
             get_env<int>("DG_SM90_FP4_FUSE_SCALE_B_HUMMING_DECODE") != 0;
         const bool use_rs_mode = get_env<int>("DG_SM90_FP4_RS_MODE") != 0;
+        const float expected_tokens_per_expert =
+            static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
         const bool math_wg_participates_in_fp4_decode =
             get_env<int>("DG_SM90_FP4_MATH_WG_DECODE", 1) != 0;
         const int num_math_wg_decode_warps =
             get_env<int>("DG_SM90_FP4_MATH_WG_DECODE_WARPS",
                          math_wg_participates_in_fp4_decode ? 4 : 0);
+        const bool default_skip_loader_decode_assist =
+            // The two loader-side non-epilogue warps are on the TMA/SFB
+            // producer path. H20 A/B showed leaving them out of FP4 decode is
+            // a repeatable win for b1 and b8, but b4/b16 are noisy and b2 or
+            // b32+ regress where raw decode parallelism matters more.
+            !use_rs_mode and
+            ((expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f) or
+             (expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f));
         const int first_fp4_decode_assist_warp =
-            get_env<int>("DG_SM90_FP4_FIRST_DECODE_ASSIST_WARP", 0);
+            get_env<int>("DG_SM90_FP4_FIRST_DECODE_ASSIST_WARP",
+                         default_skip_loader_decode_assist ? 2 : 0);
         const bool use_kg_pair_decode =
             get_env<int>("DG_SM90_FP4_KG_PAIR_DECODE", 0) != 0;
         const bool use_vector_store_decode =
@@ -448,24 +459,48 @@ static void fp8_fp4_mega_moe(
                          default_rs_decode_pair_shfl ? 1 : 0) != 0;
         const bool use_rs_direct_l2_scatter =
             get_env<int>("DG_SM90_FP4_RS_DIRECT_L2_SCATTER", 0) != 0;
-        const float expected_tokens_per_expert =
-            static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
+        const bool default_ss_early_b_decode =
+            // SS decode-to-SMEM A/B on H20 showed early packed-B decode helps
+            // the sparse b8-b16 band and the high b32-b128 band. Keep b1-b4
+            // off where dispatch/scheduler overhead dominates.
+            !use_rs_mode and
+            ((expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert <= 3.0f) or
+             (expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert <= 24.0f));
         const bool default_early_b_decode =
             // RS A/B on DSV4 small batches showed real packed-B/activation
             // overlap is useful across batch/rank 1..16 once the RS kernel
-            // waits the split barriers correctly. Keep this RS-only so the
-            // faster SS small-batch path does not inherit the scheduling knob.
-            use_rs_mode and num_tokens > 0 and num_tokens <= 16;
+            // waits the split barriers correctly.
+            (use_rs_mode and num_tokens > 0 and num_tokens <= 16) or
+            default_ss_early_b_decode;
         const bool use_early_b_decode =
             get_env<int>("DG_SM90_FP4_EARLY_B_DECODE", default_early_b_decode ? 1 : 0) != 0;
+        const bool default_decode_done_mbarrier =
+            // H20 paired runs showed the extra one-way decode mbarrier hurts
+            // the current SS early-B/stage5 path, especially b8. Keep the env
+            // knob for diagnostics but leave the default on the lean CTA sync.
+            false;
         const bool use_decode_done_mbarrier =
-            // Small-batch SM90 FP4 runs were consistently faster with the
-            // decode-done rendezvous on the existing CTA barrier.
-            get_env<int>("DG_SM90_FP4_DECODE_MBARRIER", 0) != 0;
+            get_env<int>("DG_SM90_FP4_DECODE_MBARRIER",
+                         default_decode_done_mbarrier ? 1 : 0) != 0;
+        const bool default_l2_arrival_counter =
+            // Narrow H20 A/B win: b2 benefits when paired with the skipped
+            // post-scatter sync. After the stage6 decode heuristic, b16 was
+            // faster without the counter; keep this as an override-only knob
+            // outside the b2 band.
+            !use_rs_mode and
+            expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f;
         const bool use_l2_arrival_counter =
-            get_env<int>("DG_SM90_FP4_L2_ARRIVAL_COUNTER", 0) != 0;
+            get_env<int>("DG_SM90_FP4_L2_ARRIVAL_COUNTER",
+                         default_l2_arrival_counter ? 1 : 0) != 0;
+        const bool default_skip_l2_epilogue_sync =
+            // b2 pairs well with L2ArrivalCounter. b4 was too noisy/regressive
+            // after rebuilding the current branch, so keep the skipped sync out
+            // of the 0.75 token/expert band.
+            !use_rs_mode and
+            expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f;
         const bool skip_l2_epilogue_sync =
-            get_env<int>("DG_SM90_FP4_SKIP_L2_EPILOGUE_SYNC", 0) != 0;
+            get_env<int>("DG_SM90_FP4_SKIP_L2_EPILOGUE_SYNC",
+                         default_skip_l2_epilogue_sync ? 1 : 0) != 0;
         sm90_fp8_fp4_mega_moe(y,
                               l1_acts, l1_acts_sf,
                               l2_acts, l2_acts_sf,

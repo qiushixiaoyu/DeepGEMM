@@ -124,8 +124,8 @@ def _bench_cuda_event_sections(
 
 def benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    torch.manual_seed(20260524 + rank_idx)
-    random.seed(20260524 + rank_idx)
+    torch.manual_seed(rank_idx)
+    random.seed(rank_idx)
 
     if get_arch_major() != 9:
         if rank_idx == 0:
@@ -151,12 +151,6 @@ def benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         raise ValueError("--skip-fp8-ll-baseline is incompatible with --fp4-mode predecode-fp8-ll")
 
     x_bf16 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
-    scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device="cuda")
-    topk_weights, topk_idx = torch.topk(
-        scores, num_topk, dim=-1, largest=True, sorted=False
-    )
-    topk_idx_ll = topk_idx.to(torch.int64)
-
     l1_bf16 = torch.randn(
         (num_experts_per_rank, intermediate_hidden * 2, hidden),
         dtype=torch.bfloat16,
@@ -167,6 +161,12 @@ def benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         dtype=torch.bfloat16,
         device="cuda",
     ) * args.weight_scale
+
+    scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device="cuda")
+    topk_weights, topk_idx = torch.topk(
+        scores, num_topk, dim=-1, largest=True, sorted=False
+    )
+    topk_idx_ll = topk_idx.to(torch.int64)
 
     x_fp8, x_sf = per_token_cast_to_fp8(
         x_bf16, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False
@@ -448,22 +448,34 @@ def benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 "l1_profiled_k_blocks": values[0],
                 "l1_full_wait_cycles_per_block": round_cycles(cycles_per_block(0, 1)),
                 "l1_decode_sync_cycles_per_block": round_cycles(cycles_per_block(0, 2)),
+                "l1_decode_input_wait_cycles_per_block": round_cycles(cycles_per_block(0, 5)),
+                "l1_math_decode_cycles_per_block": round_cycles(cycles_per_block(0, 6)),
+                "l1_decode_rendezvous_cycles_per_block": round_cycles(cycles_per_block(0, 7)),
                 "l1_wait_decode_cycles_per_block": round_cycles(cycles_per_block(0, 1) + cycles_per_block(0, 2)),
                 "l1_wgmma_cycles_per_block": round_cycles(cycles_per_block(0, 3)),
                 "l1_promote_cycles_per_block": round_cycles(cycles_per_block(0, 4)),
                 "l1_full_wait_us_per_block": round_us(us_per_block(0, 1)),
                 "l1_decode_sync_us_per_block": round_us(us_per_block(0, 2)),
+                "l1_decode_input_wait_us_per_block": round_us(us_per_block(0, 5)),
+                "l1_math_decode_us_per_block": round_us(us_per_block(0, 6)),
+                "l1_decode_rendezvous_us_per_block": round_us(us_per_block(0, 7)),
                 "l1_wait_decode_us_per_block": round_us(sum_us(us_per_block(0, 1), us_per_block(0, 2))),
                 "l1_wgmma_us_per_block": round_us(us_per_block(0, 3)),
                 "l1_promote_us_per_block": round_us(us_per_block(0, 4)),
                 "l2_profiled_k_blocks": values[8],
                 "l2_full_wait_cycles_per_block": round_cycles(cycles_per_block(8, 1)),
                 "l2_decode_sync_cycles_per_block": round_cycles(cycles_per_block(8, 2)),
+                "l2_decode_input_wait_cycles_per_block": round_cycles(cycles_per_block(8, 5)),
+                "l2_math_decode_cycles_per_block": round_cycles(cycles_per_block(8, 6)),
+                "l2_decode_rendezvous_cycles_per_block": round_cycles(cycles_per_block(8, 7)),
                 "l2_wait_decode_cycles_per_block": round_cycles(cycles_per_block(8, 1) + cycles_per_block(8, 2)),
                 "l2_wgmma_cycles_per_block": round_cycles(cycles_per_block(8, 3)),
                 "l2_promote_cycles_per_block": round_cycles(cycles_per_block(8, 4)),
                 "l2_full_wait_us_per_block": round_us(us_per_block(8, 1)),
                 "l2_decode_sync_us_per_block": round_us(us_per_block(8, 2)),
+                "l2_decode_input_wait_us_per_block": round_us(us_per_block(8, 5)),
+                "l2_math_decode_us_per_block": round_us(us_per_block(8, 6)),
+                "l2_decode_rendezvous_us_per_block": round_us(us_per_block(8, 7)),
                 "l2_wait_decode_us_per_block": round_us(sum_us(us_per_block(8, 1), us_per_block(8, 2))),
                 "l2_wgmma_us_per_block": round_us(us_per_block(8, 3)),
                 "l2_promote_us_per_block": round_us(us_per_block(8, 4)),

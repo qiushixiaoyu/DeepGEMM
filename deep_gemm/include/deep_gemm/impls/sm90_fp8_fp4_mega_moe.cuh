@@ -304,6 +304,7 @@ template <
     uint32_t kNumSFBPerBlockK,
     bool kUseDynamicLutDecode,
     bool kUseCommonLutFastPath,
+    bool kSkipZeroSFBDecode,
     bool kFuseScaleBHummingDecode,
     typename PackedT,
     typename DecodedT>
@@ -336,15 +337,17 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_kg_pair(
             const uint32_t kg = kg_base + sub;
             const uint32_t e8m0 = (sfb_word >> (kg * 8)) & 0xffu;
 
-            if (e8m0 == 0u) {
-                #pragma unroll
-                for (uint32_t pair_idx = 0; pair_idx < kPackedWordPairsPerKG; ++ pair_idx) {
-                    const uint32_t pw_global = kg * kPackedWordsPerKG + pair_idx * 2u;
-                    const uint32_t seg_id = pw_global >> 1;
-                    const uint32_t swz_seg = seg_id ^ row_swizzle;
-                    ptx::st_shared_v2_u64(decoded_row_u64 + swz_seg * 2u, 0ull, 0ull);
+            if constexpr (kSkipZeroSFBDecode) {
+                if (e8m0 == 0u) {
+                    #pragma unroll
+                    for (uint32_t pair_idx = 0; pair_idx < kPackedWordPairsPerKG; ++ pair_idx) {
+                        const uint32_t pw_global = kg * kPackedWordsPerKG + pair_idx * 2u;
+                        const uint32_t seg_id = pw_global >> 1;
+                        const uint32_t swz_seg = seg_id ^ row_swizzle;
+                        ptx::st_shared_v2_u64(decoded_row_u64 + swz_seg * 2u, 0ull, 0ull);
+                    }
+                    continue;
                 }
-                continue;
             }
 
             uint32_t scaled_lut_lo = 0;
@@ -426,7 +429,8 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_dispatch(
     if constexpr (kUseKGPairDecode) {
         dequant_fp4_b_tile_to_e4m3_smem_kg_pair<
             LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
-            kUseDynamicLutDecode, kUseCommonLutFastPath, kFuseScaleBHummingDecode>(
+            kUseDynamicLutDecode, kUseCommonLutFastPath,
+            kSkipZeroSFBDecode, kFuseScaleBHummingDecode>(
             decode_thread_idx, num_decode_threads,
             smem_b_packed_stage, smem_b_stage, smem_sfb_stage);
     } else if constexpr (kUseVectorStoreDecode) {
@@ -2137,6 +2141,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 uint64_t fp4_profile_t0 = 0;
                 uint64_t fp4_profile_t_full_wait_done = 0;
+                uint64_t fp4_profile_t_decode_input_ready = 0;
+                uint64_t fp4_profile_t_math_decode_done = 0;
                 uint64_t fp4_profile_t_decode_done = 0;
                 uint64_t fp4_profile_t_wgmma_lo_done = 0;
                 uint64_t fp4_profile_t_promote_lo_done = 0;
@@ -2181,12 +2187,19 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 // before WGMMA reads the decoded shared tile.
                 if constexpr (kUseKGPipelineDecode) {
                     if constexpr (kClockProfile) {
-                        if (epilogue_thread_idx == 0)
+                        if (epilogue_thread_idx == 0) {
+                            fp4_profile_t_decode_input_ready = fp4_profile_t_full_wait_done;
+                            fp4_profile_t_math_decode_done = fp4_profile_t_full_wait_done;
                             fp4_profile_t_decode_done = fp4_profile_t_full_wait_done;
+                        }
                     }
                 } else {
                     if constexpr (kUseEarlyBDecode)
                         wait_fp4_decode_input_ready(stage_idx, phase);
+                    if constexpr (kClockProfile) {
+                        if (epilogue_thread_idx == 0)
+                            fp4_profile_t_decode_input_ready = clock64();
+                    }
                     const bool math_warp_decodes =
                         epilogue_warp_idx < kNumMathWGDecodeWarps;
                     if constexpr (kNumMathWGDecodeWarps > 0) {
@@ -2200,6 +2213,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 kUseCommonLutFastPath, kFuseScaleBHummingDecode>(
                                 decode_thread_idx, kNumFP4DecodeWorkerThreads,
                                 smem_b_packed[stage_idx], smem_b[stage_idx], smem_sfb[stage_idx]);
+                        }
+                    }
+                    if constexpr (kClockProfile) {
+                        if (epilogue_thread_idx == 0) {
+                            fp4_profile_t_math_decode_done =
+                                math_warp_decodes ? clock64() : fp4_profile_t_decode_input_ready;
                         }
                     }
                     if constexpr (kNumMathWGDecodeWarps > 0) {
@@ -2284,6 +2303,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             fp4_profile_add(2, fp4_profile_t_decode_done - fp4_profile_t_full_wait_done);
                             fp4_profile_add(3, fp4_profile_t_wgmma_lo_done - fp4_profile_t_decode_done);
                             fp4_profile_add(4, fp4_profile_t_promote_done - fp4_profile_t_wgmma_lo_done);
+                            fp4_profile_add(5, fp4_profile_t_decode_input_ready - fp4_profile_t_full_wait_done);
+                            fp4_profile_add(6, fp4_profile_t_math_decode_done - fp4_profile_t_decode_input_ready);
+                            fp4_profile_add(7, fp4_profile_t_decode_done - fp4_profile_t_math_decode_done);
                         }
                     }
                 } else {
@@ -2347,6 +2369,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                                 (fp4_profile_t_wgmma_hi_done - fp4_profile_t_promote_lo_done));
                             fp4_profile_add(12, (fp4_profile_t_promote_lo_done - fp4_profile_t_wgmma_lo_done) +
                                                 (fp4_profile_t_promote_done - fp4_profile_t_wgmma_hi_done));
+                            fp4_profile_add(13, fp4_profile_t_decode_input_ready - fp4_profile_t_full_wait_done);
+                            fp4_profile_add(14, fp4_profile_t_math_decode_done - fp4_profile_t_decode_input_ready);
+                            fp4_profile_add(15, fp4_profile_t_decode_done - fp4_profile_t_math_decode_done);
                         }
                     }
                     } else {
@@ -2467,6 +2492,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                                 (fp4_profile_t_wgmma_hi_done - fp4_profile_t_promote_lo_done));
                             fp4_profile_add(12, (fp4_profile_t_promote_lo_done - fp4_profile_t_wgmma_lo_done) +
                                                 (fp4_profile_t_promote_done - fp4_profile_t_wgmma_hi_done));
+                            fp4_profile_add(13, fp4_profile_t_decode_input_ready - fp4_profile_t_full_wait_done);
+                            fp4_profile_add(14, fp4_profile_t_math_decode_done - fp4_profile_t_decode_input_ready);
+                            fp4_profile_add(15, fp4_profile_t_decode_done - fp4_profile_t_math_decode_done);
                         }
                     }
                     }
@@ -2690,17 +2718,25 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     constexpr uint32_t kRSAccumPerThread = RSWGMMA::kNumAccum;
                     constexpr uint32_t kNumRSNSlices = BLOCK_N / RSWGMMA::M;
 
-                    auto write_remote_bf16_scalar = [&](uint32_t row, uint32_t col, float value) {
+                    auto write_remote_bf16_two_cols = [&](uint32_t row, uint32_t col_0, uint32_t col_1,
+                                                           float value_0, float value_1) {
                         const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + row);
                         const auto dst_token = combine_token_buffer.get_rank_buffer(src_metadata.topk_idx)
                                                .get_data_buffer(src_metadata.token_idx);
-                        auto dst_ptr = math::advance_ptr<uint16_t>(
+                        const uint32_t base_offset = n_idx * sizeof(nv_bfloat16);
+
+                        float value_0_copy = value_0;
+                        float value_1_copy = value_1;
+                        const uint32_t packed =
+                            math::cast_into_bf16_and_pack(value_0_copy, value_1_copy);
+                        auto dst_ptr_0 = math::advance_ptr<uint16_t>(
                             dst_token.get_base_ptr(),
-                            n_idx * sizeof(nv_bfloat16) + col * sizeof(nv_bfloat16));
-                        float value_copy = value;
-                        float value_dup = value;
-                        const uint32_t packed = math::cast_into_bf16_and_pack(value_copy, value_dup);
-                        *sym_buffer.map(dst_ptr, src_metadata.rank_idx) = static_cast<uint16_t>(packed);
+                            base_offset + col_0 * sizeof(nv_bfloat16));
+                        *sym_buffer.map(dst_ptr_0, src_metadata.rank_idx) = static_cast<uint16_t>(packed);
+                        auto dst_ptr_1 = math::advance_ptr<uint16_t>(
+                            dst_token.get_base_ptr(),
+                            base_offset + col_1 * sizeof(nv_bfloat16));
+                        *sym_buffer.map(dst_ptr_1, src_metadata.rank_idx) = static_cast<uint16_t>(packed >> 16);
                     };
 
                     #pragma unroll
@@ -2713,12 +2749,14 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             const uint32_t token_0 = i * 8 + col_idx * 2;
                             const uint32_t token_1 = token_0 + 1;
                             if (token_0 < valid_m) {
-                                write_remote_bf16_scalar(token_0, n_row_0, final_accum[rs_accum_base + i * 4 + 0]);
-                                write_remote_bf16_scalar(token_0, n_row_1, final_accum[rs_accum_base + i * 4 + 2]);
+                                write_remote_bf16_two_cols(token_0, n_row_0, n_row_1,
+                                                           final_accum[rs_accum_base + i * 4 + 0],
+                                                           final_accum[rs_accum_base + i * 4 + 2]);
                             }
                             if (token_1 < valid_m) {
-                                write_remote_bf16_scalar(token_1, n_row_0, final_accum[rs_accum_base + i * 4 + 1]);
-                                write_remote_bf16_scalar(token_1, n_row_1, final_accum[rs_accum_base + i * 4 + 3]);
+                                write_remote_bf16_two_cols(token_1, n_row_0, n_row_1,
+                                                           final_accum[rs_accum_base + i * 4 + 1],
+                                                           final_accum[rs_accum_base + i * 4 + 3]);
                             }
                         }
                     }
@@ -2822,7 +2860,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         const uint32_t dst_token_idx = src_metadata.token_idx;
                         const uint32_t dst_topk_idx = src_metadata.topk_idx;
 
-                        // BLOCK_N=128 scatters 8 BF16s/lane (=16B, uint4).  For
+                        // BLOCK_N=128 scatters 8 BF16s/lane (=16B, uint4). For
                         // BLOCK_N=64 each lane owns 4 BF16s (=8B), so use uint2;
                         // a uint4 load would be misaligned for odd lanes.
                         auto smem_ptr = smem_cd_l2
