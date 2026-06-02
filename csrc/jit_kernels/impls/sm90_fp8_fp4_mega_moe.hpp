@@ -145,6 +145,10 @@ public:
         // performance builds do not carry clock64 instructions or hot-path
         // branches.
         bool use_clock_profile;
+        // A/B knob: split each SS N=128 WGMMA into two N=64 WGMMAs so the
+        // per-K-block accumulator is 32 floats instead of 64. This targets the
+        // 2-WG split-M path's structural accum spill while leaving defaults off.
+        bool use_ss_nsplit;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -176,7 +180,7 @@ public:
 
 using namespace deep_gemm;
 
-// JIT cache version: sm90_fp8_fp4_mega_moe_rs_l2_arrival_v1
+// JIT cache version: sm90_fp8_fp4_mega_moe_split_n_v3_l2counter
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm90_fp8_fp4_mega_moe_impl<
         {},
@@ -210,6 +214,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {}, {},
+        {},
         {},
         {},
         {},
@@ -260,7 +265,8 @@ static void __instantiate_kernel() {{
     args.use_decode_done_mbarrier ? "true" : "false",
     args.use_l2_arrival_counter ? "true" : "false",
     args.skip_l2_epilogue_sync ? "true" : "false",
-    args.use_clock_profile ? "true" : "false");
+    args.use_clock_profile ? "true" : "false",
+    args.use_ss_nsplit ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -324,7 +330,8 @@ static void sm90_fp8_fp4_mega_moe(
     const bool& use_decode_done_mbarrier = false,
     const bool& use_l2_arrival_counter = false,
     const bool& skip_l2_epilogue_sync = false,
-    const std::optional<torch::Tensor>& fp4_clock_profile = std::nullopt
+    const std::optional<torch::Tensor>& fp4_clock_profile = std::nullopt,
+    const bool& use_ss_nsplit = false
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -377,11 +384,37 @@ static void sm90_fp8_fp4_mega_moe(
                                                         /*allow_tf32=*/false);
 
     // L1 output (post-SwiGLU FP8): N is halved.
+    // Mirror the FP8 split-N infrastructure: when BLOCK_M=64 and the host
+    // heuristics asked for multiple math warpgroups (`num_epilogue_warpgroups
+    // > 1`), each warpgroup shares the same BLOCK_M rows but only owns
+    // `WG_BLOCK_N = BLOCK_N / num_wg` columns. Each warpgroup issues its own
+    // TMA store with that column tile, so the descriptor outer-box must be
+    // `(WG_L1_OUT_BLOCK_N = WG_BLOCK_N / 2, l1_output_box_m)`. The split-N
+    // gating must match the kernel-side `kSplitNWarpgroups` predicate, which
+    // requires WG_BLOCK_N >= 64 (so the FP8MMASelector remains valid).
     const int num_epilogue_warpgroups_h = config.num_epilogue_threads / 128;
-    const int wg_block_m = config.block_m / num_epilogue_warpgroups_h;
+    const bool split_n_warpgroups =
+        config.block_m == 64 and num_epilogue_warpgroups_h > 1 and
+        config.block_n % num_epilogue_warpgroups_h == 0 and
+        (config.block_n / num_epilogue_warpgroups_h) >= 64 and not use_rs_mode;
+    const int wg_split_m = split_n_warpgroups ? 1 : num_epilogue_warpgroups_h;
+    const int wg_split_n = split_n_warpgroups ? num_epilogue_warpgroups_h : 1;
+    DG_HOST_ASSERT(wg_split_m * wg_split_n == num_epilogue_warpgroups_h);
+    const int wg_block_m = config.block_m / wg_split_m;
+    const int wg_block_n = config.block_n / wg_split_n;
+    const int wg_l1_out_block_n = wg_block_n / 2;
+    const int l1_output_box_m = wg_block_m;
+    // share-SF 路径要求合并 TMA store，box 退化回单 WG 的
+    // (L1_OUT_BLOCK_N, BLOCK_M)。这里的 kL2ActsSFGranK 与 kernel 端
+    // `kL2ActsSFGranK` 的语义保持一致：BLOCK_N=64 时 per-32 K，否则 per-64 K。
+    const int kL2ActsSFGranK_h = config.block_n == 64 ? 32 : 64;
+    const bool split_n_shares_sf = split_n_warpgroups and
+                                  (wg_l1_out_block_n < kL2ActsSFGranK_h);
+    const int tma_l1_out_box_n = split_n_shares_sf ? (config.block_n / 2) : wg_l1_out_block_n;
+    const int tma_l1_out_box_m = split_n_shares_sf ? config.block_m : l1_output_box_m;
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
                                                        intermediate_hidden, config.num_max_pool_tokens,
-                                                       config.block_n / 2, wg_block_m,
+                                                       tma_l1_out_box_n, tma_l1_out_box_m,
                                                        static_cast<int>(l2_acts.stride(-2)),
                                                        0);
 
@@ -446,6 +479,7 @@ static void sm90_fp8_fp4_mega_moe(
         .use_l2_arrival_counter = use_l2_arrival_counter,
         .skip_l2_epilogue_sync = skip_l2_epilogue_sync,
         .use_clock_profile = fp4_clock_profile_ptr != nullptr,
+        .use_ss_nsplit = use_ss_nsplit,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

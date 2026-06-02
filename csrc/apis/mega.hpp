@@ -371,19 +371,106 @@ static void fp8_fp4_mega_moe(
         const bool use_rs_mode = get_env<int>("DG_SM90_FP4_RS_MODE") != 0;
         const float expected_tokens_per_expert =
             static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
+        // D3 H20 result: for the high-occupancy b16/b32 band the decode-lookahead
+        // path wins big -- b16 -22.7%, b32 -20.9%. It combines three knobs that
+        // must move together: (1) a one-way decode_done mbarrier so decode-assist
+        // warps no longer rendezvous with the math warpgroup every stage and can
+        // run AHEAD, decoding stage S+1 while WGMMA consumes stage S; (2) the math
+        // warpgroup as a pure WGMMA consumer (no decode); (3) crucially, the two
+        // TMA/SFB loader warps are EXCLUDED from decode-assist so only the 4 idle
+        // non-epilogue warps decode ahead. Letting the loaders also lookahead
+        // (D-full) blew up full_wait (80->328 cyc/block) and the decode
+        // rendezvous (b32 +384%) because they fall behind on TMA issue. With the
+        // loaders skipped (D-skip), decode_total drops 522->130 cyc/block and
+        // hides entirely in the ~928-cyc WGMMA shadow.
+        const bool fp4_decode_lookahead_band =
+            !use_rs_mode and
+            expected_tokens_per_expert >= 3.0f and expected_tokens_per_expert <= 6.0f;
+        // D7 H20: the same D-skip three-knob lookahead also wins big at the
+        // higher 1-WG occupancy band -- b64 (expected=12) -22.18%, b128
+        // (expected=24) -22.11%, and the one-way mbarrier is slightly better
+        // than without (-22% vs -20%). b256 (expected=48) does NOT benefit
+        // (D_skip +20.5% there): by that occupancy the 4 idle assist warps can
+        // no longer decode a full stage ahead before WGMMA needs it, so the
+        // band stops at 24.0. b48 (expected=9) has no standard batch size, so
+        // the (6,12) gap is empty and harmless.
+        const bool fp4_bigband_lookahead_band =
+            !use_rs_mode and
+            expected_tokens_per_expert >= 12.0f and expected_tokens_per_expert <= 24.0f;
+        // b16/b32 -- WGMMA ~949 cyc/block dominates and the ~497-cyc decode sits
+        // on the critical path. Taking decode off the math warpgroup AND skipping
+        // the two TMA/SFB loader warps (so only the 4 idle non-epilogue warps
+        // decode, hiding in the WGMMA shadow) is a clean -22.39% there. It does
+        // NOT use the one-way mbarrier (that lookahead band starts at 3.0). b2
+        // (expected=0.375) is excluded: its profile is full_wait-bound
+        // (~1048 cyc/block TMA/scheduling), so decode knobs do not help and
+        // math-off even regresses it +10.8%. The (>0.375, <1.0) window captures
+        // only the discrete b4=0.75 point.
+        const bool fp4_b4_skip_decode_band =
+            !use_rs_mode and
+            expected_tokens_per_expert >= 0.5f and expected_tokens_per_expert < 1.0f;
+        // D9 H20: the 2-WG split-MN path (block_m=128, num_epilogue_threads=256,
+        // the auto_split_mn branch that engages once expected>=64) is
+        // register-pressured -- the math warpgroup carries FP4 decode + the
+        // WGMMA accum live-range + the final_accum promotion all at once and
+        // spills (88B stack / 204B+252B spill on b512). Taking decode OFF the
+        // math warpgroup (pure WGMMA consumer; decode runs on the assist warps)
+        // cuts the spill (88/204/252 -> 80/184/224) and wins -9.1% (b512) /
+        // -11.0% (b1024) with accuracy intact (diff 6e-4 << 0.07). Unlike the
+        // 1-WG lookahead bands this needs NEITHER skip-loader NOR the mbarrier
+        // (the measured win was math-off ALONE; partial WARPS=2 matched base, so
+        // it must be a FULL offload). Gate on expected>=64 only so the carefully
+        // tuned 1-WG b1..b256 defaults stay untouched (b256 expected=48 < 64).
+        const bool fp4_2wg_decode_offload_band =
+            !use_rs_mode and expected_tokens_per_expert >= 64.0f;
+        const bool default_math_wg_decode =
+            // D2b H20 A/B: taking FP4 decode off the math warpgroup (so it is a
+            // pure WGMMA consumer and the decode hides in the WGMMA shadow) is a
+            // large win at LOW expert occupancy -- b1 -15.5%, b8 -21.7% -- where
+            // the dispatch/loader assist warps have spare capacity to decode the
+            // packed-B tile on their own. At HIGHER occupancy (b16/b32) those
+            // assist warps are saturated by TMA/SFB production, so the math
+            // warpgroup stalls on the decode-done rendezvous (b32 rendezvous
+            // +347%) and the kernel regresses. Keep math-warp decode ON by
+            // default, and only turn it OFF in the measured low-occupancy bands:
+            //   * b1 (<0.375) and b8 ([1.0,2.0)) -- D2b/D2c, math as pure consumer;
+            //   * b4 ([0.5,1.0), fp4_b4_skip_decode_band) -- D5, only wins once
+            //     paired with skip-loader (B_skip -22.4%); math-off alone did not;
+            //   * b16/b32 ([3.0,6.0], fp4_decode_lookahead_band) -- D3 lookahead,
+            //     math runs as a pure WGMMA consumer.
+            //   * b64/b128 ([12.0,24.0], fp4_bigband_lookahead_band) -- D7, same
+            //     D-skip lookahead at higher 1-WG occupancy.
+            // b2 (0.375) is deliberately excluded: it is full_wait-bound, not
+            // decode-bound, and math-off regresses it +10.8%.
+            //   * b512+ (expected>=64, fp4_2wg_decode_offload_band) -- D9, the
+            //     2-WG split-MN path; math-off alone cuts spill and wins -9~11%.
+            !use_rs_mode and
+            ((expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f) or
+             (expected_tokens_per_expert >= 1.0f and expected_tokens_per_expert < 2.0f) or
+             fp4_decode_lookahead_band or fp4_b4_skip_decode_band or
+             fp4_bigband_lookahead_band or fp4_2wg_decode_offload_band);
         const bool math_wg_participates_in_fp4_decode =
-            get_env<int>("DG_SM90_FP4_MATH_WG_DECODE", 1) != 0;
+            get_env<int>("DG_SM90_FP4_MATH_WG_DECODE",
+                         default_math_wg_decode ? 0 : 1) != 0;
         const int num_math_wg_decode_warps =
             get_env<int>("DG_SM90_FP4_MATH_WG_DECODE_WARPS",
                          math_wg_participates_in_fp4_decode ? 4 : 0);
         const bool default_skip_loader_decode_assist =
             // The two loader-side non-epilogue warps are on the TMA/SFB
             // producer path. H20 A/B showed leaving them out of FP4 decode is
-            // a repeatable win for b1 and b8, but b4/b16 are noisy and b2 or
-            // b32+ regress where raw decode parallelism matters more.
+            // a repeatable win where decode can hide behind WGMMA, but b2 and
+            // b256+ regress where raw decode parallelism matters more. Skip the
+            // loaders (only the 4 idle warps decode) in the measured bands:
+            //   * b1 (<0.375) and b8 ([1.5,3.0)) -- D2c;
+            //   * b4 ([0.5,1.0), fp4_b4_skip_decode_band) -- D5 B_skip -22.4%;
+            //   * b16/b32 ([3.0,6.0], fp4_decode_lookahead_band) -- D3 requires
+            //     skip-loader so only the 4 idle warps decode ahead.
+            //   * b64/b128 ([12.0,24.0], fp4_bigband_lookahead_band) -- D7.
             !use_rs_mode and
             ((expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f) or
-             (expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f));
+             (expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f) or
+             fp4_decode_lookahead_band or fp4_b4_skip_decode_band or
+             fp4_bigband_lookahead_band);
         const int first_fp4_decode_assist_warp =
             get_env<int>("DG_SM90_FP4_FIRST_DECODE_ASSIST_WARP",
                          default_skip_loader_decode_assist ? 2 : 0);
@@ -476,9 +563,15 @@ static void fp8_fp4_mega_moe(
             get_env<int>("DG_SM90_FP4_EARLY_B_DECODE", default_early_b_decode ? 1 : 0) != 0;
         const bool default_decode_done_mbarrier =
             // H20 paired runs showed the extra one-way decode mbarrier hurts
-            // the current SS early-B/stage5 path, especially b8. Keep the env
-            // knob for diagnostics but leave the default on the lean CTA sync.
-            false;
+            // the current SS early-B/stage5 path at LOW occupancy (especially
+            // b8), so it stays off there. But at HIGH occupancy it is exactly
+            // what unlocks decode lookahead: D3 measured b16 -22.7% / b32 -20.9%
+            // once the arrive-count deadlock was fixed. Enable it by default only
+            // in the validated b16/b32 lookahead band; the env knob still
+            // overrides for diagnostics elsewhere.
+            // D7: the b64/b128 bigband lookahead (expected 12..24) also wins with
+            // the mbarrier on (-22% vs -20% without), so OR it in.
+            fp4_decode_lookahead_band or fp4_bigband_lookahead_band;
         const bool use_decode_done_mbarrier =
             get_env<int>("DG_SM90_FP4_DECODE_MBARRIER",
                          default_decode_done_mbarrier ? 1 : 0) != 0;
@@ -501,6 +594,19 @@ static void fp8_fp4_mega_moe(
         const bool skip_l2_epilogue_sync =
             get_env<int>("DG_SM90_FP4_SKIP_L2_EPILOGUE_SYNC",
                          default_skip_l2_epilogue_sync ? 1 : 0) != 0;
+        // D13 (verified 20260602): the SS N-split replaces each N=128 WGMMA
+        // with two N=64 WGMMAs so the per-K-block accum is 32 floats instead
+        // of 64, removing the 2-WG `final_accum[64]+accum[64]==128-reg` spill.
+        // ON cleared the spill (128 regs, 0 stack frame) and beat FP8 normal
+        // across b512-b4096 (1.13x/1.13x/1.14x/1.15x gain over OFF). Default ON
+        // for the 2-WG split-M path (expected >= 64). The kernel-side
+        // `kSSNSplitActive` gate (WG_BLOCK_N==128 && >1 epilogue warpgroup)
+        // keeps the 1-WG winning path (b1-b256) inert regardless of this flag.
+        const bool default_use_ss_nsplit =
+            !use_rs_mode and expected_tokens_per_expert >= 64.0f;
+        const bool use_ss_nsplit =
+            get_env<int>("DG_SM90_FP4_SS_NSPLIT",
+                         default_use_ss_nsplit ? 1 : 0) != 0;
         sm90_fp8_fp4_mega_moe(y,
                               l1_acts, l1_acts_sf,
                               l2_acts, l2_acts_sf,
@@ -540,7 +646,8 @@ static void fp8_fp4_mega_moe(
                               use_decode_done_mbarrier,
                               use_l2_arrival_counter,
                               skip_l2_epilogue_sync,
-                              fp4_clock_profile);
+                              fp4_clock_profile,
+                              use_ss_nsplit);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

@@ -456,6 +456,23 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int smem_cd_l1 = num_epilogue_warpgroups * block_m * (block_n / 2);
     const int smem_cd_l2 = num_epilogue_warpgroups * block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
     const int smem_cd = align(std::max(smem_cd_l1, smem_cd_l2), kSmemAlignment);
+    // share-SF amax scratch: allocated when split-N + WG_L1_OUT_BLOCK_N <
+    // kL2ActsSFGranK (mirror of kernel-side `kSplitNSharesSF`). 64 float
+    // slots aligned to 1024 = 1024 bytes. RS mode never enables split-N so
+    // this term remains 0 there.
+    const int kL2ActsSFGranK_h = block_n == 64 ? 32 : 64;
+    const bool fp4_split_n_eligible_h =
+        not use_rs_mode and block_m == 64 and num_epilogue_warpgroups > 1 and
+        block_n % num_epilogue_warpgroups == 0 and
+        (block_n / num_epilogue_warpgroups) >= 64;
+    const int wg_l1_out_block_n_h = fp4_split_n_eligible_h
+        ? (block_n / num_epilogue_warpgroups) / 2
+        : 0;
+    const bool split_n_shares_sf_h = fp4_split_n_eligible_h and
+        (wg_l1_out_block_n_h < kL2ActsSFGranK_h);
+    const int smem_amax_scratch = split_n_shares_sf_h
+        ? align(64 * static_cast<int>(sizeof(uint32_t)), kSmemAlignment)
+        : 0;
     // RS L1 uses a shared-memory transpose bridge indexed as
     // token[BLOCK_M] x rs_row[64].  This is independent of BLOCK_N; BLOCK_N=64
     // has one RS N-slice, while BLOCK_N=128 has two.
@@ -483,7 +500,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
         (!use_rs_mode and use_decode_done_mbarrier) ? 8 : 0;
     const int smem_barriers_per_stage =
         2 * 8 + smem_decode_full_per_stage + smem_decode_done_per_stage;
-    const int smem_fixed = smem_dispatch_size + smem_cd + smem_rs_accum + smem_barriers_fixed;
+    const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_scratch + smem_rs_accum + smem_barriers_fixed;
 
     const int max_num_stages = (smem_capacity - smem_fixed) /
                                (smem_per_stage + smem_barriers_per_stage);
@@ -520,6 +537,36 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const int block_n = get_env<int>("DG_SM90_FP4_BLOCK_N", default_block_n);
     DG_HOST_ASSERT(block_n == 64 or block_n == 128);
     const int block_k = 128;
+
+    // FP4 SS split-N infrastructure: when BLOCK_M=64 and BLOCK_N=128, allow
+    // multiple math warpgroups to share the same BLOCK_M rows and split the
+    // BLOCK_N columns, so that each warpgroup owns WG_BLOCK_N=64. The public
+    // `get_block_config_for_mega_moe_sm90` helper still asserts the strict
+    // split-M relationship (block_m / num_epilogue_warpgroups == 64); we keep
+    // that helper untouched and override `num_epilogue_threads` locally for
+    // the FP4 path only. RS-mode keeps a single epilogue warpgroup because
+    // packed-B + transpose-bridge are tightly coupled to that layout.
+    //
+    // Phase A: only the *infrastructure* is in place; the default keeps the
+    // historical single-warpgroup layout so precision/perf are unchanged
+    // unless `DG_SM90_FP4_SPLIT_N=1` (or DG_SM90_FP4_NUM_EPILOGUE_WARPGROUPS)
+    // is explicitly set.
+    int fp4_num_epilogue_warpgroups = num_epilogue_threads / 128;
+    const bool fp4_split_n_eligible =
+        not use_rs_mode and block_m == 64 and block_n == 128;
+    if (fp4_split_n_eligible and
+        get_env<int>("DG_SM90_FP4_SPLIT_N", 0) != 0) {
+        fp4_num_epilogue_warpgroups = 2;
+    }
+    fp4_num_epilogue_warpgroups = get_env<int>(
+        "DG_SM90_FP4_NUM_EPILOGUE_WARPGROUPS", fp4_num_epilogue_warpgroups);
+    DG_HOST_ASSERT(fp4_num_epilogue_warpgroups >= 1);
+    DG_HOST_ASSERT((block_m / fp4_num_epilogue_warpgroups == 64) or
+                   (block_m == 64 and fp4_num_epilogue_warpgroups > 1 and
+                    block_n % fp4_num_epilogue_warpgroups == 0 and
+                    (block_n / fp4_num_epilogue_warpgroups) >= 64));
+    DG_HOST_ASSERT(not use_rs_mode or fp4_num_epilogue_warpgroups == 1);
+    const int fp4_num_epilogue_threads = fp4_num_epilogue_warpgroups * 128;
     const int cluster_size = 1;
     const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
         num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
@@ -581,7 +628,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         SM90ArchSpec::smem_capacity,
         num_experts, hidden,
         block_m, block_n, block_k,
-        num_dispatch_threads / 32, num_epilogue_threads / 32,
+        num_dispatch_threads / 32, fp4_num_epilogue_threads / 32,
         use_rs_mode, use_rs_stage_sfb, use_early_b_decode, use_decode_done_mbarrier,
         default_num_stages_cap);
 
@@ -592,7 +639,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         swizzle_acts_mode, swizzle_weights_mode,
         num_experts_per_wave,
         num_stages, smem_size,
-        num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads
+        num_dispatch_threads, num_non_epilogue_threads, fp4_num_epilogue_threads
     };
 
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {

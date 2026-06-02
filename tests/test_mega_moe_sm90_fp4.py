@@ -205,7 +205,7 @@ def _reference_fused(
     x_fp32 = _dequant_per_token_per_128_k(x_fp8_g, x_sf_g)  # (Mg, H)
 
     # Token-chunked dequant to bound peak memory of the per-token gather.
-    _CHUNK = 64
+    _CHUNK = int(os.getenv('DSV4_FP4_REFERENCE_CHUNK', '64'))
     for k in range(num_topk):
         mask = topk_idx_g[:, k] >= 0
         if not mask.any():
@@ -450,6 +450,26 @@ def _layer6_dsv4_checkpoint(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
     ))]
 
 
+def _layer7_dsv4_2wg(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
+    # 2-WG split-MN accuracy guard (D9). num_tokens=512 drives
+    # expected_tokens_per_expert = 512 * num_topk / experts_per_rank
+    #                            = 512 * 6 / (256 / 8) = 96 >= 64,
+    # so get_block_config_for_mega_moe_sm90 takes the auto_split_mn branch:
+    # block_m=128 with TWO epilogue warpgroups. This is the only accuracy
+    # scenario that exercises the 2-WG path; L1/L3/L4/L5 are all 1-WG
+    # (num_tokens<=128 -> expected<64). It guards the D9 default flip that turns
+    # the math warpgroup's FP4 decode OFF on the 2-WG path (decode is offloaded
+    # to the assist warps and written to the shared decoded-B smem tile, so the
+    # numerics must be identical to the math-on path).
+    assert num_ranks == 8, 'DSV4 2-WG shape test expects 8 ranks'
+    return [('L7.dsv4_2wg_nt512_h4096_ih2048_e256_k6', dict(
+        num_max_tokens_per_rank=512, num_tokens=512,
+        hidden=4096, intermediate_hidden=2048,
+        num_experts=256, num_topk=6,
+        activation_clamp=10.0,
+    ))]
+
+
 # ----------------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------------
@@ -477,6 +497,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         layers += _layer5_dsv4_shape(num_ranks)
     if 6 in args.layers:
         layers += _layer6_dsv4_checkpoint(num_ranks)
+    if 7 in args.layers:
+        layers += _layer7_dsv4_2wg(num_ranks)
 
     if args.filter:
         layers = [(n, c) for n, c in layers if args.filter in n]
@@ -512,7 +534,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='SM90 FP4 MegaMoE tests')
     parser.add_argument('--num-processes', type=int, default=2)
     parser.add_argument('--layers', type=int, nargs='+', default=[1, 3, 4],
-                        help='Which layers to run (1, 3, 4, 5, 6). Default: 1 3 4.')
+                        help='Which layers to run (1, 3, 4, 5, 6, 7). Default: 1 3 4. '
+                             'Layer 7 is the 2-WG (num_tokens=512) accuracy guard.')
     parser.add_argument('--filter', type=str, default='')
     parser.add_argument('--diff-tol', type=float, default=0.10,
                         help='calc_diff tolerance (default 0.10; FP4 weights '
