@@ -52,21 +52,23 @@ __global__ void fp4_decode_only_kernel(const uint8_t* __restrict__ w_packed,
                                        const uint8_t* __restrict__ sf,
                                        float* __restrict__ scratch,
                                        unsigned long long* __restrict__ cycles,
-                                       int t, int n, int k) {
+                                       int t, int experts, int n, int k) {
     const int col = blockIdx.x;
     const int tb = blockIdx.y;
+    const int expert = blockIdx.z;
     const int tid = threadIdx.x;
     const int packed_k = k / 2;
     const int groups_k = k / 128;
+    const int token_blocks = (t + kBlockT - 1) / kBlockT;
     const int token_base = tb * kBlockT;
     const int valid_t = max(0, min(kBlockT, t - token_base));
     const unsigned long long start = clock64();
 
     float accum = 0.0f;
     for (int pk = tid; pk < packed_k; pk += blockDim.x) {
-        const uint8_t packed = w_packed[col * packed_k + pk];
+        const uint8_t packed = w_packed[(expert * n + col) * packed_k + pk];
         const int k0 = pk * 2;
-        const float scale = ue8m0_to_scale(sf[col * groups_k + k0 / 128]);
+        const float scale = ue8m0_to_scale(sf[(expert * n + col) * groups_k + k0 / 128]);
         const float w0 = fp4_e2m1_to_float(packed & 0x0fu) * scale;
         const float w1 = fp4_e2m1_to_float(packed >> 4) * scale;
         accum += w0 + w1;
@@ -82,7 +84,7 @@ __global__ void fp4_decode_only_kernel(const uint8_t* __restrict__ w_packed,
         __syncthreads();
     }
     if (tid == 0) {
-        const int block_idx = tb * n + col;
+        const int block_idx = (expert * token_blocks + tb) * n + col;
         scratch[block_idx] = smem[0] * static_cast<float>(valid_t);
         cycles[block_idx] = clock64() - start;
     }
@@ -93,12 +95,14 @@ __global__ void fp4_gemv_kernel(const half* __restrict__ x,
                                 const uint8_t* __restrict__ sf,
                                 float* __restrict__ out,
                                 unsigned long long* __restrict__ cycles,
-                                int t, int n, int k) {
+                                int t, int experts, int n, int k) {
     const int col = blockIdx.x;
     const int tb = blockIdx.y;
+    const int expert = blockIdx.z;
     const int tid = threadIdx.x;
     const int packed_k = k / 2;
     const int groups_k = k / 128;
+    const int token_blocks = (t + kBlockT - 1) / kBlockT;
     const int token_base = tb * kBlockT;
     const unsigned long long start = clock64();
 
@@ -109,10 +113,10 @@ __global__ void fp4_gemv_kernel(const half* __restrict__ x,
     }
 
     for (int pk = tid; pk < packed_k; pk += blockDim.x) {
-        const uint8_t packed = w_packed[col * packed_k + pk];
+        const uint8_t packed = w_packed[(expert * n + col) * packed_k + pk];
         const int k0 = pk * 2;
         const int k1 = k0 + 1;
-        const float scale = ue8m0_to_scale(sf[col * groups_k + k0 / 128]);
+        const float scale = ue8m0_to_scale(sf[(expert * n + col) * groups_k + k0 / 128]);
         const float w0 = fp4_e2m1_to_float(packed & 0x0fu) * scale;
         const float w1 = fp4_e2m1_to_float(packed >> 4) * scale;
 
@@ -149,10 +153,10 @@ __global__ void fp4_gemv_kernel(const half* __restrict__ x,
         for (int tt = 0; tt < kBlockT; ++tt) {
             const int token = token_base + tt;
             if (token < t) {
-                out[token * n + col] = smem[tt][0];
+                out[(expert * t + token) * n + col] = smem[tt][0];
             }
         }
-        cycles[tb * n + col] = clock64() - start;
+        cycles[(expert * token_blocks + tb) * n + col] = clock64() - start;
     }
 }
 
@@ -173,17 +177,19 @@ void launch_decode_only(torch::Tensor w_packed,
     CHECK_DTYPE(sf, torch::kUInt8);
     CHECK_DTYPE(scratch, torch::kFloat32);
     CHECK_DTYPE(cycles, torch::kInt64);
-    const int n = static_cast<int>(w_packed.size(0));
-    const int k = static_cast<int>(w_packed.size(1)) * 2;
+    TORCH_CHECK(w_packed.dim() == 3, "w_packed must be [experts, n, k/2]");
+    const int experts = static_cast<int>(w_packed.size(0));
+    const int n = static_cast<int>(w_packed.size(1));
+    const int k = static_cast<int>(w_packed.size(2)) * 2;
     TORCH_CHECK(k % 128 == 0, "k must be divisible by 128");
-    TORCH_CHECK(sf.size(0) == n && sf.size(1) == k / 128, "bad sf shape");
-    const dim3 grid(n, (t + kBlockT - 1) / kBlockT);
+    TORCH_CHECK(sf.size(0) == experts && sf.size(1) == n && sf.size(2) == k / 128, "bad sf shape");
+    const dim3 grid(n, (t + kBlockT - 1) / kBlockT, experts);
     fp4_decode_only_kernel<<<grid, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
         w_packed.data_ptr<uint8_t>(),
         sf.data_ptr<uint8_t>(),
         scratch.data_ptr<float>(),
         reinterpret_cast<unsigned long long*>(cycles.data_ptr<int64_t>()),
-        t, n, k);
+        t, experts, n, k);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -207,21 +213,24 @@ void launch_gemv(torch::Tensor x,
     CHECK_DTYPE(sf, torch::kUInt8);
     CHECK_DTYPE(out, torch::kFloat32);
     CHECK_DTYPE(cycles, torch::kInt64);
+    TORCH_CHECK(x.dim() == 2, "x must be [t, k]");
+    TORCH_CHECK(w_packed.dim() == 3, "w_packed must be [experts, n, k/2]");
     const int t = static_cast<int>(x.size(0));
     const int k = static_cast<int>(x.size(1));
-    const int n = static_cast<int>(w_packed.size(0));
-    TORCH_CHECK(w_packed.size(1) * 2 == k, "bad packed weight shape");
+    const int experts = static_cast<int>(w_packed.size(0));
+    const int n = static_cast<int>(w_packed.size(1));
+    TORCH_CHECK(w_packed.size(2) * 2 == k, "bad packed weight shape");
     TORCH_CHECK(k % 128 == 0, "k must be divisible by 128");
-    TORCH_CHECK(sf.size(0) == n && sf.size(1) == k / 128, "bad sf shape");
-    TORCH_CHECK(out.size(0) == t && out.size(1) == n, "bad out shape");
-    const dim3 grid(n, (t + kBlockT - 1) / kBlockT);
+    TORCH_CHECK(sf.size(0) == experts && sf.size(1) == n && sf.size(2) == k / 128, "bad sf shape");
+    TORCH_CHECK(out.size(0) == experts && out.size(1) == t && out.size(2) == n, "bad out shape");
+    const dim3 grid(n, (t + kBlockT - 1) / kBlockT, experts);
     fp4_gemv_kernel<<<grid, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
         w_packed.data_ptr<uint8_t>(),
         sf.data_ptr<uint8_t>(),
         out.data_ptr<float>(),
         reinterpret_cast<unsigned long long*>(cycles.data_ptr<int64_t>()),
-        t, n, k);
+        t, experts, n, k);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -273,14 +282,14 @@ def unpack_fp4(w_packed: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
     return values * scales.repeat_interleave(128, dim=1)
 
 
-def make_inputs(t: int, n: int, k: int, seed: int):
+def make_inputs(t: int, experts: int, n: int, k: int, seed: int):
     gen = torch.Generator(device="cuda")
     gen.manual_seed(seed + t * 1000003 + n * 9176 + k)
     x = torch.randn((t, k), device="cuda", dtype=torch.float16, generator=gen)
-    codes_lo = torch.randint(0, 16, (n, k // 2), device="cuda", dtype=torch.uint8, generator=gen)
-    codes_hi = torch.randint(0, 16, (n, k // 2), device="cuda", dtype=torch.uint8, generator=gen)
+    codes_lo = torch.randint(0, 16, (experts, n, k // 2), device="cuda", dtype=torch.uint8, generator=gen)
+    codes_hi = torch.randint(0, 16, (experts, n, k // 2), device="cuda", dtype=torch.uint8, generator=gen)
     w_packed = (codes_lo | (codes_hi << 4)).contiguous()
-    sf = torch.randint(123, 130, (n, k // 128), device="cuda", dtype=torch.uint8, generator=gen)
+    sf = torch.randint(123, 130, (experts, n, k // 128), device="cuda", dtype=torch.uint8, generator=gen)
     return x, w_packed, sf
 
 
@@ -312,25 +321,25 @@ def cycle_stats(cycles: torch.Tensor):
 
 def run_correctness(ext):
     t, n, k = 3, 64, 128
-    x, w_packed, sf = make_inputs(t, n, k, seed=17)
-    out = torch.empty((t, n), device="cuda", dtype=torch.float32)
-    cycles = torch.empty((n * ((t + 7) // 8),), device="cuda", dtype=torch.int64)
+    x, w_packed, sf = make_inputs(t, 1, n, k, seed=17)
+    out = torch.empty((1, t, n), device="cuda", dtype=torch.float32)
+    cycles = torch.empty((1, (t + 7) // 8, n), device="cuda", dtype=torch.int64)
     ext.gemv(x, w_packed, sf, out, cycles)
-    ref = x.float() @ unpack_fp4(w_packed, sf).t()
+    ref = x.float() @ unpack_fp4(w_packed[0], sf[0]).t()
     torch.cuda.synchronize()
-    max_diff = float((out - ref).abs().max().item())
+    max_diff = float((out[0] - ref).abs().max().item())
     result = {"kind": "correctness", "t": t, "n": n, "k": k, "max_diff": max_diff, "passed": max_diff < 2e-2}
     print("MICRO_RESULT_JSON " + json.dumps(result, sort_keys=True), flush=True)
     if not result["passed"]:
         raise RuntimeError(f"correctness failed: max_diff={max_diff}")
 
 
-def run_case(ext, stage: str, t: int, n: int, k: int, warmup: int, repeat: int, seed: int):
-    x, w_packed, sf = make_inputs(t, n, k, seed=seed)
+def run_case(ext, stage: str, t: int, experts: int, n: int, k: int, warmup: int, repeat: int, seed: int):
+    x, w_packed, sf = make_inputs(t, experts, n, k, seed=seed)
     token_blocks = (t + 7) // 8
-    out = torch.empty((t, n), device="cuda", dtype=torch.float32)
-    scratch = torch.empty((token_blocks, n), device="cuda", dtype=torch.float32)
-    cycles = torch.empty((token_blocks, n), device="cuda", dtype=torch.int64)
+    out = torch.empty((experts, t, n), device="cuda", dtype=torch.float32)
+    scratch = torch.empty((experts, token_blocks, n), device="cuda", dtype=torch.float32)
+    cycles = torch.empty((experts, token_blocks, n), device="cuda", dtype=torch.int64)
 
     def decode_fn():
         ext.decode_only(w_packed, sf, scratch, cycles, t)
@@ -341,6 +350,7 @@ def run_case(ext, stage: str, t: int, n: int, k: int, warmup: int, repeat: int, 
         "kind": "decode_only",
         "stage": stage,
         "t": t,
+        "experts": experts,
         "n": n,
         "k": k,
         "block_t": 8,
@@ -359,6 +369,7 @@ def run_case(ext, stage: str, t: int, n: int, k: int, warmup: int, repeat: int, 
         "kind": "gemv_decode_fma",
         "stage": stage,
         "t": t,
+        "experts": experts,
         "n": n,
         "k": k,
         "block_t": 8,
@@ -374,6 +385,7 @@ def run_case(ext, stage: str, t: int, n: int, k: int, warmup: int, repeat: int, 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokens", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32])
+    parser.add_argument("--experts", type=int, nargs="+", default=[1])
     parser.add_argument("--stages", nargs="+", default=["l1", "l2"], choices=["l1", "l2"])
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=30)
@@ -388,6 +400,7 @@ def main():
         "sm": f"{props.major}{props.minor}",
         "clock_rate_khz": getattr(props, "clock_rate", None),
         "tokens": args.tokens,
+        "experts": args.experts,
         "stages": args.stages,
         "note": "Standalone CUDA-core prototype; one CTA computes one output column for up to 8 tokens.",
     }, sort_keys=True), flush=True)
@@ -400,8 +413,9 @@ def main():
     }
     for stage in args.stages:
         shape = shapes[stage]
-        for t in args.tokens:
-            run_case(ext, stage, t, shape["n"], shape["k"], args.warmup, args.repeat, args.seed)
+        for experts in args.experts:
+            for t in args.tokens:
+                run_case(ext, stage, t, experts, shape["n"], shape["k"], args.warmup, args.repeat, args.seed)
 
 
 if __name__ == "__main__":
