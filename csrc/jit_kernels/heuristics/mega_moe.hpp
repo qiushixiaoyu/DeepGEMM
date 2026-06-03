@@ -453,8 +453,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
 
     const auto num_epilogue_warpgroups = num_epilogue_warps / 4;
-    const int smem_cd_l1 = num_epilogue_warpgroups * block_m * (block_n / 2);
-    const int smem_cd_l2 = num_epilogue_warpgroups * block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
+    const int smem_cd_l1 = block_m * (block_n / 2);
+    const int smem_cd_l2 = block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
     const int smem_cd = align(std::max(smem_cd_l1, smem_cd_l2), kSmemAlignment);
     // share-SF amax scratch: allocated when split-N + WG_L1_OUT_BLOCK_N <
     // kL2ActsSFGranK (mirror of kernel-side `kSplitNSharesSF`). 64 float
