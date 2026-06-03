@@ -172,7 +172,7 @@ void launch_decode_only(torch::Tensor w_packed,
     CHECK_DTYPE(w_packed, torch::kUInt8);
     CHECK_DTYPE(sf, torch::kUInt8);
     CHECK_DTYPE(scratch, torch::kFloat32);
-    CHECK_DTYPE(cycles, torch::kUInt64);
+    CHECK_DTYPE(cycles, torch::kInt64);
     const int n = static_cast<int>(w_packed.size(0));
     const int k = static_cast<int>(w_packed.size(1)) * 2;
     TORCH_CHECK(k % 128 == 0, "k must be divisible by 128");
@@ -182,7 +182,7 @@ void launch_decode_only(torch::Tensor w_packed,
         w_packed.data_ptr<uint8_t>(),
         sf.data_ptr<uint8_t>(),
         scratch.data_ptr<float>(),
-        cycles.data_ptr<unsigned long long>(),
+        reinterpret_cast<unsigned long long*>(cycles.data_ptr<int64_t>()),
         t, n, k);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -206,7 +206,7 @@ void launch_gemv(torch::Tensor x,
     CHECK_DTYPE(w_packed, torch::kUInt8);
     CHECK_DTYPE(sf, torch::kUInt8);
     CHECK_DTYPE(out, torch::kFloat32);
-    CHECK_DTYPE(cycles, torch::kUInt64);
+    CHECK_DTYPE(cycles, torch::kInt64);
     const int t = static_cast<int>(x.size(0));
     const int k = static_cast<int>(x.size(1));
     const int n = static_cast<int>(w_packed.size(0));
@@ -220,7 +220,7 @@ void launch_gemv(torch::Tensor x,
         w_packed.data_ptr<uint8_t>(),
         sf.data_ptr<uint8_t>(),
         out.data_ptr<float>(),
-        cycles.data_ptr<unsigned long long>(),
+        reinterpret_cast<unsigned long long*>(cycles.data_ptr<int64_t>()),
         t, n, k);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -314,7 +314,7 @@ def run_correctness(ext):
     t, n, k = 3, 64, 128
     x, w_packed, sf = make_inputs(t, n, k, seed=17)
     out = torch.empty((t, n), device="cuda", dtype=torch.float32)
-    cycles = torch.empty((n * ((t + 7) // 8),), device="cuda", dtype=torch.uint64)
+    cycles = torch.empty((n * ((t + 7) // 8),), device="cuda", dtype=torch.int64)
     ext.gemv(x, w_packed, sf, out, cycles)
     ref = x.float() @ unpack_fp4(w_packed, sf).t()
     torch.cuda.synchronize()
@@ -330,7 +330,7 @@ def run_case(ext, stage: str, t: int, n: int, k: int, warmup: int, repeat: int, 
     token_blocks = (t + 7) // 8
     out = torch.empty((t, n), device="cuda", dtype=torch.float32)
     scratch = torch.empty((token_blocks, n), device="cuda", dtype=torch.float32)
-    cycles = torch.empty((token_blocks, n), device="cuda", dtype=torch.uint64)
+    cycles = torch.empty((token_blocks, n), device="cuda", dtype=torch.int64)
 
     def decode_fn():
         ext.decode_only(w_packed, sf, scratch, cycles, t)
@@ -406,4 +406,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
