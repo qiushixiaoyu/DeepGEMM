@@ -351,6 +351,16 @@ static int get_num_experts_per_wave_for_mega_moe_sm90(
     if (expected_tokens_per_expert < 1.0f or expected_tokens_per_expert > 4.0f) {
         return num_experts_per_rank;
     }
+    // Wide FFN middle-band shortcut: avoid extra L1/L2 wave transitions when
+    // one all-expert wave already exposes enough split-N blocks to fill the SMs.
+    if (block_m == 64 and intermediate_hidden >= 3072) {
+        const int num_n_blocks_per_expert = (2 * intermediate_hidden) / block_n;
+        const int single_wave_blocks =
+            num_experts_per_rank * num_n_blocks_per_expert;
+        // Leave headroom for routing imbalance while keeping all SMs busy.
+        if (single_wave_blocks >= 4 * num_sms)
+            return num_experts_per_rank;
+    }
     return get_num_experts_per_wave_for_mega_moe(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms);
@@ -418,7 +428,17 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
     const bool auto_split_mn = expected_tokens_per_expert >= 64.0f;
-    const int block_n = auto_split_mn ? 256 : 128;
+    // Wider FFNs use a larger split-N tile once each expert has enough routed
+    // work to amortize the larger per-tile footprint. Keep the sparse corner on
+    // block_n=128.
+    const bool decode_split_n_path =
+        block_m == 64 and num_epilogue_threads == 256;
+    const bool decode_use_block_n_256 =
+        decode_split_n_path and intermediate_hidden >= 3072 and
+        expected_tokens_per_expert >= 0.25f and
+        (2 * intermediate_hidden) % 256 == 0;
+    const int block_n = auto_split_mn ? 256
+                                      : (decode_use_block_n_256 ? 256 : 128);
     const int block_k = 128;
     // NOTES: cluster_size=1 for SM90 in this initial implementation. Cluster=2
     // multicast on A is feasible (each pair of CTAs shares m_block, splits N),
