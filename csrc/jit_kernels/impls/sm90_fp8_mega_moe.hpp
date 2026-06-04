@@ -175,10 +175,18 @@ static void sm90_fp8_mega_moe(
     const bool default_split_mn_barrier_opt =
         config.block_m == 128 and config.block_n == 256 and
         config.num_epilogue_threads == 512;
-    const bool l2_arrival_counter = default_split_mn_barrier_opt;
-    const bool l2_epilogue_requires_full_sync = not default_split_mn_barrier_opt;
     const bool split_phase_hot_path =
         config.block_m == 128 and config.block_n == 256 and hidden >= 7168;
+    const bool decode_split_n_path =
+        config.block_m == 64 and config.num_epilogue_threads == 256;
+    const bool decode_split_n_bn256 =
+        decode_split_n_path and config.block_n == 256;
+    const bool decode_l2_counter =
+        decode_split_n_bn256 and num_tokens >= 4 and num_tokens <= 128;
+    const bool l2_arrival_counter =
+        default_split_mn_barrier_opt or decode_l2_counter;
+    const bool l2_epilogue_requires_full_sync =
+        not l2_arrival_counter;
 
     // Tensormap construction
     // Acts/weights: standard 2D TMA descriptors (FP8 K-major).
