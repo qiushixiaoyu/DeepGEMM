@@ -23,7 +23,6 @@
 #include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>
-#define __CLION_IDE__
 
 namespace deep_gemm {
 

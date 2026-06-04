@@ -34,16 +34,16 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
-    // ====== Stream A0.1 — DG_USE_FP4_ACTS ======
+    // ====== FP4 activation path: DG_USE_FP4_ACTS ======
     // When true, the L1 epilogue quantizes its SwiGLU outputs to E2M1 (FP4) +
     // UE8M0 SF instead of E4M3 (FP8) + UE8M0 SF. The per-row gmem footprint
     // halves (intermediate_hidden / 2 packed bytes vs intermediate_hidden FP8
     // bytes) and the smem CD staging is sized accordingly. The L2 phase still
-    // reads its activations as FP8 in this step (separate flag for A0.2), so
-    // end-to-end output is intentionally not bit-equivalent to the FP8 path —
+    // reads its activations as FP8 in this step, so end-to-end output is
+    // intentionally not bit-equivalent to the FP8 path -
     // the accuracy harness compares L1's quantized output decoded back to BF16.
     bool kUseFp4Acts = false,
-    // ====== Stream A0.5 — DG_USE_MXF4_KIND ======
+    // ====== MXF4 mainloop path: DG_USE_MXF4_KIND ======
     // When true (and `kUseFp4Acts` also true), L1 + L2 mainloops swap from
     // `kind::mxf8f6f4.block_scale.block32` (K=32 with-padding FP4 smem) to
     // `kind::mxf4.block_scale.block32` (K=64 dense FP4 smem). Per the
@@ -55,7 +55,7 @@ template <
     // accepts only E2M1 inputs — see the host-side `DG_HOST_ASSERT(not
     // use_mxf4_kind or use_fp4_acts)` in `mega.hpp`.
     bool kUseMxf4Kind = false,
-    // ====== Stream B (combine path) — DG_USE_FP8_COMBINE ======
+    // ====== FP8 combine path: DG_USE_FP8_COMBINE ======
     // When true, the L2 epilogue ships FP8 E4M3 + per-(token, N=128) UE8M0
     // SF over NVLink instead of BF16. Byte footprint per token per slot:
     //   off: kHidden * 2  (BF16)
@@ -126,11 +126,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk);
 
     // Token and buffer layouts
-    // ====== Stream A0.0b — DG_USE_FP4_ACTS L1 input path ======
+    // ====== FP4 L1 input path: DG_USE_FP4_ACTS ======
     // When `kUseFp4Acts`, the symmetric `x` slot (and the L1 token pool that
     // mirrors it) holds packed E2M1 (FP4) instead of dense E4M3 (FP8). The
     // packed footprint is `kHidden / 2` bytes per token. The SF slot is
-    // unchanged (`kHidden / 32` bytes — `gran_k=32` for both FP4 and FP8 acts
+    // unchanged (`kHidden / 32` bytes - `gran_k=32` for both FP4 and FP8 acts
     // under `kind::mxf8f6f4`).
     constexpr uint32_t kInputTokenBytes = kUseFp4Acts ? (kHidden / 2) : kHidden;
     constexpr auto fp8_token_layout = layout::Data(kInputTokenBytes);
@@ -191,9 +191,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     );
 
     // Combine inputs.
-    // Stream B: under `kUseFp8Combine`, the slot holds FP8 E4M3 (kHidden
+    // Under `kUseFp8Combine`, the slot holds FP8 E4M3 (kHidden
     // bytes/token) + a separate SF slot holding UE8M0 bytes
-    // (kHidden / kCombineGranK bytes/token, kCombineGranK = 128). Off → BF16
+    // (kHidden / kCombineGranK bytes/token, kCombineGranK = 128). Off -> BF16
     // (kHidden*2 bytes/token), zero-sized SF slot.
     constexpr uint32_t kCombineGranK = 128;
     DG_STATIC_ASSERT(kHidden % kCombineGranK == 0, "kHidden must be a multiple of 128 for FP8 combine SF");
@@ -215,14 +215,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // NOTES: activations are FP8 (e4m3), weights are FP4 (e2m1)
     using a_dtype_t = cutlass::float_e4m3_t;
     using b_dtype_t = cutlass::detail::float_e2m1_unpacksmem_t;
-    // Stream A0.2: when `kUseFp4Acts` is on, the L2 phase reads acts as
+    // When `kUseFp4Acts` is on, the L2 phase reads acts as
     // E2M1 instead of E4M3. Both share the same byte footprint in smem
     // (FP8 = 1 B, FP4 unpacksmem = 1 B with `_ALIGN16B` padding), so the
     // smem A allocation, swizzle mode (128 B), and umma_desc stride math
     // are identical. Only the *MMA instruction descriptor*'s A-dtype field
     // and the source-side TMA `expect_tx` differ between phases.
     using l2_a_dtype_t = cute::conditional_t<kUseFp4Acts, b_dtype_t, a_dtype_t>;
-    // Stream A0.0b: same deal for L1 — when `kUseFp4Acts` is on, the L1
+    // Same deal for L1: when `kUseFp4Acts` is on, the L1
     // phase reads its A operand from the L1 token pool as packed E2M1.
     // Same `_ALIGN16B` padded smem layout as L2; same MMA instruction
     // descriptor flip from E4M3 to E2M1.
@@ -233,7 +233,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t LAYOUT_AD_M = 128;
     constexpr uint32_t UMMA_M = LAYOUT_AD_M * 2;
     constexpr uint32_t UMMA_N = BLOCK_M;  // Swap AB
-    // Stream A0.5: kind::mxf4 runs K=64 dense per call (vs K=32 for
+    // kind::mxf4 runs K=64 dense per call (vs K=32 for
     // kind::mxf8f6f4). BLOCK_K stays 128 elements; the # of MMA calls per
     // K-tile (`BLOCK_K / UMMA_K`) halves from 4 to 2.
     constexpr uint32_t UMMA_K = kUseMxf4Kind ? 64 : 32;
@@ -244,7 +244,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(BLOCK_K == 128, "Invalid block K");
 
     // Swizzle configs
-    // Stream A0.5: under `kUseMxf4Kind`, A and B smem use the dense FP4
+    // Under `kUseMxf4Kind`, A and B smem use the dense FP4
     // layout (`_ALIGN8B`, 2 nibbles/byte) instead of the with-padding
     // layout (`_ALIGN16B`, 1 byte per element). Per-K-row byte stride
     // halves: BLOCK_K elements × 0.5 B/elem = BLOCK_K / 2 bytes. Swizzle
@@ -255,7 +255,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kSwizzleBMode = kUseMxf4Kind
         ? (BLOCK_K / 2)
         : (BLOCK_K * static_cast<uint32_t>(sizeof(b_dtype_t)));
-    // Stream A0.2: l2_a_dtype must keep the same smem footprint as
+    // l2_a_dtype must keep the same smem footprint as
     // a_dtype so SMEM_A_SIZE_PER_STAGE / kSwizzleAMode are unchanged.
     DG_STATIC_ASSERT(sizeof(l2_a_dtype_t) == sizeof(a_dtype_t),
                      "L2 A dtype must match A in smem footprint");
@@ -275,8 +275,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Shared memory sizes
     // NOTES: FP8 CD output for L1 (2 TMA stages, BLOCK_N/2 post-SwiGLU), BF16 output for L2 (no TMA, a single stage)
     constexpr uint32_t L1_OUT_BLOCK_N = BLOCK_N / 2;
-    // ====== Stream A0.1 ======
-    // FP4 path packs 2 elements per byte → row footprint halves. We keep
+    // ====== FP4 activation output layout ======
+    // FP4 path packs 2 elements per byte, so row footprint halves. We keep
     // `L1_OUT_BLOCK_N` in *elements* and introduce a row-byte-stride that
     // depends on the flag, so the existing offset arithmetic (`row *
     // L1_OUT_BLOCK_N_BYTES`) still works for both paths.
@@ -285,7 +285,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         math::constexpr_align<uint32_t>(kNumExperts * sizeof(uint32_t), kSharedMemoryAlignment);
     constexpr uint32_t SMEM_SEND_BUFFER_SIZE =
         math::constexpr_align(fp8_token_layout.get_num_bytes() * kNumDispatchWarps, kSharedMemoryAlignment);
-    // Stream A0.5: under `kUseMxf4Kind`, dense FP4 smem (2 nibbles/byte)
+    // Under `kUseMxf4Kind`, dense FP4 smem (2 nibbles/byte)
     // halves the per-stage byte footprint vs the with-padding layout.
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = kUseMxf4Kind
         ? (LOAD_BLOCK_M * BLOCK_K / 2)
@@ -642,7 +642,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
             // TMA load token from remote rank into shared memory
-            // Stream A0.0b: under `kUseFp4Acts`, the source slot in the
+            // Under `kUseFp4Acts`, the source slot in the
             // remote rank's symmetric `x` buffer is packed E2M1 (kHidden/2
             // bytes), so the per-token NVLink pull halves. The local pull
             // buffer / l1 token buffer is sized off `fp8_token_layout` which
@@ -683,7 +683,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 *l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>() = weight;
 
                 // Wait for TMA token load to complete
-                // Stream A0.0b: expect_tx halves with the FP4 packed footprint.
+                // expect_tx halves with the FP4 packed footprint.
                 ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kInputTokenBytes);
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
 
@@ -816,13 +816,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     m_idx += scheduler.template get_valid_m<true>() / 2;
 
                 // TMA copy tokens and SFA, then arrive at full barrier.
-                // Stream A0.2 + A0.0b: under FP4 acts, BOTH L1 and L2 phases
+                // Under FP4 acts, BOTH L1 and L2 phases
                 // load A as packed E2M1 (`l1_a_dtype_t == l2_a_dtype_t == b_dtype_t`).
                 // Same per-byte smem layout as FP8 A (1 B/elem under `_ALIGN16B`),
                 // but source-side packed bytes are halved → expect_tx halved.
                 if (cute::elect_one_sync()) {
                     if constexpr (kUseMxf4Kind) {
-                        // Stream A0.5: dense FP4 smem (`_ALIGN8B`). The TMA
+                        // Dense FP4 smem (`_ALIGN8B`). The TMA
                         // descriptor's inner box covers BLOCK_K elements in
                         // BLOCK_K/2 bytes per row; one cluster-multicast TMA
                         // call fills the full A stage. Bypass `tma::copy`
@@ -849,7 +849,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     tma::copy<SF_BLOCK_M, 1, 0>(
                         tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx], sfa_m_idx, sfa_k_idx, 2);
                     if (is_leader_cta) {
-                        // Stream A0.5: under `kUseMxf4Kind`, smem A is dense
+                        // Under `kUseMxf4Kind`, smem A is dense
                         // FP4 (LOAD_BLOCK_M * BLOCK_K / 2 bytes per CTA, equal
                         // to source-side packed bytes — no `_ALIGN16B` doubling).
                         // For 2 CTAs (cluster multicast), tx-count is
@@ -897,7 +897,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // TMA copy weights with SF
                 if (cute::elect_one_sync()) {
                     if constexpr (kUseMxf4Kind) {
-                        // Stream A0.5: dense FP4 smem; one cluster-multicast
+                        // Dense FP4 smem; one cluster-multicast
                         // TMA call covers the full B stage. See A-side comment.
                         cute::SM100_TMA_2SM_LOAD_2D::copy(
                             tensor_map_b_ptr,
@@ -912,7 +912,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     tma::copy<BLOCK_N, 1, 0>(
                         tensor_map_sfb_ptr, full_barriers[stage_idx], smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
                     if (is_leader_cta) {
-                        // Stream A0.5: B-side tx-count for cluster-multicast
+                        // B-side tx-count for cluster-multicast
                         // counts SOURCE BYTES PER PEER × 2 PEERS (broadcast: both
                         // peers receive a copy of the same source bytes). For the
                         // existing FP4 unpacksmem path, that happens to equal
@@ -945,7 +945,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 UMMA_M, UMMA_N,
                 cute::UMMA::Major::K, cute::UMMA::Major::K
             >();
-            // Stream A0.2 + A0.0b: when both L1 and L2 read FP4 acts under
+            // When both L1 and L2 read FP4 acts under
             // `kUseFp4Acts`, we need a separate instruction descriptor whose
             // A-dtype field is E2M1 (not E4M3). All other fields (block-scale
             // shape, UMMA M/N/K, K-major) are unchanged. The smem layout
@@ -954,7 +954,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Single shared idesc — both `l1_a_dtype_t` and `l2_a_dtype_t`
             // resolve to `b_dtype_t` (E2M1 unpacksmem) under the flag.
             //
-            // Stream A0.5: under `kUseMxf4Kind`, the descriptor's a/b_format
+            // Under `kUseMxf4Kind`, the descriptor's a/b_format
             // fields encode E2M1 as `MXF4Format::E2M1 = 1`, NOT
             // `MXF8F6F4Format::E2M1 = 5`. CUTLASS picks the right enum via
             // `to_UMMAFormat<T>()`: passing `cute::float_e2m1_t` (dense) yields
@@ -975,7 +975,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             auto sf_desc = mma::sm100::make_sf_desc(nullptr);
 
             DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
-            // Stream A0.5: under `kUseMxf4Kind`, smem A and B carry dense
+            // Under `kUseMxf4Kind`, smem A and B carry dense
             // FP4 (2 nibbles/byte). The `make_umma_desc` helper asserts
             // `kSwizzleMode == BLOCK_K * sizeof(dtype_t)`, so we pass a
             // BLOCK_K of `BLOCK_K / 2` (the byte count) and `dtype_t =
@@ -1057,13 +1057,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + i * 4);
                         }
 
-                        // Issue UMMA. Stream A0.2: L2 phase under FP4 acts
+                        // Issue UMMA. L2 phase under FP4 acts
                         // uses `instr_desc_l2` (A=E2M1) instead of `instr_desc`
                         // (A=E4M3). The smem K-stride for A is the same
                         // (sizeof(l2_a_dtype_t) == sizeof(a_dtype_t) == 1) so
                         // `advance_umma_desc_lo` on `a_dtype_t` is correct
                         // for both phases.
-                        // Stream A0.5: under `kUseMxf4Kind`, swap the MMA to
+                        // Under `kUseMxf4Kind`, swap the MMA to
                         // `kind::mxf4` (cta_group::2). UMMA_K=64 (vs 32),
                         // so K_PER_TILE=2 (vs 4). The SF address top-2 bits
                         // are HALF-WORD offsets {0, 2} for scale_vec::2X
@@ -1088,7 +1088,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                     k_block_idx > 0 or k > 0, runtime_instr_desc,
                                     kTmemStartColOfSFB, kTmemStartColOfSFA);
                             } else {
-                                // Stream A0.0b: under `kUseFp4Acts`, both L1 and L2 read
+                                // Under `kUseFp4Acts`, both L1 and L2 read
                                 // A as E2M1. Pick the FP4 idesc unconditionally when the flag is on.
                                 const auto runtime_instr_desc = kUseFp4Acts
                                     ? mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc_fp4, k, k)
@@ -1535,7 +1535,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
 
                         if constexpr (kUseFp8Combine) {
-                            // Stream B: BF16 (in `packed`) → FP8 E4M3 + per-row UE8M0 SF.
+                            // BF16 (in `packed`) -> FP8 E4M3 + per-row UE8M0 SF.
                             //
                             // 16 lanes (lane_idx & ~15u) cover one row's
                             // BLOCK_N=128 elements (= 8 BF16 each). Compute
@@ -1688,7 +1688,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 static_cast<int>(__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_idx * kNumTopk + lane_idx)) : -1;
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 
-            // Stream B: FP8 path loads kNumChunkBytes / 2 per slot (FP8 = 1 byte/elem)
+            // FP8 combine path loads kNumChunkBytes / 2 per slot (FP8 = 1 byte/elem)
             // and reads a per-(slot, token, n_block) UE8M0 SF byte to dequant
             // on the fly. Output is BF16 either way → store byte count is
             // kNumChunkBytes regardless.

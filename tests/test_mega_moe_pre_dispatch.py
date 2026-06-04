@@ -1,4 +1,4 @@
-# Bytewise + correctness probe for `deep_gemm.mega_moe_pre_dispatch`.
+# Bytewise correctness check for `deep_gemm.mega_moe_pre_dispatch`.
 #
 # The fused pre-dispatch kernel produces the exact byte layout DeepGEMM's
 # mega-MoE symmetric `x`, `x_sf`, `topk_idx`, and `topk_weights` slots expect.
@@ -27,7 +27,7 @@ def _alloc_outputs(padded_max: int, hidden: int, top_k: int,
     buf_x_sf = torch.empty((padded_max, num_groups // 4), dtype=torch.int32, device='cuda')
     buf_topk_idx = torch.empty((padded_max, top_k), dtype=torch.int64, device='cuda')
     buf_topk_weights = torch.empty((padded_max, top_k), dtype=torch.float32, device='cuda')
-    # Sentinel-fill so any write-correctness bug shows up as a non-zero diff.
+    # Pre-fill so any write-correctness bug shows up as a non-zero diff.
     buf_x.fill_(0)
     buf_x_sf.fill_(0)
     buf_topk_idx.fill_(0)
@@ -71,7 +71,7 @@ def _run_one(use_fp4_acts: bool, args: argparse.Namespace) -> None:
 
     # --- Bytewise compare on valid-token rows ---
     if use_fp4_acts:
-        # ref_x is int8 (M, H/2); buf_x[:M] is int8 (M, H/2). Compare raw bytes.
+        # ref_x is int8 (M, H/2); buf_x[:M] is int8 (M, H/2). Compare bytewise.
         kernel_bytes = buf_x[:M].view(torch.uint8)
         ref_bytes = ref_x.view(torch.uint8)
     else:

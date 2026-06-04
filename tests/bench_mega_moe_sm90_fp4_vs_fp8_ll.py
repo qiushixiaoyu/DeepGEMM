@@ -224,13 +224,7 @@ def benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         sym_buffer.topk_idx[:num_tokens].copy_(topk_idx)
         sym_buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
-    fp4_clock_profile = None
-    if args.fp4_clock_profile:
-        if args.fp4_mode != "runtime":
-            raise ValueError("--fp4-clock-profile only applies to --fp4-mode runtime")
-        fp4_clock_profile = torch.zeros((16,), dtype=torch.int64, device="cuda")
-
-    def fp4_fused_kernel(clock_profile=None):
+    def fp4_fused_kernel():
         if args.fp4_mode == "predecode-fp8-fused":
             deep_gemm.fp8_mega_moe(
                 y_fused,
@@ -254,13 +248,12 @@ def benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 activation="swiglu",
                 activation_clamp=clamp_arg,
                 fast_math=bool(args.fast_math),
-                fp4_clock_profile=clock_profile,
             )
         return y_fused
 
-    def run_fp4_fused(clock_profile=None):
+    def run_fp4_fused():
         fp4_prepare_inputs()
-        return fp4_fused_kernel(clock_profile)
+        return fp4_fused_kernel()
 
     ll_buffer = None
     if run_fp8_ll_baseline_enabled:
@@ -407,82 +400,6 @@ def benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     local_expert_ids = gathered_topk_idx[gathered_topk_idx != -1]
     num_recv_tokens = int(local_expert_ids.numel())
     num_touched_experts = int(torch.unique(local_expert_ids).numel())
-
-    if fp4_clock_profile is not None:
-        fp4_clock_profile.zero_()
-        dist.barrier()
-        run_fp4_fused(fp4_clock_profile)
-        torch.cuda.synchronize()
-        dist.all_reduce(fp4_clock_profile, op=dist.ReduceOp.SUM)
-        if rank_idx == 0:
-            values = [int(v) for v in fp4_clock_profile.cpu().tolist()]
-            props = torch.cuda.get_device_properties(0)
-            clock_khz_value = getattr(props, "clock_rate", None)
-            if clock_khz_value is None:
-                clock_khz_value = getattr(props, "clockRate", None)
-            clock_khz = None if clock_khz_value is None else float(clock_khz_value)
-
-            def cycles_per_block(slot_base: int, rel_slot: int) -> float:
-                count = values[slot_base]
-                return float("nan") if count == 0 else values[slot_base + rel_slot] / count
-
-            def us_per_block(slot_base: int, rel_slot: int):
-                cycles = cycles_per_block(slot_base, rel_slot)
-                if clock_khz is None or math.isnan(cycles):
-                    return None
-                return cycles * 1000.0 / clock_khz
-
-            def round_cycles(value: float):
-                return None if math.isnan(value) else round(value, 3)
-
-            def round_us(value):
-                return None if value is None else round(value, 6)
-
-            def sum_us(lhs, rhs):
-                return None if lhs is None or rhs is None else lhs + rhs
-
-            clock_result = {
-                "batch_per_rank": num_tokens,
-                "num_ranks": num_ranks,
-                "clock_rate_khz": None if clock_khz is None else int(clock_khz),
-                "l1_profiled_k_blocks": values[0],
-                "l1_full_wait_cycles_per_block": round_cycles(cycles_per_block(0, 1)),
-                "l1_decode_sync_cycles_per_block": round_cycles(cycles_per_block(0, 2)),
-                "l1_decode_input_wait_cycles_per_block": round_cycles(cycles_per_block(0, 5)),
-                "l1_math_decode_cycles_per_block": round_cycles(cycles_per_block(0, 6)),
-                "l1_decode_rendezvous_cycles_per_block": round_cycles(cycles_per_block(0, 7)),
-                "l1_wait_decode_cycles_per_block": round_cycles(cycles_per_block(0, 1) + cycles_per_block(0, 2)),
-                "l1_wgmma_cycles_per_block": round_cycles(cycles_per_block(0, 3)),
-                "l1_promote_cycles_per_block": round_cycles(cycles_per_block(0, 4)),
-                "l1_full_wait_us_per_block": round_us(us_per_block(0, 1)),
-                "l1_decode_sync_us_per_block": round_us(us_per_block(0, 2)),
-                "l1_decode_input_wait_us_per_block": round_us(us_per_block(0, 5)),
-                "l1_math_decode_us_per_block": round_us(us_per_block(0, 6)),
-                "l1_decode_rendezvous_us_per_block": round_us(us_per_block(0, 7)),
-                "l1_wait_decode_us_per_block": round_us(sum_us(us_per_block(0, 1), us_per_block(0, 2))),
-                "l1_wgmma_us_per_block": round_us(us_per_block(0, 3)),
-                "l1_promote_us_per_block": round_us(us_per_block(0, 4)),
-                "l2_profiled_k_blocks": values[8],
-                "l2_full_wait_cycles_per_block": round_cycles(cycles_per_block(8, 1)),
-                "l2_decode_sync_cycles_per_block": round_cycles(cycles_per_block(8, 2)),
-                "l2_decode_input_wait_cycles_per_block": round_cycles(cycles_per_block(8, 5)),
-                "l2_math_decode_cycles_per_block": round_cycles(cycles_per_block(8, 6)),
-                "l2_decode_rendezvous_cycles_per_block": round_cycles(cycles_per_block(8, 7)),
-                "l2_wait_decode_cycles_per_block": round_cycles(cycles_per_block(8, 1) + cycles_per_block(8, 2)),
-                "l2_wgmma_cycles_per_block": round_cycles(cycles_per_block(8, 3)),
-                "l2_promote_cycles_per_block": round_cycles(cycles_per_block(8, 4)),
-                "l2_full_wait_us_per_block": round_us(us_per_block(8, 1)),
-                "l2_decode_sync_us_per_block": round_us(us_per_block(8, 2)),
-                "l2_decode_input_wait_us_per_block": round_us(us_per_block(8, 5)),
-                "l2_math_decode_us_per_block": round_us(us_per_block(8, 6)),
-                "l2_decode_rendezvous_us_per_block": round_us(us_per_block(8, 7)),
-                "l2_wait_decode_us_per_block": round_us(sum_us(us_per_block(8, 1), us_per_block(8, 2))),
-                "l2_wgmma_us_per_block": round_us(us_per_block(8, 3)),
-                "l2_promote_us_per_block": round_us(us_per_block(8, 4)),
-                "raw_slots": values,
-            }
-            print("CLOCK_PROFILE_JSON " + json.dumps(clock_result, sort_keys=True), flush=True)
-        dist.barrier()
 
     if args.profile_breakdown:
         if args.fp4_mode == "predecode-fp8-ll":
@@ -672,11 +589,6 @@ if __name__ == "__main__":
         "--profile-breakdown",
         action="store_true",
         help="Emit PROFILE_JSON with CUDA-event timings for FP4 and FP8 LL stages",
-    )
-    parser.add_argument(
-        "--fp4-clock-profile",
-        action="store_true",
-        help="Emit CLOCK_PROFILE_JSON with in-kernel FP4 wait/decode, WGMMA, and promote cycle counters",
     )
     parser.add_argument(
         "--skip-fp8-ll-baseline",

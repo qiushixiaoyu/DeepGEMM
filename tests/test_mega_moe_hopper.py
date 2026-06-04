@@ -636,8 +636,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
 
     def run_fused():
-        # Match the SM100 test: DG_COMM_KERNEL_DEBUG=1 zeros the whole
-        # sym_buffer at kernel exit, so inputs must be re-copied every call.
+        # Copy inputs before each launch so repeated runs start from the same
+        # sym_buffer state.
         sym_buffer.x[:num_tokens].copy_(x_fp8[0])
         sym_buffer.x_sf[:num_tokens].copy_(x_fp8[1])
         sym_buffer.topk_idx[:num_tokens].copy_(topk_idx)

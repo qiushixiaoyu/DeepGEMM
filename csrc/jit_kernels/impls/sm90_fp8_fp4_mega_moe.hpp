@@ -50,102 +50,98 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
-        // A/B knob: decode two consecutive K/32 groups in one work item. Keep
+        // Decode two consecutive K/32 groups in one work item. Keep
         // this as a JIT-time specialization so the default helper does not
         // carry both code paths and pollute small-batch codegen.
         bool use_kg_pair_decode;
-        // A/B knob: reduce decoded-tile shared-store instruction count by
+        // Reduce decoded-tile shared-store instruction count by
         // writing two adjacent u64 outputs with one st.shared.v2.u64.
         bool use_vector_store_decode;
-        // A/B knob: when a UE8M0 SFB byte is zero, zero-fill the decoded
+        // When a UE8M0 SFB byte is zero, zero-fill the decoded
         // shared tile instead of building a scale LUT and unpacking FP4.
         bool use_skip_zero_sfb_decode;
-        // A/B knob: build the scaled E4M3 LUT in registers from UE8M0 instead
+        // Build the scaled E4M3 LUT in registers from UE8M0 instead
         // of loading the 64-bit LUT from constant memory.
         bool use_dynamic_lut_decode;
-        // A/B knob: bypass the constant LUT for the common UE8M0 scale values
+        // Bypass the constant LUT for the common UE8M0 scale values
         // seen in small-batch FP4 expert weights.
         bool use_common_lut_fast_path;
-        // A/B knob: decode one K/32 group at a time and let the math warpgroup
+        // Decode one K/32 group at a time and let the math warpgroup
         // consume each group immediately, overlapping the next group's decode
         // with the current WGMMA batch.
         bool use_kg_pipeline_decode;
-        // A/B knob for RS mode: Linear1 has one activation scale per 128-K
+        // RS mode: Linear1 has one activation scale per 128-K
         // block, so batch the four RS K/32 WGMMA slices into one commit/wait
         // and promote once instead of scaling every slice separately.
         bool use_rs_group_k_promote;
-        // A/B knob for RS mode: Linear2 keeps two independent K/32
+        // RS mode: Linear2 keeps two independent K/32
         // accumulators live so two WGMMAs can share one commit/wait.
         bool use_rs_l2_group_k2_promote;
-        // A/B knob for RS mode: read two contiguous floats at a time when
+        // RS mode: read two contiguous floats at a time when
         // converting the L1 RS accumulator scratch back to SS epilogue layout.
         bool use_rs_transpose_vec_load;
-        // A/B knob for RS mode: avoid writing/reading padding rows in the L1
+        // RS mode: avoid writing/reading padding rows in the L1
         // RS accumulator transpose bridge when an expert block has valid_m < 64.
         bool use_rs_guard_transpose_valid;
-        // A/B knob for RS mode: read adjacent activation scale pairs with one
+        // RS mode: read adjacent activation scale pairs with one
         // ld.shared.v2.f32 in the RS promote loops.
         bool use_rs_sfa_vec_load;
-        // A/B knob for RS mode: one row lane loads SFA and broadcasts to the
+        // RS mode: one row lane loads SFA and broadcasts to the
         // other row lanes with the same accumulator column.
         bool use_rs_sfa_bcast_load;
-        // A/B knob for RS mode: reuse one packed SFB uint32 across the four
+        // RS mode: reuse one packed SFB uint32 across the four
         // K/32 decode slices instead of reloading it for each byte.
         bool use_rs_sfb_word_reuse;
-        // A/B knob for RS mode: lanes with the same RS row consume the same
+        // RS mode: lanes with the same RS row consume the same
         // packed SFB word, so load it once per row and shuffle to the other
         // three column-pair lanes.
         bool use_rs_sfb_bcast_load;
-        // A/B knob for RS mode: stage packed SFB words in shared memory from
+        // RS mode: stage packed SFB words in shared memory from
         // the loader warp so math warpgroups do not repeatedly global-load SF.
         bool use_rs_stage_sfb;
-        // A/B knob for RS mode: adjacent lanes consume the low/high halves of
+        // RS mode: adjacent lanes consume the low/high halves of
         // the same packed FP4 word, so load once and shuffle within the pair.
         bool use_rs_decode_pair_shfl;
-        // A/B knob for RS mode: write L2 BF16 outputs directly from registers
+        // RS mode: write L2 BF16 outputs directly from registers
         // to the combine buffer, skipping the SMEM staging + vector scatter.
         bool use_rs_direct_l2_scatter;
         // Plan-C / humming decode: fold SFB exponent into the FP4 → E4M3 LUT.
-        // Keep as a JIT-time knob so we can A/B against Plan B (post-MMA
-        // promote) without recompiling the host runtime.
+        // Keep as a JIT-time specialization so the host runtime can select
+        // the decode strategy without recompilation.
         bool fuse_scale_b_humming_decode;
         // UE8M0 SFB uses pure power-of-two promote (exp_offset = e8m0 - 121).
         // Currently always true (DSV4 standard); exposed for parity with
-        // future FP32 SFB experiments.
+        // future FP32 SFB support.
         bool scale_b_pow2_promote;
-        // Experimental RS-mode plumbing. When enabled, the JIT instantiates a
-        // distinct kernel/config intended to keep decoded FP4 weight fragments
+        // RS mode instantiates a distinct kernel/config intended to keep
+        // decoded FP4 weight fragments
         // in registers instead of writing an E4M3 B tile back to shared memory.
         bool use_rs_mode;
-        // A/B knob for overlapping FP4 decode with WGMMA. When false, the math
+        // Overlap FP4 decode with WGMMA. When false, the math
         // warpgroup only waits on the decode barrier; non-epilogue warps do the
         // decode work and can run ahead through pipeline stages.
         bool math_wg_participates_in_fp4_decode;
-        // A/B knob: limit how many warps inside the math warpgroup help decode.
+        // Limit how many warps inside the math warpgroup help decode.
         // This keeps CTA size fixed while testing whether reducing math-side
         // non-tensor-core work improves WGMMA feed.
         int num_math_wg_decode_warps;
-        // A/B knob: skip early non-epilogue warps as FP4 decode helpers.
+        // Skip early non-epilogue warps as FP4 decode helpers.
         // 0 keeps the existing 4 assist warps; 2 skips the two TMA loader
         // warps; 4 leaves all decode work to the math warpgroup.
         int first_fp4_decode_assist_warp;
-        // A/B knob: split packed-B readiness from the A+B full barrier so the
+        // Split packed-B readiness from the A+B full barrier so the
         // assist warps can start FP4 decode while A/SFA TMA is still in flight.
         bool use_early_b_decode;
-        // A/B knob: replace the FP4 decode rendezvous sync with a per-stage
+        // Replace the FP4 decode rendezvous sync with a per-stage
         // mbarrier so assist warps can run ahead after publishing a decoded tile.
         bool use_decode_done_mbarrier;
-        // A/B knob: mirror the FP8 split-MN arrival-counter path for FP4 L1->L2
+        // Mirror the FP8 split-MN arrival-counter path for FP4 L1->L2
         // readiness, avoiding the bitmask update's CTA-wide epilogue sync.
         bool use_l2_arrival_counter;
-        // A/B knob: skip the trailing L2 epilogue CTA sync and rely on the
+        // Skip the trailing L2 epilogue CTA sync and rely on the
         // following NVLink/grid synchronization when it is sufficient.
         bool skip_l2_epilogue_sync;
-        // Debug-only instrumentation. This is a JIT-time knob so normal
-        // performance builds do not carry clock64 instructions or hot-path
-        // branches.
-        bool use_clock_profile;
-        // A/B knob: split each SS N=128 WGMMA into two N=64 WGMMAs so the
+        // Split each SS N=128 WGMMA into two N=64 WGMMAs so the
         // per-K-block accumulator is 32 floats instead of 64. This targets the
         // 2-WG split-M path's structural accum spill while leaving defaults off.
         bool use_ss_nsplit;
@@ -168,7 +164,6 @@ public:
         CUtensorMap tensor_map_l2_acts_sf;
         CUtensorMap tensor_map_l2_weights;
         const uint32_t* l2_weights_sf;
-        uint64_t* fp4_clock_profile;
 
         // Launch configs
         LaunchArgs launch_args;
@@ -180,7 +175,6 @@ public:
 
 using namespace deep_gemm;
 
-// JIT cache version: sm90_fp8_fp4_mega_moe_split_n_v3_l2counter
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm90_fp8_fp4_mega_moe_impl<
         {},
@@ -214,7 +208,6 @@ static void __instantiate_kernel() {{
         {},
         {},
         {}, {},
-        {},
         {},
         {},
         {},
@@ -265,7 +258,6 @@ static void __instantiate_kernel() {{
     args.use_decode_done_mbarrier ? "true" : "false",
     args.use_l2_arrival_counter ? "true" : "false",
     args.skip_l2_epilogue_sync ? "true" : "false",
-    args.use_clock_profile ? "true" : "false",
     args.use_ss_nsplit ? "true" : "false");
     }
 
@@ -283,8 +275,7 @@ static void __instantiate_kernel() {{
             args.tensor_map_l2_acts,
             args.tensor_map_l2_acts_sf,
             args.tensor_map_l2_weights,
-            args.l2_weights_sf,
-            args.fp4_clock_profile
+            args.l2_weights_sf
         ));
     }
 };
@@ -330,7 +321,6 @@ static void sm90_fp8_fp4_mega_moe(
     const bool& use_decode_done_mbarrier = false,
     const bool& use_l2_arrival_counter = false,
     const bool& skip_l2_epilogue_sync = false,
-    const std::optional<torch::Tensor>& fp4_clock_profile = std::nullopt,
     const bool& use_ss_nsplit = false
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
@@ -438,10 +428,6 @@ static void sm90_fp8_fp4_mega_moe(
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
     if (cumulative_local_expert_recv_stats.has_value())
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
-    uint64_t* fp4_clock_profile_ptr = nullptr;
-    if (fp4_clock_profile.has_value())
-        fp4_clock_profile_ptr = reinterpret_cast<uint64_t*>(fp4_clock_profile->data_ptr<int64_t>());
-
     // Launch
     const auto num_sms = device_runtime->get_num_sms();
     const SM90FP8FP4MegaMoERuntime::Args args = {
@@ -478,7 +464,6 @@ static void sm90_fp8_fp4_mega_moe(
         .use_decode_done_mbarrier = use_decode_done_mbarrier,
         .use_l2_arrival_counter = use_l2_arrival_counter,
         .skip_l2_epilogue_sync = skip_l2_epilogue_sync,
-        .use_clock_profile = fp4_clock_profile_ptr != nullptr,
         .use_ss_nsplit = use_ss_nsplit,
         .config = config,
         .y = y.data_ptr(),
@@ -494,14 +479,11 @@ static void sm90_fp8_fp4_mega_moe(
         .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
         .tensor_map_l2_weights = tensor_map_l2_weights,
         .l2_weights_sf = reinterpret_cast<const uint32_t*>(l2_weights_sf.data_ptr()),
-        .fp4_clock_profile = fp4_clock_profile_ptr,
         .launch_args = LaunchArgs(num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, config.cluster_size)
     };
     const auto code = SM90FP8FP4MegaMoERuntime::generate(args);
-    const auto runtime_name = use_rs_mode
-        ? (args.use_clock_profile ? "sm90_fp8_fp4_mega_moe_rs_clock_profile" : "sm90_fp8_fp4_mega_moe_rs")
-        : (args.use_clock_profile ? "sm90_fp8_fp4_mega_moe_clock_profile" : "sm90_fp8_fp4_mega_moe");
+    const auto runtime_name = use_rs_mode ? "sm90_fp8_fp4_mega_moe_rs" : "sm90_fp8_fp4_mega_moe";
     const auto runtime = compiler->build(runtime_name, code);
     SM90FP8FP4MegaMoERuntime::launch(runtime, args);
 }

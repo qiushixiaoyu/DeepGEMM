@@ -214,8 +214,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      recipe: Tuple[int, int, int] = (1, 1, 32),
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
-                     fast_math: bool = True,
-                     fp4_clock_profile: Optional[torch.Tensor] = None):
+                     fast_math: bool = True):
     (l1_weights_data, l1_weights_sf) = l1_weights
     (l2_weights_data, l2_weights_sf) = l2_weights
     common_args = (
@@ -231,15 +230,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         activation, activation_clamp,
         fast_math,
     )
-    if fp4_clock_profile is None:
-        try:
-            _C.fp8_fp4_mega_moe(*common_args, None)
-        except TypeError as exc:
-            if 'Mismatched number of arguments' not in str(exc):
-                raise
-            _C.fp8_fp4_mega_moe(*common_args)
-    else:
-        _C.fp8_fp4_mega_moe(*common_args, fp4_clock_profile)
+    _C.fp8_fp4_mega_moe(*common_args)
 
 
 def mega_moe_pre_dispatch(x: torch.Tensor,

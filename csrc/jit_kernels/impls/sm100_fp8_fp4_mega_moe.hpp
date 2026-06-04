@@ -25,14 +25,14 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
-        // Stream A0.1: enable FP4 (E2M1) activations from L1 epilogue.
+        // Enable FP4 (E2M1) activations from L1 epilogue.
         // Default false — keeps the FP8-acts baseline byte-identical.
         bool use_fp4_acts;
-        // Stream A0.5: when set, run kind::mxf4 (K=64 dense) instead of
+        // When set, run kind::mxf4 (K=64 dense) instead of
         // kind::mxf8f6f4 (K=32 with-padding) for both L1 and L2 mainloops.
         // Only honored when `use_fp4_acts` is also set.
         bool use_mxf4_kind;
-        // Stream B (combine path): when set, the L2 epilogue writes FP8 E4M3
+        // When set, the L2 epilogue writes FP8 E4M3
         // + per-(token,N=128) UE8M0 SF over NVLink instead of BF16. The
         // combine reduce dequantizes on the fly. Halves NVLink bytes/token
         // on the second a2a (kHidden + kHidden/128 vs kHidden*2).
@@ -147,7 +147,7 @@ static void sm100_fp8_fp4_mega_moe(
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
-    // Stream A0.5 sanity: kind::mxf4 only accepts FP4 inputs.
+    // kind::mxf4 only accepts FP4 inputs.
     DG_HOST_ASSERT(not use_mxf4_kind or use_fp4_acts);
 
     // Heuristics
@@ -158,7 +158,7 @@ static void sm100_fp8_fp4_mega_moe(
 
     // Make tensormap
     constexpr int kGranK = 32;
-    // Stream A0.5: when `use_mxf4_kind` is on, BOTH L1 and L2 acts AND
+    // When `use_mxf4_kind` is on, BOTH L1 and L2 acts AND
     // weights TMA descriptors switch from `_ALIGN16B` (FP4 with-padding,
     // 8 data + 8 pad bytes per 16-byte atom) to `_ALIGN8B` (dense FP4,
     // 2 nibbles/byte). The smem byte stride per K-row halves accordingly,
@@ -170,13 +170,13 @@ static void sm100_fp8_fp4_mega_moe(
                                            : config.swizzle_acts_mode;
     const int swizzle_weights = use_mxf4_kind ? config.swizzle_weights_mode / 2
                                               : config.swizzle_weights_mode;
-    // Stream A0.0b: when `use_fp4_acts` is on, the L1 token pool buffer
+    // When `use_fp4_acts` is on, the L1 token pool buffer
     // (`l1_acts`) is already viewed as `kPackedFP4` (int8) by the symm-buffer
     // slice (see `csrc/apis/mega.hpp`), with shape `[num_pool_tokens, hidden/2]`
     // of packed E2M1 (low nibble = even col, high nibble = odd col).
     // `make_tma_2d_desc` then auto-selects `CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B`
     // via `aten_dtype_to_tensor_map_dtype` (runtime_utils.hpp:84-87) — or
-    // `_ALIGN8B` under `use_mxf4_kind` (Stream A0.5).
+    // `_ALIGN8B` under `use_mxf4_kind`.
     //
     // TMA descriptor: `gmem_inner_dim = hidden` U4 elements (the descriptor
     // reads `hidden/2` storage bytes per row); smem inner box `BLOCK_K = 128`
@@ -209,15 +209,15 @@ static void sm100_fp8_fp4_mega_moe(
     // Post-SwiGLU output has half the N width (`BLOCK_N / 2` per input tile),
     // so the swizzle mode is also halved (128 -> 64).
     //
-    // Stream A0.2: when `use_fp4_acts` is on, the L1 epilogue emits packed
+    // When `use_fp4_acts` is on, the L1 epilogue emits packed
     // E2M1 (FP4) where each byte holds 2 elements. The kernel writes a
     // **dense canonical** smem layout (no swizzle XOR) — see the FP4 store
     // branch in `sm100_fp8_fp4_mega_moe.cuh`. To match, we build the L1
     // output TMA descriptor with `swizzle = 0`. The gmem result is the
     // canonical `[M, intermediate_hidden / 2]` packed FP4 layout, byte-
-    // identical to what `kernels/fused_gemm_swiglu_fp4_quant_1cta` produces
-    // (Stream A2). The L2 reader (built below) consumes this same canonical
-    // layout via `_ALIGN16B`. The per-row gmem byte footprint halves
+    // identical to what `kernels/fused_gemm_swiglu_fp4_quant_1cta` produces.
+    // The L2 reader (built below) consumes this same canonical layout via
+    // `_ALIGN16B`. The per-row gmem byte footprint halves
     // (`intermediate_hidden / 2` bytes vs `intermediate_hidden` for FP8);
     // outer stride in the underlying buffer is unchanged.
     const auto tensor_map_l1_output = use_fp4_acts
@@ -231,7 +231,7 @@ static void sm100_fp8_fp4_mega_moe(
                            config.block_n / 2, config.store_block_m,
                            static_cast<int>(l2_acts.stride(-2)),
                            config.swizzle_acts_mode / 2);
-    // Stream A0.2: when FP4 acts on, L2 reads packed E2M1 via `_ALIGN16B`.
+    // When FP4 acts are enabled, L2 reads packed E2M1 via `_ALIGN16B`.
     // `make_tma_2d_desc` selects the descriptor dtype from the source
     // tensor's `scalar_type`; `l2_acts` is allocated as FP8 (1 byte/elem).
     // For the FP4 path we re-view the same byte buffer as `kPackedFP4` so

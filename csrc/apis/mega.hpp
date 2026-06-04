@@ -71,7 +71,7 @@ get_symm_buffer_size_for_mega_moe(
     // Workspace bytes
     const auto workspace = layout::Workspace(nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk);
 
-    // Stream A0.0b: when `DG_USE_FP4_ACTS=1`, the symmetric `x` slot and the
+    // When `DG_USE_FP4_ACTS=1`, the symmetric `x` slot and the
     // L1 token pool both hold packed E2M1 (FP4) instead of dense E4M3 (FP8).
     // The per-token byte footprint halves; the SF slot is unchanged
     // (`hidden/32` UE8M0 bytes — same `gran_k=32` for FP4 and FP8 acts under
@@ -81,7 +81,7 @@ get_symm_buffer_size_for_mega_moe(
     const bool host_use_fp4_acts = get_env<int>("DG_USE_FP4_ACTS") != 0;
     const int input_token_bytes = host_use_fp4_acts ? (hidden / 2) : hidden;
 
-    // Stream B (combine path): when `DG_USE_FP8_COMBINE=1`, the combine slot
+    // When `DG_USE_FP8_COMBINE=1`, the combine slot
     // holds FP8 E4M3 (kHidden bytes/token) + a separate combine_sf slot
     // holding UE8M0 SF bytes (kHidden/128 bytes/token, gran_k=128). When off,
     // the combine slot holds BF16 (kHidden*2 bytes/token) and combine_sf is
@@ -114,8 +114,8 @@ get_symm_buffer_size_for_mega_moe(
     //     `intermediate_hidden / 32` bytes (per-32 K).
     //   * SM90 stores per-64 K floats so that each L1 epilogue block (which
     //     produces 64 post-SwiGLU columns) can write its own SF independently
-    //     without cross-CTA amax synchronisation.  The experimental SM90 FP4
-    //     BLOCK_N=64 mode produces 32 post-SwiGLU columns per L1 block, so its
+    //     without cross-CTA amax synchronisation. SM90 FP4 BLOCK_N=64 mode
+    //     produces 32 post-SwiGLU columns per L1 block, so its
     //     L2 SF view also switches to per-32.
     const int fp8_intermediate_sf_bytes_per_token =
         is_sm90 ? (intermediate_hidden * static_cast<int>(sizeof(float)) / sm90_l2_act_sf_gran_k)
@@ -190,7 +190,7 @@ get_symm_buffer_size_for_mega_moe(
     // Slice function: creates `(x, x_sf, topk_weights, topk_idx, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf)` tensor views from the raw buffer
     // NOTES: `x_sf` is K-major, while `l1_acts_sf` and `l2_acts_sf` are M-major
     //        Dtype is per-arch (see `sf_dtype` above): float on SM90, int (packed UE8M0) on SM100.
-    // Stream A0.0b: under `host_use_fp4_acts`, the `x` and `l1_acts` views
+    // Under `host_use_fp4_acts`, the `x` and `l1_acts` views
     // expose packed E2M1 (`kPackedFP4` = `torch::kInt8`, 2 elements/byte) of
     // shape `[..., hidden / 2]`. Underlying buffer bytes are the same as the
     // sized `fp8_token_layout` slot, just half the row width.
@@ -248,8 +248,7 @@ static void fp8_fp4_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math,
-    const std::optional<torch::Tensor>& fp4_clock_profile = std::nullopt
+    const bool& fast_math
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -301,13 +300,6 @@ static void fp8_fp4_mega_moe(
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
     }
-    if (fp4_clock_profile.has_value()) {
-        DG_HOST_ASSERT(fp4_clock_profile->is_cuda());
-        DG_HOST_ASSERT(fp4_clock_profile->scalar_type() == torch::kInt64);
-        DG_HOST_ASSERT(fp4_clock_profile->is_contiguous());
-        DG_HOST_ASSERT(fp4_clock_profile->numel() >= 16);
-    }
-
     // Check buffer bytes
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
@@ -322,19 +314,18 @@ static void fp8_fp4_mega_moe(
     // Already registered tensors
     const auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
 
-    // Stream A0.1: pick up FP4-acts flag from `DG_USE_FP4_ACTS` env var.
+    // Pick up FP4-acts flag from `DG_USE_FP4_ACTS` env var.
     // Default off — preserves byte-identical FP8-acts behavior. Setting
     // `DG_USE_FP4_ACTS=1` flips L1's epilogue quant to E2M1 + UE8M0 SF.
     const bool use_fp4_acts = get_env<int>("DG_USE_FP4_ACTS") != 0;
-    // Stream A0.5: when also `DG_USE_MXF4_KIND=1`, the L1 and L2 mainloops
+    // When also `DG_USE_MXF4_KIND=1`, the L1 and L2 mainloops
     // run `tcgen05.mma.kind::mxf4.block_scale.block32` instead of
     // `kind::mxf8f6f4` — K=64 dense per call (vs K=32 with-padding), dense
     // FP4 smem (`_ALIGN8B`, half the byte footprint), scale_vec::2X SF
     // protocol with HALF-WORD address bits. Only honored when
-    // `DG_USE_FP4_ACTS=1` (kind::mxf4 is FP4-only). See A6 capstone /
-    // B2 standalone GEMM for the +20-22% headline.
+    // `DG_USE_FP4_ACTS=1` (kind::mxf4 is FP4-only).
     const bool use_mxf4_kind = use_fp4_acts and get_env<int>("DG_USE_MXF4_KIND") != 0;
-    // Stream B (combine path): when `DG_USE_FP8_COMBINE=1`, the L2 epilogue
+    // When `DG_USE_FP8_COMBINE=1`, the L2 epilogue
     // ships FP8 E4M3 + per-(token, N=128) UE8M0 SF over NVLink instead of
     // BF16. The combine reduce dequantizes on the fly. NVLink bytes/token
     // halve (from kHidden*2 → kHidden + kHidden/128). Independent of the
@@ -359,91 +350,41 @@ static void fp8_fp4_mega_moe(
                                use_fp4_acts, use_mxf4_kind, use_fp8_combine);
     } else if (arch_major == 9) {
         // SM90 (Hopper): FP8 acts × FP4 weights. Default is decode-to-SMEM
-        // SS-mode WGMMA; `DG_SM90_FP4_RS_MODE=1` routes through the experimental
+        // SS-mode WGMMA; `DG_SM90_FP4_RS_MODE=1` routes through the
         // RS-mode JIT/config plumbing. The activation a2a stays FP8 (no
         // `use_fp4_acts` on SM90 yet — there is no native FP4 WGMMA on Hopper,
         // and FP4 acts would still need a per-tile dequant pass that bottlenecks
-        // on smem write bandwidth). The combine path likewise stays BF16
-        // (Stream B is SM100-only).
+        // on smem write bandwidth). The combine path likewise stays BF16.
         DG_HOST_ASSERT(not use_fp4_acts and not use_mxf4_kind and not use_fp8_combine);
         const bool fuse_scale_b_humming_decode =
             get_env<int>("DG_SM90_FP4_FUSE_SCALE_B_HUMMING_DECODE") != 0;
         const bool use_rs_mode = get_env<int>("DG_SM90_FP4_RS_MODE") != 0;
         const float expected_tokens_per_expert =
             static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-        // D3 H20 result: for the high-occupancy b16/b32 band the decode-lookahead
-        // path wins big -- b16 -22.7%, b32 -20.9%. It combines three knobs that
-        // must move together: (1) a one-way decode_done mbarrier so decode-assist
-        // warps no longer rendezvous with the math warpgroup every stage and can
-        // run AHEAD, decoding stage S+1 while WGMMA consumes stage S; (2) the math
-        // warpgroup as a pure WGMMA consumer (no decode); (3) crucially, the two
-        // TMA/SFB loader warps are EXCLUDED from decode-assist so only the 4 idle
-        // non-epilogue warps decode ahead. Letting the loaders also lookahead
-        // (D-full) blew up full_wait (80->328 cyc/block) and the decode
-        // rendezvous (b32 +384%) because they fall behind on TMA issue. With the
-        // loaders skipped (D-skip), decode_total drops 522->130 cyc/block and
-        // hides entirely in the ~928-cyc WGMMA shadow.
+        // Decode lookahead uses a one-way decode_done mbarrier, keeps the math
+        // warpgroup as a pure WGMMA consumer, and excludes loader warps from
+        // decode-assist so they stay on the TMA/SFB producer path.
         const bool fp4_decode_lookahead_band =
             !use_rs_mode and
             expected_tokens_per_expert >= 3.0f and expected_tokens_per_expert <= 6.0f;
-        // D7 H20: the same D-skip three-knob lookahead also wins big at the
-        // higher 1-WG occupancy band -- b64 (expected=12) -22.18%, b128
-        // (expected=24) -22.11%, and the one-way mbarrier is slightly better
-        // than without (-22% vs -20%). b256 (expected=48) does NOT benefit
-        // (D_skip +20.5% there): by that occupancy the 4 idle assist warps can
-        // no longer decode a full stage ahead before WGMMA needs it, so the
-        // band stops at 24.0. b48 (expected=9) has no standard batch size, so
-        // the (6,12) gap is empty and harmless.
+        // At higher one-warpgroup occupancy, lookahead is useful only while
+        // assist warps can decode a full stage before WGMMA consumes it.
         const bool fp4_bigband_lookahead_band =
             !use_rs_mode and
             expected_tokens_per_expert >= 12.0f and expected_tokens_per_expert <= 24.0f;
-        // b16/b32 -- WGMMA ~949 cyc/block dominates and the ~497-cyc decode sits
-        // on the critical path. Taking decode off the math warpgroup AND skipping
-        // the two TMA/SFB loader warps (so only the 4 idle non-epilogue warps
-        // decode, hiding in the WGMMA shadow) is a clean -22.39% there. It does
-        // NOT use the one-way mbarrier (that lookahead band starts at 3.0). b2
-        // (expected=0.375) is excluded: its profile is full_wait-bound
-        // (~1048 cyc/block TMA/scheduling), so decode knobs do not help and
-        // math-off even regresses it +10.8%. The (>0.375, <1.0) window captures
-        // only the discrete b4=0.75 point.
+        // Low-occupancy decode offload uses assist warps for FP4 decode while
+        // keeping loader warps on the producer path.
         const bool fp4_b4_skip_decode_band =
             !use_rs_mode and
             expected_tokens_per_expert >= 0.5f and expected_tokens_per_expert < 1.0f;
-        // D9 H20: the 2-WG split-MN path (block_m=128, num_epilogue_threads=256,
-        // the auto_split_mn branch that engages once expected>=64) is
-        // register-pressured -- the math warpgroup carries FP4 decode + the
-        // WGMMA accum live-range + the final_accum promotion all at once and
-        // spills (88B stack / 204B+252B spill on b512). Taking decode OFF the
-        // math warpgroup (pure WGMMA consumer; decode runs on the assist warps)
-        // cuts the spill (88/204/252 -> 80/184/224) and wins -9.1% (b512) /
-        // -11.0% (b1024) with accuracy intact (diff 6e-4 << 0.07). Unlike the
-        // 1-WG lookahead bands this needs NEITHER skip-loader NOR the mbarrier
-        // (the measured win was math-off ALONE; partial WARPS=2 matched base, so
-        // it must be a FULL offload). Gate on expected>=64 only so the carefully
-        // tuned 1-WG b1..b256 defaults stay untouched (b256 expected=48 < 64).
+        // The 2-WG split-MN path is register-pressured, so decode is fully
+        // offloaded from the math warpgroup once that path is selected.
         const bool fp4_2wg_decode_offload_band =
             !use_rs_mode and expected_tokens_per_expert >= 64.0f;
         const bool default_math_wg_decode =
-            // D2b H20 A/B: taking FP4 decode off the math warpgroup (so it is a
-            // pure WGMMA consumer and the decode hides in the WGMMA shadow) is a
-            // large win at LOW expert occupancy -- b1 -15.5%, b8 -21.7% -- where
-            // the dispatch/loader assist warps have spare capacity to decode the
-            // packed-B tile on their own. At HIGHER occupancy (b16/b32) those
-            // assist warps are saturated by TMA/SFB production, so the math
-            // warpgroup stalls on the decode-done rendezvous (b32 rendezvous
-            // +347%) and the kernel regresses. Keep math-warp decode ON by
-            // default, and only turn it OFF in the measured low-occupancy bands:
-            //   * b1 (<0.375) and b8 ([1.0,2.0)) -- D2b/D2c, math as pure consumer;
-            //   * b4 ([0.5,1.0), fp4_b4_skip_decode_band) -- D5, only wins once
-            //     paired with skip-loader (B_skip -22.4%); math-off alone did not;
-            //   * b16/b32 ([3.0,6.0], fp4_decode_lookahead_band) -- D3 lookahead,
-            //     math runs as a pure WGMMA consumer.
-            //   * b64/b128 ([12.0,24.0], fp4_bigband_lookahead_band) -- D7, same
-            //     D-skip lookahead at higher 1-WG occupancy.
-            // b2 (0.375) is deliberately excluded: it is full_wait-bound, not
-            // decode-bound, and math-off regresses it +10.8%.
-            //   * b512+ (expected>=64, fp4_2wg_decode_offload_band) -- D9, the
-            //     2-WG split-MN path; math-off alone cuts spill and wins -9~11%.
+            // Turn math-WG decode off only in occupancy bands where assist
+            // warps can hide FP4 decode behind WGMMA or where split-MN
+            // accumulator pressure benefits from full decode offload.
             !use_rs_mode and
             ((expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f) or
              (expected_tokens_per_expert >= 1.0f and expected_tokens_per_expert < 2.0f) or
@@ -457,15 +398,8 @@ static void fp8_fp4_mega_moe(
                          math_wg_participates_in_fp4_decode ? 4 : 0);
         const bool default_skip_loader_decode_assist =
             // The two loader-side non-epilogue warps are on the TMA/SFB
-            // producer path. H20 A/B showed leaving them out of FP4 decode is
-            // a repeatable win where decode can hide behind WGMMA, but b2 and
-            // b256+ regress where raw decode parallelism matters more. Skip the
-            // loaders (only the 4 idle warps decode) in the measured bands:
-            //   * b1 (<0.375) and b8 ([1.5,3.0)) -- D2c;
-            //   * b4 ([0.5,1.0), fp4_b4_skip_decode_band) -- D5 B_skip -22.4%;
-            //   * b16/b32 ([3.0,6.0], fp4_decode_lookahead_band) -- D3 requires
-            //     skip-loader so only the 4 idle warps decode ahead.
-            //   * b64/b128 ([12.0,24.0], fp4_bigband_lookahead_band) -- D7.
+            // producer path. Skip them in bands where decode can hide behind
+            // WGMMA with the remaining assist warps.
             !use_rs_mode and
             ((expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f) or
              (expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f) or
@@ -496,15 +430,13 @@ static void fp8_fp4_mega_moe(
         const bool use_rs_l2_group_k2_promote =
             get_env<int>("DG_SM90_FP4_RS_L2_GROUP_K2_PROMOTE", 0) != 0;
         const bool default_rs_transpose_vec_load =
-            // Paired A/B on H20 showed this is a stable tiny-batch win for
-            // batch/rank 1 and 2, but it regresses or becomes noisy at 4+.
+            // Tiny-batch RS mode benefits from vectorized transpose readback.
             use_rs_mode and num_tokens <= 2;
         const bool use_rs_transpose_vec_load =
             get_env<int>("DG_SM90_FP4_RS_TRANSPOSE_VEC_LOAD",
                          default_rs_transpose_vec_load ? 1 : 0) != 0;
         const bool default_rs_guard_transpose_valid =
-            // A/B on H20 showed the extra valid-row predicates regress small
-            // batches. Keep the knob for diagnostics, but leave it off by default.
+            // Extra valid-row predicates are left off by default.
             false;
         const bool use_rs_guard_transpose_valid =
             get_env<int>("DG_SM90_FP4_RS_GUARD_TRANSPOSE_VALID",
@@ -521,8 +453,7 @@ static void fp8_fp4_mega_moe(
             get_env<int>("DG_SM90_FP4_RS_SFA_BCAST_LOAD", 0) != 0;
         const bool default_rs_sfb_word_reuse =
             // One packed UE8M0 word feeds four RS K/32 slices. Reusing it
-            // cuts repeated SFB global loads without increasing ptxas
-            // register count or spill in small-batch RS A/B runs.
+            // cuts repeated SFB global loads in small-batch RS mode.
             use_rs_mode and num_tokens <= 16;
         const bool use_rs_sfb_word_reuse =
             get_env<int>("DG_SM90_FP4_RS_SFB_WORD_REUSE",
@@ -538,8 +469,7 @@ static void fp8_fp4_mega_moe(
             get_env<int>("DG_SM90_FP4_RS_STAGE_SFB",
                          default_rs_stage_sfb ? 1 : 0) != 0;
         const bool default_rs_decode_pair_shfl =
-            // Accuracy is clean, but ptxas spills 8B with pair-shuffle on the
-            // current RS kernel. Keep this as a diagnostic knob, not a default.
+            // Pair-shuffle currently increases register pressure in RS mode.
             false;
         const bool use_rs_decode_pair_shfl =
             get_env<int>("DG_SM90_FP4_RS_DECODE_PAIR_SHFL",
@@ -547,61 +477,44 @@ static void fp8_fp4_mega_moe(
         const bool use_rs_direct_l2_scatter =
             get_env<int>("DG_SM90_FP4_RS_DIRECT_L2_SCATTER", 0) != 0;
         const bool default_ss_early_b_decode =
-            // SS decode-to-SMEM A/B on H20 showed early packed-B decode helps
-            // the sparse b8-b16 band and the high b32-b128 band. Keep b1-b4
-            // off where dispatch/scheduler overhead dominates.
+            // Early packed-B decode helps when there is enough FP4 work to
+            // overlap with A/SFA TMA, but stays off for very small batches.
             !use_rs_mode and
             ((expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert <= 3.0f) or
              (expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert <= 24.0f));
         const bool default_early_b_decode =
-            // RS A/B on DSV4 small batches showed real packed-B/activation
-            // overlap is useful across batch/rank 1..16 once the RS kernel
-            // waits the split barriers correctly.
+            // RS mode uses early packed-B decode for small batches where it can
+            // overlap with activation readiness.
             (use_rs_mode and num_tokens > 0 and num_tokens <= 16) or
             default_ss_early_b_decode;
         const bool use_early_b_decode =
             get_env<int>("DG_SM90_FP4_EARLY_B_DECODE", default_early_b_decode ? 1 : 0) != 0;
         const bool default_decode_done_mbarrier =
-            // H20 paired runs showed the extra one-way decode mbarrier hurts
-            // the current SS early-B/stage5 path at LOW occupancy (especially
-            // b8), so it stays off there. But at HIGH occupancy it is exactly
-            // what unlocks decode lookahead: D3 measured b16 -22.7% / b32 -20.9%
-            // once the arrive-count deadlock was fixed. Enable it by default only
-            // in the validated b16/b32 lookahead band; the env knob still
-            // overrides for diagnostics elsewhere.
-            // D7: the b64/b128 bigband lookahead (expected 12..24) also wins with
-            // the mbarrier on (-22% vs -20% without), so OR it in.
+            // Enable the one-way decode mbarrier only in lookahead bands where
+            // assist warps can publish decoded stages ahead of the math WG.
             fp4_decode_lookahead_band or fp4_bigband_lookahead_band;
         const bool use_decode_done_mbarrier =
             get_env<int>("DG_SM90_FP4_DECODE_MBARRIER",
                          default_decode_done_mbarrier ? 1 : 0) != 0;
         const bool default_l2_arrival_counter =
-            // Narrow H20 A/B win: b2 benefits when paired with the skipped
-            // post-scatter sync. After the stage6 decode heuristic, b16 was
-            // faster without the counter; keep this as an override-only knob
-            // outside the b2 band.
+            // Use a lightweight arrival counter only in the small band where it
+            // pairs with the skipped post-scatter sync.
             !use_rs_mode and
             expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f;
         const bool use_l2_arrival_counter =
             get_env<int>("DG_SM90_FP4_L2_ARRIVAL_COUNTER",
                          default_l2_arrival_counter ? 1 : 0) != 0;
         const bool default_skip_l2_epilogue_sync =
-            // b2 pairs well with L2ArrivalCounter. b4 was too noisy/regressive
-            // after rebuilding the current branch, so keep the skipped sync out
-            // of the 0.75 token/expert band.
+            // This is only enabled for the small-token band where the following
+            // grid/NVLink synchronization already orders the L2 scatter.
             !use_rs_mode and
             expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f;
         const bool skip_l2_epilogue_sync =
             get_env<int>("DG_SM90_FP4_SKIP_L2_EPILOGUE_SYNC",
                          default_skip_l2_epilogue_sync ? 1 : 0) != 0;
-        // D13 (verified 20260602): the SS N-split replaces each N=128 WGMMA
-        // with two N=64 WGMMAs so the per-K-block accum is 32 floats instead
-        // of 64, removing the 2-WG `final_accum[64]+accum[64]==128-reg` spill.
-        // ON cleared the spill (128 regs, 0 stack frame) and beat FP8 normal
-        // across b512-b4096 (1.13x/1.13x/1.14x/1.15x gain over OFF). Default ON
-        // for the 2-WG split-M path (expected >= 64). The kernel-side
-        // `kSSNSplitActive` gate (WG_BLOCK_N==128 && >1 epilogue warpgroup)
-        // keeps the 1-WG winning path (b1-b256) inert regardless of this flag.
+        // SS N-split replaces each N=128 WGMMA with two N=64 WGMMAs, reducing
+        // per-K-block accumulator pressure on the 2-WG split-M path. The
+        // kernel-side `kSSNSplitActive` gate keeps single-WG shapes inert.
         const bool default_use_ss_nsplit =
             !use_rs_mode and expected_tokens_per_expert >= 64.0f;
         const bool use_ss_nsplit =
@@ -646,16 +559,11 @@ static void fp8_fp4_mega_moe(
                               use_decode_done_mbarrier,
                               use_l2_arrival_counter,
                               skip_l2_epilogue_sync,
-                              fp4_clock_profile,
                               use_ss_nsplit);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
 
-    // Zero the entire symmetric buffer for debug mode
-    // NOTES: caller must re-copy inputs into the buffer before each kernel call
-    if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
-        sym_buffer.zero_();
 }
 
 // SM90 (Hopper) FP8 MegaMoE entry point.
@@ -760,8 +668,6 @@ static void fp8_mega_moe(
                      hidden, intermediate_hidden,
                      activation_clamp, fast_math);
 
-    if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
-        sym_buffer.zero_();
 }
 
 static void register_apis(pybind11::module_& m) {
@@ -779,8 +685,7 @@ static void register_apis(pybind11::module_& m) {
              const std::tuple<int, int, int>& recipe,
              const std::string& activation,
              const std::optional<float>& activation_clamp_opt,
-             const bool& fast_math,
-             const std::optional<torch::Tensor>& fp4_clock_profile) {
+             const bool& fast_math) {
               fp8_fp4_mega_moe(
                   y,
                   std::make_tuple(l1_weights, l1_weights_sf),
@@ -788,8 +693,7 @@ static void register_apis(pybind11::module_& m) {
                   cumulative_local_expert_recv_stats,
                   sym_buffer, sym_buffer_ptrs, rank_idx,
                   num_max_tokens_per_rank, num_experts, num_topk,
-                  recipe, activation, activation_clamp_opt, fast_math,
-                  fp4_clock_profile);
+                  recipe, activation, activation_clamp_opt, fast_math);
           });
     m.def("mega_moe_pre_dispatch", &mega_moe_pre_dispatch,
           pybind11::arg("x"),

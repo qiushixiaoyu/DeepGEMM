@@ -1,30 +1,27 @@
-# Stream A0.2.1 sentinel-pattern probe — verifies the L1 epilogue's FP4 store
-# byte layout matches the canonical packed layout the L2 phase reads.
+# L1 FP4 store layout check. Verifies the L1 epilogue's FP4 store byte
+# layout matches the canonical packed layout the L2 phase reads.
 #
 # Methodology:
-#   - Run the kernel with FP8 acts → dump l2_acts and decode FP8 → fp32.
-#   - Run with FP4 acts → dump l2_acts (now packed E2M1) and decode → fp32.
+#   - Run the kernel with FP8 acts, read l2_acts, and decode FP8 -> fp32.
+#   - Run with FP4 acts, read l2_acts (now packed E2M1), and decode -> fp32.
 #   - Both paths share the same scheduler / dispatch / SwiGLU math, so the
 #     dequantized values should agree to within FP4 quant noise (~5-10% rel
-#     error per cell, much less in row-mean magnitude). The slot-permutation
-#     ambiguity that plagued A0.1's harness is sidestepped by using the
-#     end-to-end `y` comparison: y is indexed by global (token, hidden) so
-#     the kernel's atomicAdd-based dispatch slot order doesn't enter the
-#     metric.
+#     error per cell, much less in row-mean magnitude). The end-to-end `y`
+#     comparison avoids slot-permutation ambiguity because y is indexed by
+#     global (token, hidden).
 #
-# Why this is "sentinel-pattern":
+# Layout detail:
 #   The MMA TMEM accumulator for each (frag = T%4, group = T/4) lane carries
 #   4 fp32 values that map to a 2x2 block of the smem CD output (rows
 #   {2*frag, 2*frag+1} × cols {T/4, T/4+8} within the warp's 16-byte stripe).
 #   This is the empirical layout of `stmatrix.m16n8.x1.trans.b8` (verified by
-#   a probe in the kernels-repo) used by the FP8 path. The original Stream
-#   A0.2 FP4 store assumed lane T's 4 fp32s are 4 contiguous N-cols in one
-#   row — which is wrong, and produced rel-RMSE = 1.41 (well above the
-#   ≤0.5 target). Stream A0.2.1 fixes the FP4 store with `__shfl_xor_sync 4`
-#   to combine adjacent-col values into FP4 bytes.
+#   the kernels-repo layout check) used by the FP8 path. A naive FP4 store that
+#   treats lane T's 4 fp32s as 4 contiguous N-cols in one row is wrong and
+#   produces rel-RMSE = 1.41 (well above the <=0.5 target). The current store
+#   uses `__shfl_xor_sync 4` to combine adjacent-col values into FP4 bytes.
 #
 # Pass criterion: end-to-end `y` rel-RMSE ≤ 0.5 between FP4-acts and FP8-acts
-# at smoke shape (matches A3's measured FP4-quant chain noise floor).
+# at smoke shape.
 #
 # Usage:
 #   bench/run_megamoe.sh --gpus 4,5 --slot 2 -- \
@@ -105,13 +102,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     transformed_l1_weights, transformed_l2_weights = \
         deep_gemm.transform_weights_for_mega_moe(l1_weights_fp4, l2_weights_fp4)
 
-    # Stream A0.0b: under `DG_USE_FP4_ACTS=1`, the symm buffer's `x` slot is
-    # sized for packed E2M1 (`hidden/2` bytes/token) — different from FP8.
+    # Under `DG_USE_FP4_ACTS=1`, the symm buffer's `x` slot is sized for
+    # packed E2M1 (`hidden/2` bytes/token), different from FP8.
     # Allocate the buffer separately for each path and feed it the matching
     # source tensor.
     def make_buffer_and_run(use_fp4_acts: bool):
         os.environ['DG_USE_FP4_ACTS'] = '1' if use_fp4_acts else '0'
-        os.environ['DG_COMM_KERNEL_DEBUG'] = '0'
         buf = deep_gemm.get_symm_buffer_for_mega_moe(
             group, num_experts,
             num_max_tokens_per_rank, num_topk,
@@ -153,26 +149,18 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     y_fp8_rms = y_fp8.float().pow(2).mean().sqrt().item()
     rel_rmse = y_rmse / max(y_fp8_rms, 1e-12)
 
-    dist_print(f'=== A0.2.1 sentinel — y rel-RMSE (FP4 vs FP8 acts) ===',
+    dist_print(f'=== L1 FP4 layout check: y rel-RMSE (FP4 vs FP8 acts) ===',
                once_in_node=True)
     dist_print(f'  y_fp8 RMS:        {y_fp8_rms:.4f}', once_in_node=True)
     dist_print(f'  y_rmse:           {y_rmse:.4f}', once_in_node=True)
     dist_print(f'  rel-RMSE:         {rel_rmse:.4f}', once_in_node=True)
-    dist_print(f'  target:           ≤ 0.50 (A3 chain noise floor)',
+    dist_print(f'  target:           <= 0.50',
                once_in_node=True)
     dist_print(f'  verdict:          {"PASS" if rel_rmse <= 0.5 else "FAIL"}',
                once_in_node=True)
 
-    # Spot-check first row to make the failure mode legible if it ever
-    # comes back: matched values at low N indices = layout correct;
-    # garbage = layout broken.
-    dist_print(f'\n  y_fp8 [0, :8]:  {y_fp8[0, :8].cpu().tolist()}',
-               once_in_node=True)
-    dist_print(f'  y_fp4 [0, :8]:  {y_fp4[0, :8].cpu().tolist()}',
-               once_in_node=True)
-
     assert rel_rmse <= 0.5, \
-        f'A0.2.1 layout regression: y rel-RMSE {rel_rmse:.4f} > 0.5'
+        f'L1 FP4 layout regression: y rel-RMSE {rel_rmse:.4f} > 0.5'
 
     dist.barrier()
     dist.destroy_process_group()

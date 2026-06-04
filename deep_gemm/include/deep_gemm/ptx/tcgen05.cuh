@@ -139,8 +139,8 @@ struct SM100_MMA_MXF4_SS {
     }
 };
 
-// Stream A0.5: cta_group::2 (cluster) variant of kind::mxf4 for the
-// mega_moe 2-CTA path. Mirrors `SM100_MMA_MXF8F6F4_2x1SM_SS` shape — the
+// cta_group::2 (cluster) variant of kind::mxf4 for the mega_moe 2-CTA path.
+// Mirrors `SM100_MMA_MXF8F6F4_2x1SM_SS` shape — the
 // only differences vs the 1-CTA `SM100_MMA_MXF4_SS` above are the
 // `cta_group::2` qualifier and the (caller-side) requirement that:
 //   - operands are K-major (kind::mxf4 hardware restriction)

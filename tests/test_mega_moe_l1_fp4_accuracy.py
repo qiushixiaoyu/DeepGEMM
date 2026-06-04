@@ -1,13 +1,13 @@
-# Stream A0.2 accuracy harness — DeepGEMM mega_moe FP4 acts vs FP8 acts.
+# DeepGEMM mega_moe FP4 activation accuracy harness.
 #
-# Primary metric (Stream A0.2): end-to-end y comparison. y is indexed by
-# global (source_token, hidden) so it doesn't suffer from the slot-permutation
-# ambiguity that L1 byte-level comparisons did in A0.1. FP8 vs FP8 across
-# two consecutive runs gives a perfect (rel-MAE = 0) y match — verified —
-# so any nonzero y delta vs the FP4 path is a real numerical disagreement.
+# Primary metric: end-to-end y comparison. y is indexed by global
+# (source_token, hidden) so it doesn't suffer from the slot-permutation
+# ambiguity that L1 byte-level comparisons can have. FP8 vs FP8 across two
+# consecutive runs gives a perfect (rel-MAE = 0) y match, so any nonzero y
+# delta vs the FP4 path is a real numerical disagreement.
 #
-# Secondary signals (kept for diagnostics, NOT for verdict):
-#  - L1 byte-level dump and dequant (`fp8_dec` / `fp4_dec`): per-slot
+# Supplementary signals (not used for verdict):
+#  - L1 decoded-output comparison (`fp8_dec` / `fp4_dec`): per-slot
 #    comparison is meaningful only insofar as the kernel's atomicAdd-based
 #    dispatch happens to produce the same slot order across the two runs.
 #    Per-slot magnitudes correlate ~0.7-0.75 between the paths, suggesting
@@ -159,12 +159,12 @@ def _dequant_l1_acts_fp4(l2_acts_bytes: torch.Tensor,
                          gran_k: int = 32) -> torch.Tensor:
     """Decode the FP4 L1 output bytes from the same symm buffer slot.
 
-    Per A0.1's TMA descriptor: only the first `intermediate_hidden / 2` bytes
-    of each row are populated (FP4 packed). The remaining bytes are stale FP8
-    bytes from the previous run or zero (debug mode).
+    Only the first `intermediate_hidden / 2` bytes of each row are populated
+    with packed FP4 data. The remaining bytes are outside the FP4 payload and
+    are ignored by the decoder.
     """
     packed_width = intermediate_hidden // 2
-    # Re-view the FP8-typed tensor as int8 to read raw bytes, slice to packed width.
+    # Re-view the FP8-typed tensor as int8 and slice to the packed payload width.
     raw_bytes = l2_acts_bytes[:valid_slots].view(torch.int8)[:, :packed_width]
     decoded = _decode_fp4_packed(raw_bytes)  # (V, I)
     sf = _decode_sf_buffer_to_per_token(
@@ -302,11 +302,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # ---- Run FP8 path ----
     os.environ['DG_USE_FP4_ACTS'] = '0'
-    os.environ['DG_COMM_KERNEL_DEBUG'] = '0'  # don't zero buffer between calls
-    # First run is a warmup. Stream A0.2 verified FP8-vs-FP8 across two
-    # consecutive runs gives a perfect (rel-MAE = 0) `y` match — the kernel
-    # IS deterministic at the `y` level, so any nonzero FP4-vs-FP8 `y`
-    # delta is a real numerical disagreement, not slot-permutation noise.
+    # First run is a warmup. FP8-vs-FP8 across two consecutive runs gives a
+    # perfect (rel-MAE = 0) `y` match, so any nonzero FP4-vs-FP8 `y` delta is
+    # a real numerical disagreement, not slot-permutation noise.
     _ = run_once()
     torch.cuda.synchronize()
     y_fp8, recv_stats_fp8 = run_once()
@@ -353,20 +351,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist_print(f'  rel-MAE / FP8 RMS: {y_8v8_mae / max(y_fp8_rms_for_floor, 1e-12):.6f}',
                once_in_node=True)
 
-    # ---- End-to-end y comparison (Stream A0.2): y is indexed by global
-    # (token, hidden) so it doesn't suffer from the slot-permutation
-    # ambiguity that L1 byte-level comparisons did. This is the primary
-    # accuracy signal.
+    # ---- End-to-end y comparison: y is indexed by global (token, hidden) so
+    # it doesn't suffer from the slot-permutation ambiguity that L1 byte-level
+    # comparisons did. This is the primary accuracy signal.
     y_diff = (y_fp4.float() - y_fp8.float()).abs()
     y_mae = y_diff.mean().item()
     y_rmse = y_diff.pow(2).mean().sqrt().item()
     y_max = y_diff.max().item()
     y_fp8_rms = y_fp8.float().pow(2).mean().sqrt().item()
     y_fp8_mag = y_fp8.float().abs().mean().item()
-    dist_print(f'y_fp8 [0, :8]: {y_fp8[0, :8].cpu().tolist()}', once_in_node=True)
-    dist_print(f'y_fp4 [0, :8]: {y_fp4[0, :8].cpu().tolist()}', once_in_node=True)
-    dist_print(f'y_fp8 [10, :8]: {y_fp8[10, :8].cpu().tolist()}', once_in_node=True)
-    dist_print(f'y_fp4 [10, :8]: {y_fp4[10, :8].cpu().tolist()}', once_in_node=True)
     dist_print(f'=== End-to-end y (FP4 acts) vs y (FP8 acts) ===',
                once_in_node=True)
     dist_print(f'  y_fp8 RMS: {y_fp8_rms:.4f}   y_fp8 mean|.|: {y_fp8_mag:.4f}',
@@ -380,10 +373,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                once_in_node=True)
 
     # Sanity assertion: magnitudes within 50% (no catastrophic miscalibration,
-    # no NaN/Inf). The rel-RMSE bound (target ≈ 0.5 per Stream A3's chain)
-    # is intentionally NOT enforced here yet — A0.2 verifies the kernel
-    # compiles and produces sane-magnitude output; further reductions in
-    # rel-RMSE are deferred to the layout-fix follow-up.
+    # no NaN/Inf). The rel-RMSE bound is intentionally NOT enforced here yet;
+    # this test verifies the kernel compiles and produces sane-magnitude output.
     y_fp4_mag = y_fp4.float().abs().mean().item()
     if not torch.isfinite(y_fp4).all():
         dist_print(f'  WARNING: y_fp4 contains NaN/Inf!', once_in_node=True)
@@ -391,7 +382,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         f'FP4 magnitude badly miscalibrated: |y_fp4|={y_fp4_mag} vs |y_fp8|={y_fp8_mag}'
 
     # ---- Decode each path's L1 output and compute MAE/RMSE vs reference ----
-    # NOTE: this section is a sanity dump only — per-slot comparison is not
+    # NOTE: this section is supplementary only. Per-slot comparison is not
     # well-defined because the kernel's atomic-based dispatch can permute
     # which (token, topk) lands at which slot between runs. The end-to-end
     # y comparison above is the primary accuracy signal.
@@ -420,23 +411,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         intermediate_hidden, num_padded_sf_pool_tokens,
         total_local)
 
-    # Sanity: dump a few raw bytes from each path so we can compare visually
-    # if the harness misaligns.
-    dist_print(f'l2_acts_fp8 [0, :16] (raw bytes via .view(int8)): '
-               f'{l2_acts_fp8[0, :16].view(torch.int8).tolist()}',
-               once_in_node=True)
-    dist_print(f'l2_acts_fp4 [0, :16] (raw bytes via .view(int8)): '
-               f'{l2_acts_fp4[0, :16].view(torch.int8).tolist()}',
-               once_in_node=True)
-    dist_print(f'fp8_dec [0, :16]: {fp8_dec[0, :16].cpu().tolist()}',
-               once_in_node=True)
-    dist_print(f'fp4_dec [0, :16]: {fp4_dec[0, :16].cpu().tolist()}',
-               once_in_node=True)
-    dist_print(f'fp8_dec [0, 16:32]: {fp8_dec[0, 16:32].cpu().tolist()}',
-               once_in_node=True)
-    dist_print(f'fp4_dec [0, 16:32]: {fp4_dec[0, 16:32].cpu().tolist()}',
-               once_in_node=True)
-
     err = (fp4_dec - fp8_dec).abs()
     mae = err.mean().item()
     rmse = err.pow(2).mean().sqrt().item()
@@ -453,9 +427,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # rowwise mean magnitudes should agree (same data, different quant).
     fp8_rowmag = fp8_dec.abs().mean(dim=1)
     fp4_rowmag = fp4_dec.abs().mean(dim=1)
-    if total_local >= 8:
-        dist_print(f'fp8_rowmag [:8]: {fp8_rowmag[:8].cpu().tolist()}', once_in_node=True)
-        dist_print(f'fp4_rowmag [:8]: {fp4_rowmag[:8].cpu().tolist()}', once_in_node=True)
     rowmag_corr = float((fp8_rowmag * fp4_rowmag).mean() /
                         ((fp8_rowmag.pow(2).mean().sqrt() *
                           fp4_rowmag.pow(2).mean().sqrt()) + 1e-12))

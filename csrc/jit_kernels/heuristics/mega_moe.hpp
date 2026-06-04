@@ -135,7 +135,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& block_m, const int& block_n, const int& block_k, const int& store_block_m,
     const int& sf_block_m, const int& sf_block_n,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
-    // Stream A0.5: under `use_mxf4_kind`, A and B smem use the dense FP4
+    // Under `use_mxf4_kind`, A and B smem use the dense FP4
     // layout (`_ALIGN8B`, 2 nibbles/byte). Per-stage byte footprint halves
     // for both A and B → num_stages doubles for the same smem budget.
     const bool& use_mxf4_kind = false) {
@@ -174,7 +174,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_sfb_per_stage = sf_block_n * 4;
 
     // Per-stage: A tile + B tile + SFA tile + SFB tile + full/empty barriers.
-    // Stream A0.5: dense FP4 (mxf4) halves both A and B byte footprints.
+    // Dense FP4 (mxf4) halves both A and B byte footprints.
     const int smem_a_per_stage = use_mxf4_kind ? (load_block_m * block_k / 2)
                                                : (load_block_m * block_k);
     const int smem_b_per_stage = use_mxf4_kind ? (block_n * block_k / 2)
@@ -514,7 +514,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     } else if (const int override_num_stages = get_env<int>("DG_SM90_NUM_STAGES", 0);
                override_num_stages > 0) {
         // Keep the legacy global knob as a fallback, but prefer the FP4-only
-        // override for clean A/B against an unchanged FP8 low-latency baseline.
+        // override so FP8 low-latency defaults remain unchanged.
         num_stages = std::min(max_num_stages, override_num_stages);
     }
     DG_HOST_ASSERT(num_stages >= 2);
@@ -586,8 +586,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
     // Runtime FP4 decode is CUDA-core heavy on SM90. For the sparse small-batch
-    // band, A/B on H20 showed that trimming dispatch from 4 warps to 2 and
-    // giving the decode/GEMM side 6 warps helps b1 plus the b4-b128 band.
+    // band, trimming dispatch from 4 warps to 2 and giving the decode/GEMM
+    // side 6 warps helps b1 plus the b4-b128 band.
     // Keep b2 on the lean 4/4/4 layout: it regressed when forced to 2/6/4.
     const bool fp4_decode_heavy_small_batch =
         !use_rs_mode and block_m == 64 and block_n == 128 and
@@ -605,11 +605,11 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
                    num_non_epilogue_threads % 64 == 0);
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);
 
-    // FP4-only stage-depth A/B on H20: stage5 helps the broad decode-heavy
-    // band, a narrower stage4 cap is a useful b32 local win, and stage6 helps
-    // sparse b2/b8-style batches by giving TMA/decode/WGMMA one more stage of
-    // slack. Keep b64+ off stage6 after source-tree _C repair exposed a real
-    // regression once this heuristic actually reached the host extension.
+    // FP4 stage-depth defaults: stage5 helps the broad decode-heavy band, a
+    // narrower stage4 cap is useful around b32, and stage6 helps sparse
+    // b2/b8-style batches by giving TMA/decode/WGMMA one more stage of slack.
+    // Keep b64+ off stage6 because it regresses once this heuristic reaches
+    // the host extension.
     const bool fp4_stage4_decode_band =
         !use_rs_mode and block_m == 64 and block_n == 128 and
         expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f;

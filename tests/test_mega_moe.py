@@ -83,9 +83,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         assert l1_weights.shape[2] % 128 == 0 and l2_weights.shape[2] % 128 == 0
 
         # Cast inputs to FP8 (or FP4 under DG_USE_FP4_ACTS) with per-32 UE8M0 SF.
-        # Stream A0.0b: when the flag is on, the symm buffer's `x` slot is sized
-        # for packed E2M1 (`hidden/2` bytes/token), so we must quantize at the
-        # source to match.
+        # The FP4 path stores packed E2M1 in the symm buffer's `x` slot
+        # (`hidden/2` bytes/token), so the source tensor must match that layout.
         if os.environ.get('DG_USE_FP4_ACTS', '0') != '0':
             x = per_token_cast_to_fp4(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
         else:
@@ -107,7 +106,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         transformed_l1_weights, transformed_l2_weights = deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights)
 
     # Run fused mega MoE
-    # NOTES: copy x into buffer before each call because debug mode zeros the entire buffer
+    # Copy inputs into the buffer before each call so repeated launches start
+    # from the same buffer state.
     def run_fused():
         buffer.x[:num_tokens].copy_(x[0])
         buffer.x_sf[:num_tokens].copy_(x[1])

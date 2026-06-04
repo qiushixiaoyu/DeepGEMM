@@ -23,7 +23,6 @@
 #include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>
-#define __CLION_IDE__
 
 namespace deep_gemm {
 
@@ -463,7 +462,7 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_dispatch(
 //   3. Mainloop decode:  the default host path uses the UE8M0 LUT decoder
 //      (`fp4x4_to_scaled_e4m3x4_e8m0`) to dequant the packed FP4 weight tile.
 //      `DG_SM90_FP4_FUSE_SCALE_B_HUMMING_DECODE=1` switches the JIT to the
-//      humming decoder A/B path. The default decode-to-SMEM path writes an E4M3
+//      humming decoder path. The default decode-to-SMEM path writes an E4M3
 //      tile (`smem_b_decoded`) that SS-mode WGMMA consumes exactly like the FP8
 //      path, preserving the existing per-token SwiGLU amax / quantize epilogue.
 //   4. RS mode:          enabled behind `DG_SM90_FP4_RS_MODE`, with a separate
@@ -502,35 +501,34 @@ template <
     float kActivationClamp,
     bool kFastMath,
     // FP4-specific knobs (all defaults match the design doc's "Plan C" path).
-    bool kUseKGPairDecode          = false,  // A/B: decode two consecutive K-groups per work item
-    bool kUseVectorStoreDecode     = false,  // A/B: write adjacent decoded u64 values with one v2.u64 store
-    bool kSkipZeroSFBDecode        = false,  // A/B: skip LUT decode when UE8M0 scale byte is zero
-    bool kUseDynamicLutDecode      = false,  // A/B: build per-SFB LUT in registers instead of constant-cache lookup
-    bool kUseCommonLutFastPath     = false,  // A/B: immediate LUTs for common UE8M0 values
-    bool kUseKGPipelineDecode      = false,  // A/B: overlap per-K-group decode with each WGMMA issue
-    bool kRSGroupKPromote          = false,  // A/B: RS Linear1 batches four K/32 WGMMA slices, then promotes once
-    bool kRSL2GroupK2Promote       = false,  // A/B: RS Linear2 batches two K/32 WGMMA slices per wait
-    bool kRSUseTransposeVecLoad    = false,  // A/B: vectorize RS L1 scratch readback into SS epilogue layout
-    bool kRSGuardTransposeValid    = false,  // A/B: skip RS L1 transpose rows outside valid_m
-    bool kRSUseSFAVecLoad          = false,  // A/B: vectorize adjacent RS SFA loads in promote loops
-    bool kRSBroadcastSFALoad       = false,  // A/B: one row lane loads SFA, then shuffles to same-col lanes
-    bool kRSReuseSFBWord           = false,  // A/B: reuse one packed SFB word across four K/32 slices
-    bool kRSBroadcastSFBLoad       = false,  // A/B: one col-pair lane loads SFB, then shuffles to same-row lanes
-    bool kRSStageSFB               = false,  // A/B: stage packed SFB words in SMEM for RS decode
-    bool kRSDecodePairShfl         = false,  // A/B: share one packed FP4 load across adjacent low/high lanes
-    bool kRSDirectL2Scatter        = false,  // A/B: skip RS L2 BF16 SMEM staging and scatter from registers
+    bool kUseKGPairDecode          = false,  // Decode two consecutive K-groups per work item
+    bool kUseVectorStoreDecode     = false,  // Write adjacent decoded u64 values with one v2.u64 store
+    bool kSkipZeroSFBDecode        = false,  // Skip LUT decode when UE8M0 scale byte is zero
+    bool kUseDynamicLutDecode      = false,  // Build per-SFB LUT in registers instead of constant-cache lookup
+    bool kUseCommonLutFastPath     = false,  // Immediate LUTs for common UE8M0 values
+    bool kUseKGPipelineDecode      = false,  // Overlap per-K-group decode with each WGMMA issue
+    bool kRSGroupKPromote          = false,  // RS Linear1 batches four K/32 WGMMA slices, then promotes once
+    bool kRSL2GroupK2Promote       = false,  // RS Linear2 batches two K/32 WGMMA slices per wait
+    bool kRSUseTransposeVecLoad    = false,  // Vectorize RS L1 scratch readback into SS epilogue layout
+    bool kRSGuardTransposeValid    = false,  // Skip RS L1 transpose rows outside valid_m
+    bool kRSUseSFAVecLoad          = false,  // Vectorize adjacent RS SFA loads in promote loops
+    bool kRSBroadcastSFALoad       = false,  // One row lane loads SFA, then shuffles to same-col lanes
+    bool kRSReuseSFBWord           = false,  // Reuse one packed SFB word across four K/32 slices
+    bool kRSBroadcastSFBLoad       = false,  // One col-pair lane loads SFB, then shuffles to same-row lanes
+    bool kRSStageSFB               = false,  // Stage packed SFB words in SMEM for RS decode
+    bool kRSDecodePairShfl         = false,  // Share one packed FP4 load across adjacent low/high lanes
+    bool kRSDirectL2Scatter        = false,  // Skip RS L2 BF16 SMEM staging and scatter from registers
     bool kFuseScaleBHummingDecode = true,   // Plan C: bake SFB into decode LUT
     bool kScaleBPow2Promote       = true,   // UE8M0 SFB: exponent-shift promote
     bool kUseRSMode               = false,  // correctness-first RS mainloop
     bool kMathWGParticipatesInFP4Decode = true,
     uint32_t kNumMathWGDecodeWarps = kMathWGParticipatesInFP4Decode ? (kNumEpilogueThreads / 32) : 0,
-    uint32_t kFirstFP4DecodeAssistWarp = 0,  // A/B: skip early non-epilogue warps as decode helpers
-    bool kEarlyBDecode            = false,  // A/B: overlap assist decode with A/SFA TMA
-    bool kDecodeDoneMBarrier      = false,  // A/B: one-way decode-done mbarrier instead of rendezvous sync
-    bool kL2ArrivalCounter        = false,  // A/B: count ready L1 output slices instead of bitmask + CTA sync
-    bool kSkipL2EpilogueSync      = false,  // A/B: rely on following grid/NVLink sync after L2 scatter
-    bool kClockProfile            = false,  // debug-only clock64 phase counters
-    bool kFP4SSNSplit             = false,  // A/B: split SS N=128 WGMMA into 2x N=64 to reduce accum pressure
+    uint32_t kFirstFP4DecodeAssistWarp = 0,  // Skip early non-epilogue warps as decode helpers
+    bool kEarlyBDecode            = false,  // Overlap assist decode with A/SFA TMA
+    bool kDecodeDoneMBarrier      = false,  // One-way decode-done mbarrier instead of rendezvous sync
+    bool kL2ArrivalCounter        = false,  // Count ready L1 output slices instead of bitmask + CTA sync
+    bool kSkipL2EpilogueSync      = false,  // Rely on following grid/NVLink sync after L2 scatter
+    bool kFP4SSNSplit             = false,  // Split SS N=128 WGMMA into 2x N=64 to reduce accum pressure
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -556,8 +554,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
-                           const uint32_t* __restrict__ l2_weights_sf,
-                           uint64_t* fp4_clock_profile) {
+                           const uint32_t* __restrict__ l2_weights_sf) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900) and (__CUDA_ARCH__ < 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
@@ -888,7 +885,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         if (cute::elect_one_sync()) {
             #pragma unroll
             for (uint32_t i = 0; i < kNumStages; ++ i) {
-                // Default path uses one A+B full barrier. The early-B A/B path
+                // Default path uses one A+B full barrier. The early-B path
                 // splits packed-B readiness so assist warps can decode while
                 // A/SFA TMA is still in flight; the main full barrier then only
                 // tracks the A/SFA producer.
@@ -905,8 +902,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     // > 0 -- plus the optional math-WG decode warps. Counting
                     // all `kNumMMANonEpilogueWarps` here over-counts arrivals
                     // by `kFirstFP4DecodeAssistWarp`, so the consumer `wait()`
-                    // never completes and the kernel hangs (observed as the
-                    // b1 DG_SM90_FP4_DECODE_MBARRIER=1 deadlock).
+                    // would never complete.
                     constexpr uint32_t kDecodeDoneArrivers =
                         (kNumMMANonEpilogueWarps - kFirstFP4DecodeAssistWarp) +
                         kNumMathWGDecodeWarps;
@@ -1486,14 +1482,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         const uint32_t epilogue_wg_idx    = epilogue_warp_idx / 4;
         const uint32_t epilogue_thread_idx = epilogue_warp_idx * 32 + lane_idx;
         const uint32_t warp_idx_in_wg     = epilogue_warp_idx % 4;
-        auto fp4_profile_add = [&](uint32_t slot, uint64_t value) {
-            if constexpr (kClockProfile) {
-                if (epilogue_thread_idx == 0 and fp4_clock_profile != nullptr) {
-                    auto* profile = reinterpret_cast<unsigned long long*>(fp4_clock_profile);
-                    atomicAdd(profile + slot, static_cast<unsigned long long>(value));
-                }
-            }
-        };
 
         // WGMMA-output register layout helpers
         const uint32_t row_idx = lane_idx / 4;
@@ -1572,13 +1560,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t rs_lane_col_pair = lane_idx % 4;
                 const uint32_t packed_shift = (rs_lane_col_pair & 1u) * 16u;
                 const uint32_t rs_lane_pair_col = (rs_lane_col_pair & 2u) * 2u;
-                uint64_t rs_profile_count = 0;
-                uint64_t rs_profile_full_wait = 0;
-                uint64_t rs_profile_decode = 0;
-                uint64_t rs_profile_wgmma = 0;
-                uint64_t rs_profile_promote = 0;
-                uint64_t rs_profile_t0 = 0;
-                uint64_t rs_profile_t1 = 0;
 
                 auto load_rs_packed_nibbles = [&](uint32_t mat,
                                                   uint32_t cur_stage,
@@ -1700,37 +1681,14 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 };
 
                 for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
-                    uint64_t rs_stage_decode = 0;
-                    uint64_t rs_stage_wgmma = 0;
-                    uint64_t rs_stage_promote = 0;
-                    if constexpr (kClockProfile) {
-                        if (epilogue_thread_idx == 0)
-                            rs_profile_t0 = clock64();
-                    }
                     wait_fp4_decode_input_ready(stage_idx, phase);
-                    if constexpr (kClockProfile) {
-                        if (epilogue_thread_idx == 0) {
-                            rs_profile_t1 = clock64();
-                            rs_profile_full_wait += rs_profile_t1 - rs_profile_t0;
-                        }
-                    }
                     const auto desc_b_base = mma::sm90::make_smem_desc(smem_a[stage_idx], 1);
                     const uint32_t desc_b_base_lo = __shfl_sync(0xffffffff, desc_b_base.reg32_[0], 0);
                     bool rs_acts_ready = !kUseEarlyBDecode;
                     auto wait_rs_acts_ready = [&]() {
                         if constexpr (kUseEarlyBDecode) {
                             if (!rs_acts_ready) {
-                                if constexpr (kClockProfile) {
-                                    if (epilogue_thread_idx == 0)
-                                        rs_profile_t0 = clock64();
-                                }
                                 full_barriers[stage_idx]->wait(phase);
-                                if constexpr (kClockProfile) {
-                                    if (epilogue_thread_idx == 0) {
-                                        rs_profile_t1 = clock64();
-                                        rs_profile_full_wait += rs_profile_t1 - rs_profile_t0;
-                                    }
-                                }
                                 rs_acts_ready = true;
                             }
                         }
@@ -1767,10 +1725,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
                             #pragma unroll
                             for (uint32_t k = 0; k < BLOCK_K / RSWGMMA::K; ++ k) {
-                                if constexpr (kClockProfile) {
-                                    if (epilogue_thread_idx == 0)
-                                        rs_profile_t0 = clock64();
-                                }
                                 uint32_t e8m0_02, e8m0_13;
                                 if constexpr (kRSReuseSFBWord) {
                                     e8m0_02 = unpack_rs_e8m0(sfb_word_02, k);
@@ -1809,18 +1763,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                     a3 = decode_rs_a_reg_lut(load_rs_packed_nibbles(3, stage_idx, k, rs_n_slice),
                                                              lut_13_lo, lut_13_hi);
                                 }
-                                if constexpr (kClockProfile) {
-                                    if (epilogue_thread_idx == 0) {
-                                        rs_profile_t1 = clock64();
-                                        rs_stage_decode += rs_profile_t1 - rs_profile_t0;
-                                    }
-                                }
 
                                 wait_rs_acts_ready();
-                                if constexpr (kClockProfile) {
-                                    if (epilogue_thread_idx == 0)
-                                        rs_profile_t0 = clock64();
-                                }
                                 auto desc_b = desc_b_base;
                                 desc_b.reg32_[0] = desc_b_base_lo + k * RSWGMMA::K / 16;
                                 // Each RS slice rewrites the register-backed A operand.
@@ -1828,12 +1772,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 // for the four K slices.
                                 ptx::warpgroup_arrive();
                                 RSWGMMA::wgmma(a0, a1, a2, a3, desc_b, rs_accum, k != 0);
-                                if constexpr (kClockProfile) {
-                                    if (epilogue_thread_idx == 0) {
-                                        rs_profile_t1 = clock64();
-                                        rs_stage_wgmma += rs_profile_t1 - rs_profile_t0;
-                                    }
-                                }
                             }
                             ptx::warpgroup_commit_batch();
                             #pragma unroll
@@ -1841,10 +1779,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 ptx::warpgroup_fence_operand(rs_accum[i]);
                             ptx::warpgroup_wait<0>();
 
-                            if constexpr (kClockProfile) {
-                                if (epilogue_thread_idx == 0)
-                                    rs_profile_t0 = clock64();
-                            }
                             #pragma unroll
                             for (uint32_t i = 0; i < kRSAccumPerThread / 4; ++ i) {
                                 const uint32_t token_0 = i * 8 + col_idx * 2;
@@ -1854,18 +1788,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 final_accum[rs_accum_base + i * 4 + 2] += scale_a.x * rs_accum[i * 4 + 2];
                                 final_accum[rs_accum_base + i * 4 + 3] += scale_a.y * rs_accum[i * 4 + 3];
                             }
-                            if constexpr (kClockProfile) {
-                                if (epilogue_thread_idx == 0) {
-                                    rs_profile_t1 = clock64();
-                                    rs_stage_promote += rs_profile_t1 - rs_profile_t0;
-                                }
-                            }
                         } else if (kRSL2GroupK2Promote and kL2ActsSFGranK == 32 and
                                    block_phase == sched::BlockPhase::Linear2) {
-                            // Diagnostic path: keep two independent K/32
-                            // accumulators live so two L2 WGMMAs can share one
-                            // commit/wait while preserving per-K activation
-                            // scale application.
+                            // Keep two independent K/32 accumulators live so
+                            // two L2 WGMMAs can share one commit/wait while
+                            // preserving per-K activation scale application.
                             const uint32_t rs_accum_base = rs_n_slice * kRSAccumPerThread;
                             #pragma unroll
                             for (uint32_t k_pair = 0; k_pair < BLOCK_K / RSWGMMA::K; k_pair += 2) {
@@ -1879,10 +1806,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                     ptx::warpgroup_fence_operand(rs_accum_1[i]);
                                 }
 
-                                if constexpr (kClockProfile) {
-                                    if (epilogue_thread_idx == 0)
-                                        rs_profile_t0 = clock64();
-                                }
                                 const uint32_t e8m0_02_0 = load_rs_e8m0(
                                     0, k_block_idx, k_pair, rs_n_slice,
                                     l2_weights_sf, kL2SFBPerExpert, kL2SFBKWords);
@@ -1952,18 +1875,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                     a3_1 = decode_rs_a_reg_lut(load_rs_packed_nibbles(3, stage_idx, k_next, rs_n_slice),
                                                                lut_13_lo, lut_13_hi);
                                 }
-                                if constexpr (kClockProfile) {
-                                    if (epilogue_thread_idx == 0) {
-                                        rs_profile_t1 = clock64();
-                                        rs_stage_decode += rs_profile_t1 - rs_profile_t0;
-                                    }
-                                }
 
                                 wait_rs_acts_ready();
-                                if constexpr (kClockProfile) {
-                                    if (epilogue_thread_idx == 0)
-                                        rs_profile_t0 = clock64();
-                                }
                                 auto desc_b_0 = desc_b_base;
                                 desc_b_0.reg32_[0] = desc_b_base_lo + k_pair * RSWGMMA::K / 16;
                                 ptx::warpgroup_arrive();
@@ -1979,17 +1892,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                     ptx::warpgroup_fence_operand(rs_accum_1[i]);
                                 }
                                 ptx::warpgroup_wait<0>();
-                                if constexpr (kClockProfile) {
-                                    if (epilogue_thread_idx == 0) {
-                                        rs_profile_t1 = clock64();
-                                        rs_stage_wgmma += rs_profile_t1 - rs_profile_t0;
-                                    }
-                                }
 
-                                if constexpr (kClockProfile) {
-                                    if (epilogue_thread_idx == 0)
-                                        rs_profile_t0 = clock64();
-                                }
                                 #pragma unroll
                                 for (uint32_t i = 0; i < kRSAccumPerThread / 4; ++ i) {
                                     const uint32_t token_0 = i * 8 + col_idx * 2;
@@ -2009,12 +1912,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                     final_accum[rs_accum_base + i * 4 + 1] += scale_a.y * rs_accum_1[i * 4 + 1];
                                     final_accum[rs_accum_base + i * 4 + 2] += scale_a.x * rs_accum_1[i * 4 + 2];
                                     final_accum[rs_accum_base + i * 4 + 3] += scale_a.y * rs_accum_1[i * 4 + 3];
-                                }
-                                if constexpr (kClockProfile) {
-                                    if (epilogue_thread_idx == 0) {
-                                        rs_profile_t1 = clock64();
-                                        rs_stage_promote += rs_profile_t1 - rs_profile_t0;
-                                    }
                                 }
                             }
                         } else {
@@ -2036,10 +1933,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         #pragma unroll
                         for (uint32_t k = 0; k < BLOCK_K / RSWGMMA::K; ++ k) {
                             float rs_accum[kRSAccumPerThread];
-                            if constexpr (kClockProfile) {
-                                if (epilogue_thread_idx == 0)
-                                    rs_profile_t0 = clock64();
-                            }
                             uint32_t e8m0_02, e8m0_13;
                             if constexpr (kRSReuseSFBWord) {
                                 e8m0_02 = unpack_rs_e8m0(sfb_word_02, k);
@@ -2078,18 +1971,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 a3 = decode_rs_a_reg_lut(load_rs_packed_nibbles(3, stage_idx, k, rs_n_slice),
                                                          lut_13_lo, lut_13_hi);
                             }
-                            if constexpr (kClockProfile) {
-                                if (epilogue_thread_idx == 0) {
-                                    rs_profile_t1 = clock64();
-                                    rs_stage_decode += rs_profile_t1 - rs_profile_t0;
-                                }
-                            }
 
                             wait_rs_acts_ready();
-                            if constexpr (kClockProfile) {
-                                if (epilogue_thread_idx == 0)
-                                    rs_profile_t0 = clock64();
-                            }
                             #pragma unroll
                             for (uint32_t i = 0; i < kRSAccumPerThread; ++ i) {
                                 rs_accum[i] = 0.0f;
@@ -2104,20 +1987,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             for (uint32_t i = 0; i < kRSAccumPerThread; ++ i)
                                 ptx::warpgroup_fence_operand(rs_accum[i]);
                             ptx::warpgroup_wait<0>();
-                            if constexpr (kClockProfile) {
-                                if (epilogue_thread_idx == 0) {
-                                    rs_profile_t1 = clock64();
-                                    rs_stage_wgmma += rs_profile_t1 - rs_profile_t0;
-                                }
-                            }
 
                             const uint32_t sfa_group =
                                 kL2ActsSFGranK == 32 ? k : (k < 2 ? 0u : 1u);
                             const uint32_t rs_accum_base = rs_n_slice * kRSAccumPerThread;
-                            if constexpr (kClockProfile) {
-                                if (epilogue_thread_idx == 0)
-                                    rs_profile_t0 = clock64();
-                            }
                             #pragma unroll
                             for (uint32_t i = 0; i < kRSAccumPerThread / 4; ++ i) {
                                 const uint32_t token_0 = i * 8 + col_idx * 2;
@@ -2132,33 +2005,15 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 final_accum[rs_accum_base + i * 4 + 2] += scale_a.x * rs_accum[i * 4 + 2];
                                 final_accum[rs_accum_base + i * 4 + 3] += scale_a.y * rs_accum[i * 4 + 3];
                             }
-                            if constexpr (kClockProfile) {
-                                if (epilogue_thread_idx == 0) {
-                                    rs_profile_t1 = clock64();
-                                    rs_stage_promote += rs_profile_t1 - rs_profile_t0;
-                                }
-                            }
                         }
                         }
                     }
 
                     if (lane_idx == 0)
                         empty_barriers[stage_idx]->arrive();
-                    if constexpr (kClockProfile) {
-                        if (epilogue_thread_idx == 0) {
-                            ++ rs_profile_count;
-                            rs_profile_decode += rs_stage_decode;
-                            rs_profile_wgmma += rs_stage_wgmma;
-                            rs_profile_promote += rs_stage_promote;
-                        }
-                    }
                 }
 
                 if (block_phase == sched::BlockPhase::Linear1) {
-                    if constexpr (kClockProfile) {
-                        if (epilogue_thread_idx == 0)
-                            rs_profile_t0 = clock64();
-                    }
                     #pragma unroll
                     for (uint32_t rs_n_slice = 0; rs_n_slice < kNumRSNSlices; ++ rs_n_slice) {
                         const uint32_t rs_accum_base = rs_n_slice * kRSAccumPerThread;
@@ -2231,46 +2086,13 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         }
                         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                     }
-                    if constexpr (kClockProfile) {
-                        if (epilogue_thread_idx == 0) {
-                            rs_profile_t1 = clock64();
-                            rs_profile_promote += rs_profile_t1 - rs_profile_t0;
-                        }
-                    }
                 }
 
-                if constexpr (kClockProfile) {
-                    if (epilogue_thread_idx == 0) {
-                        const uint32_t slot_base = block_phase == sched::BlockPhase::Linear1 ? 0 : 8;
-                        fp4_profile_add(slot_base, rs_profile_count);
-                        fp4_profile_add(slot_base + 1, rs_profile_full_wait);
-                        fp4_profile_add(slot_base + 2, rs_profile_decode);
-                        fp4_profile_add(slot_base + 3, rs_profile_wgmma);
-                        fp4_profile_add(slot_base + 4, rs_profile_promote);
-                    }
-                }
 
             } else {
                 float accum[kSSAccum];
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
-                uint64_t fp4_profile_t0 = 0;
-                uint64_t fp4_profile_t_full_wait_done = 0;
-                uint64_t fp4_profile_t_decode_input_ready = 0;
-                uint64_t fp4_profile_t_math_decode_done = 0;
-                uint64_t fp4_profile_t_decode_done = 0;
-                uint64_t fp4_profile_t_wgmma_lo_done = 0;
-                uint64_t fp4_profile_t_promote_lo_done = 0;
-                uint64_t fp4_profile_t_wgmma_hi_done = 0;
-                uint64_t fp4_profile_t_promote_done = 0;
-                if constexpr (kClockProfile) {
-                    if (epilogue_thread_idx == 0)
-                        fp4_profile_t0 = clock64();
-                }
                 full_barriers[stage_idx]->wait(phase);
-                if constexpr (kClockProfile) {
-                    if (epilogue_thread_idx == 0)
-                        fp4_profile_t_full_wait_done = clock64();
-                }
 
                 // Read SF (must precede warpgroup_arrive)
                 float scale_a_0_lo, scale_a_1_lo;
@@ -2300,20 +2122,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 // epilogue/math threads, then all participants rendezvous
                 // before WGMMA reads the decoded shared tile.
                 if constexpr (kUseKGPipelineDecode) {
-                    if constexpr (kClockProfile) {
-                        if (epilogue_thread_idx == 0) {
-                            fp4_profile_t_decode_input_ready = fp4_profile_t_full_wait_done;
-                            fp4_profile_t_math_decode_done = fp4_profile_t_full_wait_done;
-                            fp4_profile_t_decode_done = fp4_profile_t_full_wait_done;
-                        }
-                    }
                 } else {
                     if constexpr (kUseEarlyBDecode)
                         wait_fp4_decode_input_ready(stage_idx, phase);
-                    if constexpr (kClockProfile) {
-                        if (epilogue_thread_idx == 0)
-                            fp4_profile_t_decode_input_ready = clock64();
-                    }
                     const bool math_warp_decodes =
                         epilogue_warp_idx < kNumMathWGDecodeWarps;
                     if constexpr (kNumMathWGDecodeWarps > 0) {
@@ -2329,12 +2140,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 smem_b_packed[stage_idx], smem_b[stage_idx], smem_sfb[stage_idx]);
                         }
                     }
-                    if constexpr (kClockProfile) {
-                        if (epilogue_thread_idx == 0) {
-                            fp4_profile_t_math_decode_done =
-                                math_warp_decodes ? clock64() : fp4_profile_t_decode_input_ready;
-                        }
-                    }
                     if constexpr (kNumMathWGDecodeWarps > 0) {
                         if (math_warp_decodes)
                             arrive_or_sync_fp4_decode_done(stage_idx);
@@ -2346,10 +2151,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         }
                     } else {
                         wait_fp4_decode_done(stage_idx, phase);
-                    }
-                    if constexpr (kClockProfile) {
-                        if (epilogue_thread_idx == 0)
-                            fp4_profile_t_decode_done = clock64();
                     }
                 }
 
@@ -2384,10 +2185,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 final_accum[f+2] += scale_a_1_lo * accum[i*4+2];
                                 final_accum[f+3] += scale_a_1_lo * accum[i*4+3];
                             }
-                        }
-                        if constexpr (kClockProfile) {
-                            if (epilogue_thread_idx == 0)
-                                fp4_profile_t_wgmma_lo_done = clock64();
                         }
                         if (lane_idx == 0)
                             empty_barriers[stage_idx]->arrive();
@@ -2426,10 +2223,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(accum[i]);
                             ptx::warpgroup_wait<0>();
                         }
-                        if constexpr (kClockProfile) {
-                            if (epilogue_thread_idx == 0)
-                                fp4_profile_t_wgmma_lo_done = clock64();
-                        }
 
                         if (lane_idx == 0)
                             empty_barriers[stage_idx]->arrive();
@@ -2442,19 +2235,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             final_accum[i*4+1] += scale_a_0_lo * accum[i*4+1];
                             final_accum[i*4+2] += scale_a_1_lo * accum[i*4+2];
                             final_accum[i*4+3] += scale_a_1_lo * accum[i*4+3];
-                        }
-                    }
-                    if constexpr (kClockProfile) {
-                        if (epilogue_thread_idx == 0) {
-                            fp4_profile_t_promote_done = clock64();
-                            fp4_profile_add(0, 1);
-                            fp4_profile_add(1, fp4_profile_t_full_wait_done - fp4_profile_t0);
-                            fp4_profile_add(2, fp4_profile_t_decode_done - fp4_profile_t_full_wait_done);
-                            fp4_profile_add(3, fp4_profile_t_wgmma_lo_done - fp4_profile_t_decode_done);
-                            fp4_profile_add(4, fp4_profile_t_promote_done - fp4_profile_t_wgmma_lo_done);
-                            fp4_profile_add(5, fp4_profile_t_decode_input_ready - fp4_profile_t_full_wait_done);
-                            fp4_profile_add(6, fp4_profile_t_math_decode_done - fp4_profile_t_decode_input_ready);
-                            fp4_profile_add(7, fp4_profile_t_decode_done - fp4_profile_t_math_decode_done);
                         }
                     }
                 } else {
@@ -2483,14 +2263,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         #pragma unroll
                         for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(accum[i]);
                         ptx::warpgroup_wait<0>();
-                        if constexpr (kClockProfile) {
-                            if (epilogue_thread_idx == 0) {
-                                if (sf_group == 0)
-                                    fp4_profile_t_wgmma_lo_done = clock64();
-                                if (sf_group + 1 == kNumL2SFAPerBlockK)
-                                    fp4_profile_t_wgmma_hi_done = clock64();
-                            }
-                        }
 
                         #pragma unroll
                         for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
@@ -2499,30 +2271,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             final_accum[i*4+2] += scale_a_1 * accum[i*4+2];
                             final_accum[i*4+3] += scale_a_1 * accum[i*4+3];
                         }
-                        if constexpr (kClockProfile) {
-                            if (epilogue_thread_idx == 0 and sf_group == 0)
-                                fp4_profile_t_promote_lo_done = clock64();
-                        }
                     }
 
                     if (lane_idx == 0)
                         empty_barriers[stage_idx]->arrive();
 
-                    if constexpr (kClockProfile) {
-                        if (epilogue_thread_idx == 0) {
-                            fp4_profile_t_promote_done = clock64();
-                            fp4_profile_add(8, 1);
-                            fp4_profile_add(9, fp4_profile_t_full_wait_done - fp4_profile_t0);
-                            fp4_profile_add(10, fp4_profile_t_decode_done - fp4_profile_t_full_wait_done);
-                            fp4_profile_add(11, (fp4_profile_t_wgmma_lo_done - fp4_profile_t_decode_done) +
-                                                (fp4_profile_t_wgmma_hi_done - fp4_profile_t_promote_lo_done));
-                            fp4_profile_add(12, (fp4_profile_t_promote_lo_done - fp4_profile_t_wgmma_lo_done) +
-                                                (fp4_profile_t_promote_done - fp4_profile_t_wgmma_hi_done));
-                            fp4_profile_add(13, fp4_profile_t_decode_input_ready - fp4_profile_t_full_wait_done);
-                            fp4_profile_add(14, fp4_profile_t_math_decode_done - fp4_profile_t_decode_input_ready);
-                            fp4_profile_add(15, fp4_profile_t_decode_done - fp4_profile_t_math_decode_done);
-                        }
-                    }
                     } else {
                     if constexpr (kSSNSplitActive) {
                     // L2 per-64 SFA with split-N WGMMA: each N half owns a
@@ -2549,10 +2302,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         #pragma unroll
                         for (uint32_t i = 0; i < kSSAccum; ++ i) ptx::warpgroup_fence_operand(accum[i]);
                         ptx::warpgroup_wait<0>();
-                        if constexpr (kClockProfile) {
-                            if (epilogue_thread_idx == 0 and nh == 0)
-                                fp4_profile_t_wgmma_lo_done = clock64();
-                        }
 
                         // L2 first half: SFB baked into decoded E4M3 tile by humming.
                         #pragma unroll
@@ -2561,10 +2310,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             final_accum[fbase+i*4+1] += scale_a_0_lo * accum[i*4+1];
                             final_accum[fbase+i*4+2] += scale_a_1_lo * accum[i*4+2];
                             final_accum[fbase+i*4+3] += scale_a_1_lo * accum[i*4+3];
-                        }
-                        if constexpr (kClockProfile) {
-                            if (epilogue_thread_idx == 0 and nh == 0)
-                                fp4_profile_t_promote_lo_done = clock64();
                         }
 
                         // Second K half: K=64..127, SFA = scale_a_*_hi
@@ -2594,29 +2339,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             final_accum[fbase+i*4+3] += scale_a_1_hi * accum[i*4+3];
                         }
                     }
-                    if constexpr (kClockProfile) {
-                        if (epilogue_thread_idx == 0)
-                            fp4_profile_t_wgmma_hi_done = clock64();
-                    }
 
                     if (lane_idx == 0)
                         empty_barriers[stage_idx]->arrive();
 
-                    if constexpr (kClockProfile) {
-                        if (epilogue_thread_idx == 0) {
-                            fp4_profile_t_promote_done = clock64();
-                            fp4_profile_add(8, 1);
-                            fp4_profile_add(9, fp4_profile_t_full_wait_done - fp4_profile_t0);
-                            fp4_profile_add(10, fp4_profile_t_decode_done - fp4_profile_t_full_wait_done);
-                            fp4_profile_add(11, (fp4_profile_t_wgmma_lo_done - fp4_profile_t_decode_done) +
-                                                (fp4_profile_t_wgmma_hi_done - fp4_profile_t_promote_lo_done));
-                            fp4_profile_add(12, (fp4_profile_t_promote_lo_done - fp4_profile_t_wgmma_lo_done) +
-                                                (fp4_profile_t_promote_done - fp4_profile_t_wgmma_hi_done));
-                            fp4_profile_add(13, fp4_profile_t_decode_input_ready - fp4_profile_t_full_wait_done);
-                            fp4_profile_add(14, fp4_profile_t_math_decode_done - fp4_profile_t_decode_input_ready);
-                            fp4_profile_add(15, fp4_profile_t_decode_done - fp4_profile_t_math_decode_done);
-                        }
-                    }
                     } else {
                     // L2: split BLOCK_K=128 into two halves (per-64 SFA), each 2 WGMMAs.
                     // First half: K=0..63, SFA = scale_a_*_lo
@@ -2654,10 +2380,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(accum[i]);
                         ptx::warpgroup_wait<0>();
                     }
-                    if constexpr (kClockProfile) {
-                        if (epilogue_thread_idx == 0)
-                            fp4_profile_t_wgmma_lo_done = clock64();
-                    }
 
                     // L2 first half: SFB baked into decoded E4M3 tile by humming.
                     #pragma unroll
@@ -2666,10 +2388,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         final_accum[i*4+1] += scale_a_0_lo * accum[i*4+1];
                         final_accum[i*4+2] += scale_a_1_lo * accum[i*4+2];
                         final_accum[i*4+3] += scale_a_1_lo * accum[i*4+3];
-                    }
-                    if constexpr (kClockProfile) {
-                        if (epilogue_thread_idx == 0)
-                            fp4_profile_t_promote_lo_done = clock64();
                     }
 
                     // Second half: K=64..127, SFA = scale_a_*_hi
@@ -2709,10 +2427,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(accum[i]);
                         ptx::warpgroup_wait<0>();
                     }
-                    if constexpr (kClockProfile) {
-                        if (epilogue_thread_idx == 0)
-                            fp4_profile_t_wgmma_hi_done = clock64();
-                    }
 
                     if (lane_idx == 0)
                         empty_barriers[stage_idx]->arrive();
@@ -2724,21 +2438,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         final_accum[i*4+1] += scale_a_0_hi * accum[i*4+1];
                         final_accum[i*4+2] += scale_a_1_hi * accum[i*4+2];
                         final_accum[i*4+3] += scale_a_1_hi * accum[i*4+3];
-                    }
-                    if constexpr (kClockProfile) {
-                        if (epilogue_thread_idx == 0) {
-                            fp4_profile_t_promote_done = clock64();
-                            fp4_profile_add(8, 1);
-                            fp4_profile_add(9, fp4_profile_t_full_wait_done - fp4_profile_t0);
-                            fp4_profile_add(10, fp4_profile_t_decode_done - fp4_profile_t_full_wait_done);
-                            fp4_profile_add(11, (fp4_profile_t_wgmma_lo_done - fp4_profile_t_decode_done) +
-                                                (fp4_profile_t_wgmma_hi_done - fp4_profile_t_promote_lo_done));
-                            fp4_profile_add(12, (fp4_profile_t_promote_lo_done - fp4_profile_t_wgmma_lo_done) +
-                                                (fp4_profile_t_promote_done - fp4_profile_t_wgmma_hi_done));
-                            fp4_profile_add(13, fp4_profile_t_decode_input_ready - fp4_profile_t_full_wait_done);
-                            fp4_profile_add(14, fp4_profile_t_math_decode_done - fp4_profile_t_decode_input_ready);
-                            fp4_profile_add(15, fp4_profile_t_decode_done - fp4_profile_t_math_decode_done);
-                        }
                     }
                     }
                     }
