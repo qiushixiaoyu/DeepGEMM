@@ -122,7 +122,8 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
         get_env<int>("DG_SM90_NUM_EPILOGUE_WARPGROUPS", num_epilogue_warpgroups);
     DG_HOST_ASSERT(block_m >= 64 and block_m % 64 == 0);
     DG_HOST_ASSERT(num_epilogue_warpgroups >= 1 and
-                   block_m / num_epilogue_warpgroups == 64);
+                   ((block_m / num_epilogue_warpgroups == 64) or
+                    (block_m == 64 and num_epilogue_warpgroups > 1)));
 
     DG_HOST_ASSERT(std::any_of(
         layout::kCandidateBlockM, layout::kCandidateBlockM + layout::kNumCandidateBlockMs,

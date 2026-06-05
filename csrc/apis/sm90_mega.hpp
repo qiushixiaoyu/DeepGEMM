@@ -400,14 +400,16 @@ static void fp8_fp4_mega_moe_sm90(
     const bool default_ss_early_b_decode =
         !use_rs_mode and
         ((expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert <= 3.0f) or
-         (expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert <= 24.0f));
+         (expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert <= 24.0f) or
+         fp4_2wg_decode_offload_band);
     const bool default_early_b_decode =
         (use_rs_mode and num_tokens > 0 and num_tokens <= 16) or
         default_ss_early_b_decode;
     const bool use_early_b_decode =
         get_env<int>("DG_SM90_FP4_EARLY_B_DECODE", default_early_b_decode ? 1 : 0) != 0;
     const bool default_decode_done_mbarrier =
-        fp4_decode_lookahead_band or fp4_bigband_lookahead_band;
+        fp4_decode_lookahead_band or fp4_bigband_lookahead_band or
+        fp4_2wg_decode_offload_band;
     const bool use_decode_done_mbarrier =
         get_env<int>("DG_SM90_FP4_DECODE_MBARRIER",
                      default_decode_done_mbarrier ? 1 : 0) != 0;
