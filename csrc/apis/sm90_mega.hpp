@@ -344,7 +344,7 @@ static void fp8_fp4_mega_moe_sm90(
         ((expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f) or
          (expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f) or
          fp4_decode_lookahead_band or fp4_b4_skip_decode_band or
-         fp4_bigband_lookahead_band);
+         fp4_bigband_lookahead_band or fp4_2wg_decode_offload_band);
     const int first_fp4_decode_assist_warp =
         get_env<int>("DG_SM90_FP4_FIRST_DECODE_ASSIST_WARP",
                      default_skip_loader_decode_assist ? 2 : 0);

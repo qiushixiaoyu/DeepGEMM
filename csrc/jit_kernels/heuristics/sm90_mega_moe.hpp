@@ -285,14 +285,17 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
     const bool fp4_decode_heavy_small_batch =
         !use_rs_mode and block_m == 64 and block_n == 128 and
-        ((expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f) or
-         (expected_tokens_per_expert >= 0.75f and expected_tokens_per_expert <= 24.0f));
-    const int default_num_dispatch_threads = fp4_decode_heavy_small_batch ? 64 : 128;
+        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert <= 24.0f;
+    const bool fp4_2wg_decode_offload_band =
+        !use_rs_mode and block_m == 128 and block_n == 128 and
+        fp4_num_epilogue_threads == 256 and expected_tokens_per_expert >= 64.0f;
+    const int default_num_dispatch_threads =
+        (fp4_decode_heavy_small_batch or fp4_2wg_decode_offload_band) ? 64 : 128;
     const int num_dispatch_threads =
         get_env<int>("DG_SM90_FP4_NUM_DISPATCH_THREADS", default_num_dispatch_threads);
     DG_HOST_ASSERT(num_dispatch_threads == 64 or num_dispatch_threads == 128);
     const int default_num_non_epilogue_threads =
-        fp4_decode_heavy_small_batch ? 192 : 128;
+        (fp4_decode_heavy_small_batch or fp4_2wg_decode_offload_band) ? 192 : 128;
     const int num_non_epilogue_threads =
         get_env<int>("DG_SM90_FP4_NUM_NON_EPILOGUE_THREADS", default_num_non_epilogue_threads);
     DG_HOST_ASSERT(num_non_epilogue_threads >= 128 and
