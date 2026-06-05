@@ -40,8 +40,10 @@ from test_mega_moe_hopper import (
     BASELINE_L2_ACT_SF_GRAN,
     _bench_cuda_events,
     _import_deep_ep,
+    _make_deep_ep_buffer,
     _make_deep_ep_low_latency_buffer,
     _quantize_grouped_fp8_block_128_128,
+    swiglu_apply_weight_to_fp8_triton,
     swiglu_masked_post_quant_to_fp8,
 )
 
@@ -603,6 +605,9 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
     num_experts = args.num_experts
     num_topk = args.num_topk
     num_experts_per_rank = num_experts // num_ranks
+    run_fp8_normal_baseline_enabled = (
+        args.run_normal_baseline and not args.ncu_profile_only
+    )
     run_fp8_ll_baseline_enabled = (
         not args.skip_fp8_ll_baseline and not args.ncu_profile_only
     )
@@ -739,11 +744,106 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
         dist.destroy_process_group()
         return
 
+    normal_buffer = None
     ll_buffer = None
-    if run_fp8_ll_baseline_enabled:
+    if run_fp8_normal_baseline_enabled or run_fp8_ll_baseline_enabled:
         deep_ep = _import_deep_ep()
         if deep_ep is None:
-            raise RuntimeError("deep_ep is required for the FP8 low-latency baseline")
+            raise RuntimeError("deep_ep is required for baseline comparisons")
+
+    if run_fp8_normal_baseline_enabled:
+        alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
+        deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
+        normal_buffer = _make_deep_ep_buffer(
+            deep_ep,
+            group,
+            num_max_tokens_per_rank,
+            hidden,
+            num_topk,
+            sym_buffer.buffer.nbytes,
+        )
+        normal_cum_stats = torch.zeros(
+            (num_experts_per_rank,), dtype=torch.int, device="cuda"
+        )
+        normal_state = {}
+
+    def fp8_normal_dispatch():
+        recv_x, _, recv_topk_weights, handle, _ = normal_buffer.dispatch(
+            (x_fp8, x_sf),
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            cumulative_local_expert_recv_stats=normal_cum_stats,
+            num_experts=num_experts,
+            expert_alignment=alignment,
+            do_cpu_sync=False,
+            do_handle_copy=False,
+            do_expand=True,
+            use_tma_aligned_col_major_sf=False,
+        )
+        normal_state["recv_x"] = recv_x
+        normal_state["recv_topk_weights"] = recv_topk_weights
+        normal_state["handle"] = handle
+
+    def fp8_normal_l1_gemm():
+        recv_x = normal_state["recv_x"]
+        handle = normal_state["handle"]
+        l1_y = torch.empty(
+            (recv_x[0].size(0), intermediate_hidden * 2),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            recv_x,
+            l1_fp8,
+            l1_y,
+            handle.psum_num_recv_tokens_per_expert,
+            use_psum_layout=True,
+            disable_ue8m0_cast=True,
+        )
+        normal_state["l1_y"] = l1_y
+
+    def fp8_normal_swiglu_quant():
+        normal_state["l1_act"] = swiglu_apply_weight_to_fp8_triton(
+            x=normal_state["l1_y"],
+            topk_weights=normal_state["recv_topk_weights"],
+            clamp_value=clamp_arg,
+            num_per_channels=BASELINE_L2_ACT_SF_GRAN,
+            use_ue8m0_scale=True,
+        )
+
+    def fp8_normal_l2_gemm():
+        handle = normal_state["handle"]
+        l2_y = torch.empty(
+            (normal_state["l1_act"][0].size(0), hidden),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            normal_state["l1_act"],
+            l2_fp8,
+            l2_y,
+            handle.psum_num_recv_tokens_per_expert,
+            use_psum_layout=True,
+            disable_ue8m0_cast=True,
+        )
+        normal_state["l2_y"] = l2_y
+
+    def fp8_normal_combine():
+        combined = normal_buffer.combine(
+            normal_state["l2_y"],
+            handle=normal_state["handle"],
+        )[0]
+        normal_state["combined"] = combined
+        return combined
+
+    def run_fp8_normal_baseline():
+        fp8_normal_dispatch()
+        fp8_normal_l1_gemm()
+        fp8_normal_swiglu_quant()
+        fp8_normal_l2_gemm()
+        return fp8_normal_combine()
+
+    if run_fp8_ll_baseline_enabled:
 
         ll_buffer = _make_deep_ep_low_latency_buffer(
             deep_ep, group, num_max_tokens_per_rank, hidden, num_experts
@@ -870,6 +970,9 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
         else run_fp4_fused()
     )
     assert fused_out.shape == (num_tokens, hidden)
+    if run_fp8_normal_baseline_enabled:
+        normal_out = run_fp8_normal_baseline()
+        assert normal_out.shape == (num_tokens, hidden)
     if run_fp8_ll_baseline_enabled:
         ll_out = run_fp8_low_latency_baseline()
         assert ll_out.shape == (num_tokens, hidden)
@@ -993,6 +1096,17 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
             )
 
     t_ll = float("nan")
+    t_normal = float("nan")
+    if run_fp8_normal_baseline_enabled:
+        dist.barrier()
+        t_normal = _bench_cuda_events(
+            run_fp8_normal_baseline,
+            num_warmup=args.num_warmup,
+            num_repeat=args.num_repeat,
+            l2_flush_gb=args.l2_flush_gb,
+        )
+        dist.barrier()
+
     if run_fp8_ll_baseline_enabled:
         dist.barrier()
         t_ll = _bench_cuda_events(
@@ -1004,17 +1118,32 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
         dist.barrier()
 
     metrics = _all_rank_metrics(
-        (t_fused, t_ll, float(num_recv_tokens), float(num_touched_experts))
+        (
+            t_fused,
+            t_normal,
+            t_ll,
+            float(num_recv_tokens),
+            float(num_touched_experts),
+        )
     )
     if rank_idx == 0:
         fused_us_max = float(metrics[:, 0].max().item() * 1e6)
         fused_us_mean = float(metrics[:, 0].mean().item() * 1e6)
+        normal_us_max = None
+        normal_us_mean = None
+        speedup_vs_fp8_normal_max = None
+        if run_fp8_normal_baseline_enabled:
+            normal_us_max = float(metrics[:, 1].max().item() * 1e6)
+            normal_us_mean = float(metrics[:, 1].mean().item() * 1e6)
+            speedup_vs_fp8_normal_max = round(
+                _safe_div(normal_us_max, fused_us_max), 4
+            )
         ll_us_max = None
         ll_us_mean = None
         speedup_vs_fp8_ll_max = None
         if run_fp8_ll_baseline_enabled:
-            ll_us_max = float(metrics[:, 1].max().item() * 1e6)
-            ll_us_mean = float(metrics[:, 1].mean().item() * 1e6)
+            ll_us_max = float(metrics[:, 2].max().item() * 1e6)
+            ll_us_mean = float(metrics[:, 2].mean().item() * 1e6)
             speedup_vs_fp8_ll_max = round(_safe_div(ll_us_max, fused_us_max), 4)
         result = {
             "batch_per_rank": num_tokens,
@@ -1023,12 +1152,20 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
             "intermediate_hidden": intermediate_hidden,
             "num_experts": num_experts,
             "num_topk": num_topk,
-            "recv_tokens_total": int(metrics[:, 2].sum().item()),
-            "active_experts_max": int(metrics[:, 3].max().item()),
+            "recv_tokens_total": int(metrics[:, 3].sum().item()),
+            "active_experts_max": int(metrics[:, 4].max().item()),
             "fp4_megamoe_us_max": round(fused_us_max, 3),
             "fp4_megamoe_us_mean": round(fused_us_mean, 3),
             "fp4_mode": args.fp4_mode,
             "fp4_timing_method": fused_timing_method,
+            "fp8_normal_baseline_enabled": run_fp8_normal_baseline_enabled,
+            "fp8_normal_baseline_us_max": (
+                None if normal_us_max is None else round(normal_us_max, 3)
+            ),
+            "fp8_normal_baseline_us_mean": (
+                None if normal_us_mean is None else round(normal_us_mean, 3)
+            ),
+            "speedup_vs_fp8_normal_max": speedup_vs_fp8_normal_max,
             "fp8_ll_baseline_enabled": run_fp8_ll_baseline_enabled,
             "fp8_ll_baseline_us_max": None if ll_us_max is None else round(ll_us_max, 3),
             "fp8_ll_baseline_us_mean": None if ll_us_mean is None else round(ll_us_mean, 3),
@@ -1043,6 +1180,8 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
 
     dist.barrier()
     sym_buffer.destroy()
+    if normal_buffer is not None:
+        normal_buffer.destroy()
     if ll_buffer is not None:
         ll_buffer.destroy()
     dist.destroy_process_group()
@@ -1156,6 +1295,8 @@ if __name__ == '__main__':
                         help='Emit PROFILE_JSON with CUDA-event stage timings')
     parser.add_argument('--skip-fp8-ll-baseline', action='store_true',
                         help='Only measure the FP4 fused path')
+    parser.add_argument('--run-normal-baseline', action='store_true',
+                        help='Also measure the normal DeepEP dispatch/combine FP8 baseline')
     parser.add_argument('--profile-warmup', type=int, default=3)
     parser.add_argument('--profile-repeat', type=int, default=10)
     parser.add_argument('--profile-l2-flush-gb', type=float, default=0.0)
