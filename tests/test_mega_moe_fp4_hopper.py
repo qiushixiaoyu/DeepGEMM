@@ -652,7 +652,13 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
 
     predecoded_l1 = predecoded_l2 = None
     predecoded_ll_l1 = predecoded_ll_l2 = None
-    if args.fp4_mode in ("predecode-fp8-fused", "predecode-fp8-ll"):
+    if args.fp4_mode == "predecode-fp8-fused":
+        predecoded_l1, predecoded_l2 = (
+            deep_gemm.transform_weights_for_mega_moe_sm90_fp4_predecoded(
+                l1_fp4, l2_fp4
+            )
+        )
+    elif args.fp4_mode == "predecode-fp8-ll":
         l1_fp4_data, l1_fp4_sf = l1_fp4
         l2_fp4_data, l2_fp4_sf = l2_fp4
         l1_predecode_fp8 = _dequant_fp4_per32(
@@ -673,11 +679,6 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
         )
         predecoded_ll_l1 = (l1_predecode_fp8.contiguous(), l1_predecode_sf)
         predecoded_ll_l2 = (l2_predecode_fp8.contiguous(), l2_predecode_sf)
-        if args.fp4_mode == "predecode-fp8-fused":
-            predecoded_l1, predecoded_l2 = deep_gemm.transform_weights_for_mega_moe_sm90(
-                predecoded_ll_l1,
-                predecoded_ll_l2,
-            )
 
     l1_fp8 = _quantize_grouped_fp8_block_128_128(l1_bf16)
     l2_fp8 = _quantize_grouped_fp8_block_128_128(l2_bf16)
@@ -702,29 +703,20 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
 
     def fp4_fused_kernel():
         if args.fp4_mode == "predecode-fp8-fused":
-            deep_gemm.fp8_mega_moe(
-                y_fused,
-                predecoded_l1,
-                predecoded_l2,
-                sym_buffer,
-                cumulative_local_expert_recv_stats=cum_stats,
-                recipe=(128, 128, 128),
-                activation="swiglu",
-                activation_clamp=clamp_arg,
-                fast_math=bool(args.fast_math),
-            )
+            active_l1, active_l2 = predecoded_l1, predecoded_l2
         else:
-            deep_gemm.fp8_fp4_mega_moe(
-                y_fused,
-                transformed_l1,
-                transformed_l2,
-                sym_buffer,
-                cumulative_local_expert_recv_stats=cum_stats,
-                recipe=(1, 1, 32),
-                activation="swiglu",
-                activation_clamp=clamp_arg,
-                fast_math=bool(args.fast_math),
-            )
+            active_l1, active_l2 = transformed_l1, transformed_l2
+        deep_gemm.fp8_fp4_mega_moe(
+            y_fused,
+            active_l1,
+            active_l2,
+            sym_buffer,
+            cumulative_local_expert_recv_stats=cum_stats,
+            recipe=(1, 1, 32),
+            activation="swiglu",
+            activation_clamp=clamp_arg,
+            fast_math=bool(args.fast_math),
+        )
         return y_fused
 
     def run_fp4_fused():
@@ -970,6 +962,39 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
         else run_fp4_fused()
     )
     assert fused_out.shape == (num_tokens, hidden)
+    if args.check_predecode_runtime_match:
+        if args.fp4_mode != "predecode-fp8-fused":
+            raise ValueError(
+                "--check-predecode-runtime-match is only valid with "
+                "--fp4-mode predecode-fp8-fused"
+            )
+        y_runtime = torch.empty_like(y_fused)
+        fp4_prepare_inputs()
+        cum_stats.zero_()
+        deep_gemm.fp8_fp4_mega_moe(
+            y_runtime,
+            transformed_l1,
+            transformed_l2,
+            sym_buffer,
+            cumulative_local_expert_recv_stats=cum_stats,
+            recipe=(1, 1, 32),
+            activation="swiglu",
+            activation_clamp=clamp_arg,
+            fast_math=bool(args.fast_math),
+        )
+        torch.cuda.synchronize()
+        runtime_diff = calc_diff(fused_out, y_runtime)
+        ok = runtime_diff < args.check_diff_tol
+        dist_print(
+            f"  [predecode_vs_runtime] diff={runtime_diff:.4f} "
+            f"(tol={args.check_diff_tol:.2f}) {'OK' if ok else 'FAIL'}",
+            once_in_node=True,
+        )
+        if not ok:
+            raise AssertionError(
+                f"predecoded FP4 path differs from runtime FP4 path: "
+                f"diff={runtime_diff:.6f}"
+            )
     if run_fp8_normal_baseline_enabled:
         normal_out = run_fp8_normal_baseline()
         assert normal_out.shape == (num_tokens, hidden)
@@ -1301,6 +1326,10 @@ if __name__ == '__main__':
     parser.add_argument('--profile-repeat', type=int, default=10)
     parser.add_argument('--profile-l2-flush-gb', type=float, default=0.0)
     parser.add_argument('--kineto-flush-l2', type=int, default=0)
+    parser.add_argument('--check-predecode-runtime-match', action='store_true',
+                        help='With --bench --fp4-mode predecode-fp8-fused, '
+                             'compare predecoded API output against runtime FP4')
+    parser.add_argument('--check-diff-tol', type=float, default=0.02)
     args = parser.parse_args()
 
     np_ = args.num_processes
