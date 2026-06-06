@@ -1,4 +1,3 @@
-import os
 import torch
 import types
 from typing import Tuple, Optional
@@ -186,80 +185,6 @@ def transform_weights_for_mega_moe_sm90_fp4(
     )
 
 
-def _dequant_fp4_per32_to_e4m3(
-    fp4: torch.Tensor,
-    sf: torch.Tensor,
-    chunk_rows: Optional[int] = None,
-) -> torch.Tensor:
-    assert fp4.dtype in (torch.int8, torch.uint8), f"unexpected FP4 dtype {fp4.dtype}"
-    assert sf.dtype == torch.float32, f"unexpected SF dtype {sf.dtype}"
-    g, n, half_k = fp4.shape
-    k = half_k * 2
-    assert sf.shape == (g, n, k // 32), (
-        f"unexpected SF shape {tuple(sf.shape)} for FP4 shape {tuple(fp4.shape)}"
-    )
-    chunk_rows = chunk_rows or int(os.getenv("DG_SM90_FP4_PREDECODE_CHUNK_ROWS", "256"))
-    chunk_rows = max(1, int(chunk_rows))
-
-    fp4_rows = fp4.contiguous().view(g * n, half_k)
-    sf_rows = sf.contiguous().view(g * n, k // 32)
-    out = torch.empty((g * n, k), dtype=torch.float8_e4m3fn, device=fp4.device)
-    table = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-        dtype=torch.float32, device=fp4.device,
-    )
-
-    for row_start in range(0, g * n, chunk_rows):
-        row_end = min(row_start + chunk_rows, g * n)
-        packed = fp4_rows[row_start:row_end].to(torch.uint8)
-        lo = (packed & 0x0F).to(torch.int)
-        hi = ((packed >> 4) & 0x0F).to(torch.int)
-        codes = torch.stack((lo, hi), dim=-1).reshape(row_end - row_start, k)
-        mag = (codes & 0x07).to(torch.long)
-        sign = (codes & 0x08) != 0
-        val = table[mag]
-        val = torch.where(sign & (mag != 0), -val, val)
-        sf_broad = (
-            sf_rows[row_start:row_end]
-            .unsqueeze(-1)
-            .expand(row_end - row_start, k // 32, 32)
-            .reshape(row_end - row_start, k)
-        )
-        out[row_start:row_end] = (val * sf_broad).to(torch.float8_e4m3fn)
-    return out.view(g, n, k)
-
-
-def _unit_sm90_fp8_sf(w: torch.Tensor) -> torch.Tensor:
-    g, n, k = w.shape
-    assert n % 128 == 0 and k % 128 == 0
-    return torch.ones(
-        (g, n // 128, k // 128),
-        dtype=torch.float32,
-        device=w.device,
-    )
-
-
-def transform_weights_for_mega_moe_sm90_fp4_predecoded(
-    l1_weights: Tuple[torch.Tensor, torch.Tensor],
-    l2_weights: Tuple[torch.Tensor, torch.Tensor],
-    chunk_rows: Optional[int] = None,
-) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
-    """Predecode SM90 FP4 weights into the FP8 fused MegaMoE layout.
-
-    This is a memory-for-latency path: FP4 values and their per-32-K SFB are
-    folded once during weight transform, then inference can reuse the existing
-    SM90 FP8 MegaMoE kernel with unit weight scales.
-    """
-    l1_fp4, l1_sf_fp32 = l1_weights
-    l2_fp4, l2_sf_fp32 = l2_weights
-    l1_fp8 = _dequant_fp4_per32_to_e4m3(l1_fp4, l1_sf_fp32, chunk_rows)
-    l2_fp8 = _dequant_fp4_per32_to_e4m3(l2_fp4, l2_sf_fp32, chunk_rows)
-    return transform_weights_for_mega_moe_sm90(
-        (l1_fp8, _unit_sm90_fp8_sf(l1_fp8)),
-        (l2_fp8, _unit_sm90_fp8_sf(l2_fp8)),
-    )
-
-
 def fp8_fp4_mega_moe(y: torch.Tensor,
                      l1_weights: Tuple[torch.Tensor, torch.Tensor],
                      l2_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -269,19 +194,6 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True):
-    if _is_sm90() and l1_weights[0].dtype == torch.float8_e4m3fn:
-        assert l2_weights[0].dtype == torch.float8_e4m3fn
-        fp8_mega_moe(
-            y,
-            l1_weights, l2_weights,
-            sym_buffer,
-            cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
-            recipe=(128, 128, 128),
-            activation=activation,
-            activation_clamp=activation_clamp,
-            fast_math=fast_math,
-        )
-        return
     fn = _C.fp8_fp4_mega_moe_sm90 if _is_sm90() else _C.fp8_fp4_mega_moe
     fn(
         y,
