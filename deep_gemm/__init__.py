@@ -87,6 +87,7 @@ from .mega import (
     transform_weights_for_mega_moe,
     transform_weights_for_mega_moe_sm90,
     transform_weights_for_mega_moe_sm90_fp4,
+    transform_weights_for_mega_moe_sm90_fp4_predecoded,
     fp8_fp4_mega_moe,
     fp8_mega_moe,
 )
