@@ -325,6 +325,10 @@ static void fp8_fp4_mega_moe_sm90(
     const bool fp4_b4_skip_decode_band =
         !use_rs_mode and
         expected_tokens_per_expert >= 0.5f and expected_tokens_per_expert < 1.0f;
+    const bool fp4_pro_single_token_per_expert_band =
+        !use_rs_mode and intermediate_hidden >= 3072 and
+        expected_tokens_per_expert >= 1.0f and expected_tokens_per_expert < 1.5f and
+        num_experts_per_rank % 8 == 0;
     const bool fp4_2wg_decode_offload_band =
         !use_rs_mode and expected_tokens_per_expert >= 64.0f;
     const bool default_math_wg_decode =
@@ -342,6 +346,7 @@ static void fp8_fp4_mega_moe_sm90(
     const bool default_skip_loader_decode_assist =
         !use_rs_mode and
         ((expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f) or
+         fp4_pro_single_token_per_expert_band or
          (expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f) or
          fp4_decode_lookahead_band or fp4_b4_skip_decode_band or
          fp4_bigband_lookahead_band or fp4_2wg_decode_offload_band);

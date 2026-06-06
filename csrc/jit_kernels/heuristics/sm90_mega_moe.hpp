@@ -149,6 +149,12 @@ static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
         expected_tokens_per_expert >= 1.0f and expected_tokens_per_expert < 2.0f) {
         return num_experts_per_rank;
     }
+    if (!use_rs_mode and block_m == 64 and block_n == 128 and
+        intermediate_hidden >= 3072 and
+        expected_tokens_per_expert >= 1.0f and expected_tokens_per_expert < 1.5f and
+        num_experts_per_rank % 8 == 0) {
+        return 8;
+    }
     if (expected_tokens_per_expert < 1.0f or expected_tokens_per_expert > 4.0f) {
         return num_experts_per_rank;
     }
