@@ -263,7 +263,27 @@ try:
 
     bf16_m_grouped_gemm_nt_masked = m_grouped_bf16_gemm_nt_masked
 
-except AttributeError:
+    try:
+        fp8_fp4_gemm_nt_sm90_fused_wgmma = _C.fp8_fp4_gemm_nt_sm90_fused_wgmma
+    except AttributeError:
+        pass
+    try:
+        m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma = (
+            _C.m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma
+        )
+    except AttributeError:
+        pass
+    try:
+        m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma = (
+            _C.m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma
+        )
+        m_grouped_fp8_fp4_gemm_nt_mask_sm90_fused_wgmma = (
+            _C.m_grouped_fp8_fp4_gemm_nt_mask_sm90_fused_wgmma
+        )
+    except AttributeError:
+        pass
+
+except (AttributeError, ImportError):
     pass
 
 # Mega kernels
