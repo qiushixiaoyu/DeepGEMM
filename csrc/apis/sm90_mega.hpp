@@ -59,12 +59,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
     const auto bf16_token_layout = layout::Data(hidden * 2);
     const auto fp8_intermediate_token_layout = layout::Data(intermediate_hidden);
     const auto fp8_sf_layout = layout::Data(hidden / 32);
-    const bool host_use_sm90_fp4_rs_mode = get_env<int>("DG_SM90_FP4_RS_MODE") != 0;
-    const int default_sm90_fp4_block_n = host_use_sm90_fp4_rs_mode ? 64 : 128;
-    const int sm90_fp4_block_n =
-        get_env<int>("DG_SM90_FP4_BLOCK_N", default_sm90_fp4_block_n);
-    DG_HOST_ASSERT(sm90_fp4_block_n == 64 or sm90_fp4_block_n == 128);
-    const int sm90_l2_act_sf_gran_k = sm90_fp4_block_n == 64 ? 32 : 64;
+    const int sm90_l2_act_sf_gran_k = 64;
     const auto fp8_intermediate_sf_layout =
         layout::Data(intermediate_hidden * static_cast<int>(sizeof(float)) / sm90_l2_act_sf_gran_k);
     const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
@@ -311,58 +306,51 @@ static void fp8_fp4_mega_moe_sm90(
     DG_HOST_ASSERT(get_env<int>("DG_USE_FP4_ACTS") == 0);
     DG_HOST_ASSERT(get_env<int>("DG_USE_FP8_COMBINE") == 0);
 
-    const bool fuse_scale_b_humming_decode =
-        get_env<int>("DG_SM90_FP4_FUSE_SCALE_B_HUMMING_DECODE") != 0;
-    const bool use_rs_mode = get_env<int>("DG_SM90_FP4_RS_MODE") != 0;
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
     const bool fp4_decode_lookahead_band =
-        !use_rs_mode and
         expected_tokens_per_expert >= 3.0f and expected_tokens_per_expert <= 6.0f;
     const bool fp4_bigband_lookahead_band =
-        !use_rs_mode and
         expected_tokens_per_expert >= 12.0f and expected_tokens_per_expert <= 24.0f;
     const bool fp4_b4_skip_decode_band =
-        !use_rs_mode and
         expected_tokens_per_expert >= 0.5f and expected_tokens_per_expert < 1.0f;
     const bool fp4_pro_single_token_per_expert_band =
-        !use_rs_mode and intermediate_hidden >= 3072 and
+        intermediate_hidden >= 3072 and
         expected_tokens_per_expert >= 1.0f and expected_tokens_per_expert < 1.5f and
         num_experts_per_rank % 8 == 0;
     const bool fp4_pro_fractional_token_band =
-        !use_rs_mode and intermediate_hidden >= 3072 and
+        intermediate_hidden >= 3072 and
         expected_tokens_per_expert >= 0.25f and expected_tokens_per_expert < 1.0f;
     const bool fp4_pro_split_n_mbarrier_band =
-        !use_rs_mode and intermediate_hidden >= 3072 and
+        intermediate_hidden >= 3072 and
         expected_tokens_per_expert >= 0.25f and expected_tokens_per_expert < 64.0f;
     const bool fp4_pro_two_tokens_per_expert_band =
-        !use_rs_mode and intermediate_hidden >= 3072 and
+        intermediate_hidden >= 3072 and
         expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f;
     const bool fp4_pro_mid_decode_assist_band =
-        !use_rs_mode and intermediate_hidden >= 3072 and
+        intermediate_hidden >= 3072 and
         expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f;
     const bool fp4_pro_large_decode_assist_batch =
-        !use_rs_mode and intermediate_hidden >= 3072 and
+        intermediate_hidden >= 3072 and
         expected_tokens_per_expert >= 24.0f and expected_tokens_per_expert < 64.0f;
     const bool fp4_flash_two_tokens_per_expert_band =
-        !use_rs_mode and intermediate_hidden <= 2048 and
+        intermediate_hidden <= 2048 and
         expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 2.0f;
     const bool fp4_flash_half_token_per_expert_band =
-        !use_rs_mode and intermediate_hidden <= 2048 and
+        intermediate_hidden <= 2048 and
         expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.5f;
     const bool fp4_flash_decode_lookahead_band =
-        !use_rs_mode and intermediate_hidden <= 2048 and
+        intermediate_hidden <= 2048 and
         expected_tokens_per_expert >= 3.0f and expected_tokens_per_expert < 6.0f;
     const bool fp4_flash_stage4_no_early_band =
-        !use_rs_mode and intermediate_hidden <= 2048 and
+        intermediate_hidden <= 2048 and
         expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f;
     const bool fp4_flash_split_n_mbarrier_band =
-        !use_rs_mode and intermediate_hidden <= 2048 and
+        intermediate_hidden <= 2048 and
         expected_tokens_per_expert >= 0.75f and expected_tokens_per_expert < 64.0f;
     const bool fp4_2wg_decode_offload_band =
-        !use_rs_mode and expected_tokens_per_expert >= 64.0f;
+        expected_tokens_per_expert >= 64.0f;
     const bool default_math_wg_decode =
-        !use_rs_mode and
         ((expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f) or
          fp4_flash_half_token_per_expert_band or
          (expected_tokens_per_expert >= 1.0f and expected_tokens_per_expert < 2.0f) or
@@ -372,15 +360,10 @@ static void fp8_fp4_mega_moe_sm90(
          fp4_pro_mid_decode_assist_band or fp4_pro_large_decode_assist_batch or
          fp4_bigband_lookahead_band or fp4_2wg_decode_offload_band);
     const bool math_wg_participates_in_fp4_decode =
-        get_env<int>("DG_SM90_FP4_MATH_WG_DECODE",
-                     default_math_wg_decode ? 0 : 1) != 0;
-    const int default_num_math_wg_decode_warps =
-        math_wg_participates_in_fp4_decode ? 4 : 0;
+        !default_math_wg_decode;
     const int num_math_wg_decode_warps =
-        get_env<int>("DG_SM90_FP4_MATH_WG_DECODE_WARPS",
-                     default_num_math_wg_decode_warps);
+        math_wg_participates_in_fp4_decode ? 4 : 0;
     const bool default_skip_loader_decode_assist =
-        !use_rs_mode and
         ((expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f) or
          fp4_flash_half_token_per_expert_band or
          fp4_pro_single_token_per_expert_band or
@@ -390,10 +373,7 @@ static void fp8_fp4_mega_moe_sm90(
          fp4_pro_mid_decode_assist_band or fp4_pro_large_decode_assist_batch or
          fp4_bigband_lookahead_band or fp4_2wg_decode_offload_band);
     const int first_fp4_decode_assist_warp =
-        get_env<int>("DG_SM90_FP4_FIRST_DECODE_ASSIST_WARP",
-                     default_skip_loader_decode_assist ? 2 : 0);
-    const bool use_kg_pair_decode =
-        get_env<int>("DG_SM90_FP4_KG_PAIR_DECODE", 0) != 0;
+        default_skip_loader_decode_assist ? 2 : 0;
     const bool default_wide_load_decode =
         (fp4_pro_fractional_token_band and !fp4_pro_split_n_mbarrier_band) or
         (fp4_pro_single_token_per_expert_band and !fp4_pro_split_n_mbarrier_band) or
@@ -403,58 +383,8 @@ static void fp8_fp4_mega_moe_sm90(
         fp4_flash_decode_lookahead_band or
         (intermediate_hidden >= 3072 and fp4_bigband_lookahead_band) or
         fp4_pro_large_decode_assist_batch;
-    const bool use_wide_load_decode =
-        get_env<int>("DG_SM90_FP4_WIDE_LOAD_DECODE",
-                     default_wide_load_decode ? 1 : 0) != 0;
-    const bool use_vector_store_decode =
-        get_env<int>("DG_SM90_FP4_VECTOR_STORE_DECODE", 1) != 0;
-    const bool use_skip_zero_sfb_decode =
-        get_env<int>("DG_SM90_FP4_SKIP_ZERO_DECODE", 0) != 0;
-    const bool use_dynamic_lut_decode =
-        get_env<int>("DG_SM90_FP4_DYNAMIC_LUT_DECODE", 0) != 0;
-    const bool use_common_lut_fast_path =
-        get_env<int>("DG_SM90_FP4_COMMON_LUT_FASTPATH", 0) != 0;
-    const bool use_kg_pipeline_decode =
-        get_env<int>("DG_SM90_FP4_KG_PIPELINE_DECODE", 0) != 0;
-    const bool default_rs_group_k_promote =
-        use_rs_mode and num_tokens <= 16;
-    const bool use_rs_group_k_promote =
-        get_env<int>("DG_SM90_FP4_RS_GROUP_K_PROMOTE",
-                     default_rs_group_k_promote ? 1 : 0) != 0;
-    const bool use_rs_l2_group_k2_promote =
-        get_env<int>("DG_SM90_FP4_RS_L2_GROUP_K2_PROMOTE", 0) != 0;
-    const bool default_rs_transpose_vec_load =
-        use_rs_mode and num_tokens <= 2;
-    const bool use_rs_transpose_vec_load =
-        get_env<int>("DG_SM90_FP4_RS_TRANSPOSE_VEC_LOAD",
-                     default_rs_transpose_vec_load ? 1 : 0) != 0;
-    const bool use_rs_guard_transpose_valid =
-        get_env<int>("DG_SM90_FP4_RS_GUARD_TRANSPOSE_VALID", 0) != 0;
-    const bool default_rs_sfa_vec_load =
-        use_rs_mode and num_tokens <= 16;
-    const bool use_rs_sfa_vec_load =
-        get_env<int>("DG_SM90_FP4_RS_SFA_VEC_LOAD",
-                     default_rs_sfa_vec_load ? 1 : 0) != 0;
-    const bool use_rs_sfa_bcast_load =
-        get_env<int>("DG_SM90_FP4_RS_SFA_BCAST_LOAD", 0) != 0;
-    const bool default_rs_sfb_word_reuse =
-        use_rs_mode and num_tokens <= 16;
-    const bool use_rs_sfb_word_reuse =
-        get_env<int>("DG_SM90_FP4_RS_SFB_WORD_REUSE",
-                     default_rs_sfb_word_reuse ? 1 : 0) != 0;
-    const bool use_rs_sfb_bcast_load =
-        get_env<int>("DG_SM90_FP4_RS_SFB_BCAST_LOAD", 0) != 0;
-    const bool default_rs_stage_sfb =
-        use_rs_mode and num_tokens >= 4 and num_tokens <= 16;
-    const bool use_rs_stage_sfb =
-        get_env<int>("DG_SM90_FP4_RS_STAGE_SFB",
-                     default_rs_stage_sfb ? 1 : 0) != 0;
-    const bool use_rs_decode_pair_shfl =
-        get_env<int>("DG_SM90_FP4_RS_DECODE_PAIR_SHFL", 0) != 0;
-    const bool use_rs_direct_l2_scatter =
-        get_env<int>("DG_SM90_FP4_RS_DIRECT_L2_SCATTER", 0) != 0;
+    const bool use_wide_load_decode = default_wide_load_decode;
     const bool default_ss_early_b_decode =
-        !use_rs_mode and
         ((expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert <= 3.0f and
           !fp4_pro_two_tokens_per_expert_band and
           !fp4_flash_two_tokens_per_expert_band and
@@ -463,11 +393,7 @@ static void fp8_fp4_mega_moe_sm90(
           !fp4_pro_mid_decode_assist_band and
           !fp4_flash_stage4_no_early_band) or
          fp4_2wg_decode_offload_band);
-    const bool default_early_b_decode =
-        (use_rs_mode and num_tokens > 0 and num_tokens <= 16) or
-        default_ss_early_b_decode;
-    const bool use_early_b_decode =
-        get_env<int>("DG_SM90_FP4_EARLY_B_DECODE", default_early_b_decode ? 1 : 0) != 0;
+    const bool use_early_b_decode = default_ss_early_b_decode;
     const bool default_decode_done_mbarrier =
         fp4_pro_split_n_mbarrier_band or
         fp4_flash_split_n_mbarrier_band or
@@ -476,31 +402,15 @@ static void fp8_fp4_mega_moe_sm90(
          !fp4_flash_stage4_no_early_band) or
         fp4_bigband_lookahead_band or
         fp4_2wg_decode_offload_band;
-    const bool use_decode_done_mbarrier =
-        get_env<int>("DG_SM90_FP4_DECODE_MBARRIER",
-                     default_decode_done_mbarrier ? 1 : 0) != 0;
+    const bool use_decode_done_mbarrier = default_decode_done_mbarrier;
     const bool default_l2_arrival_counter =
-        !use_rs_mode and
         ((intermediate_hidden <= 2048 and
           expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert <= 0.75f and
           !fp4_flash_half_token_per_expert_band) or
          (intermediate_hidden >= 3072 and
           expected_tokens_per_expert >= 0.25f and expected_tokens_per_expert < 0.375f));
-    const bool use_l2_arrival_counter =
-        get_env<int>("DG_SM90_FP4_L2_ARRIVAL_COUNTER",
-                     default_l2_arrival_counter ? 1 : 0) != 0;
-    const bool default_skip_l2_epilogue_sync =
-        false;
-    const bool skip_l2_epilogue_sync =
-        get_env<int>("DG_SM90_FP4_SKIP_L2_EPILOGUE_SYNC",
-                     default_skip_l2_epilogue_sync ? 1 : 0) != 0;
-    const bool default_use_ss_nsplit =
-        !use_rs_mode and expected_tokens_per_expert >= 64.0f;
-    const bool use_ss_nsplit =
-        get_env<int>("DG_SM90_FP4_SS_NSPLIT",
-                     default_use_ss_nsplit ? 1 : 0) != 0;
-    const bool cache_expert_recv_counts =
-        get_env<int>("DG_SM90_FP4_CACHE_EXPERT_COUNTS", 1) != 0;
+    const bool use_l2_arrival_counter = default_l2_arrival_counter;
+    const bool use_ss_nsplit = expected_tokens_per_expert >= 64.0f;
     sm90_fp8_fp4_mega_moe(y,
                           l1_acts, l1_acts_sf,
                           l2_acts, l2_acts_sf,
@@ -513,36 +423,14 @@ static void fp8_fp4_mega_moe_sm90(
                           num_tokens, num_topk,
                           hidden, intermediate_hidden,
                           activation_clamp, fast_math,
-                          fuse_scale_b_humming_decode,
-                          /*scale_b_pow2_promote=*/true,
-                          use_rs_mode,
                           math_wg_participates_in_fp4_decode,
                           num_math_wg_decode_warps,
                           first_fp4_decode_assist_warp,
-                          use_kg_pair_decode,
                           use_wide_load_decode,
-                          use_vector_store_decode,
-                          use_skip_zero_sfb_decode,
-                          use_dynamic_lut_decode,
-                          use_common_lut_fast_path,
-                          use_kg_pipeline_decode,
-                          use_rs_group_k_promote,
-                          use_rs_l2_group_k2_promote,
-                          use_rs_transpose_vec_load,
-                          use_rs_guard_transpose_valid,
-                          use_rs_sfa_vec_load,
-                          use_rs_sfa_bcast_load,
-                          use_rs_sfb_word_reuse,
-                          use_rs_sfb_bcast_load,
-                          use_rs_stage_sfb,
-                          use_rs_decode_pair_shfl,
-                          use_rs_direct_l2_scatter,
                           use_early_b_decode,
                           use_decode_done_mbarrier,
                           use_l2_arrival_counter,
-                          skip_l2_epilogue_sync,
-                          use_ss_nsplit,
-                          cache_expert_recv_counts);
+                          use_ss_nsplit);
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();

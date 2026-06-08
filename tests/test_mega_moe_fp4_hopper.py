@@ -6,8 +6,8 @@ Mirrors :file:`test_mega_moe_hopper.py` but exercises the FP4-weight path:
 * Weights:     packed FP4 (E2M1) with per-32 K UE8M0 SFB. Each storage byte
                holds 2 nibbles (low nibble = even K, high nibble = odd K).
 * Kernel:      ``sm90_fp8_fp4_mega_moe_impl`` (decode-to-SMEM SS-mode WGMMA).
-               The per-32 SFB is folded into the FP4 → E4M3 dequant via
-               ``fp4x4_to_scaled_e4m3x4_humming`` (Plan C).
+               The per-32 SFB is folded into the FP4 -> E4M3 dequant through
+               a constant-memory UE8M0 lookup table.
 
 The reference runs in FP32 by dequantizing the same packed FP4 weights and
 their UE8M0 SFs, so any numerical disagreement should be at WGMMA accumulator
