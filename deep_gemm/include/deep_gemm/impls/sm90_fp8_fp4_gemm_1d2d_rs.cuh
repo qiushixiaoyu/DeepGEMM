@@ -538,6 +538,27 @@ CUTLASS_DEVICE uint32_t fp4x4_to_e4m3x4(uint32_t packed) {
     return out;
 }
 
+CUTLASS_DEVICE uint32_t int4_sym_to_e4m3_byte(uint32_t code) {
+    code &= 0x0fu;
+    constexpr uint32_t pos0 = 0x44403800u;  //  0,  1,  2,  3
+    constexpr uint32_t pos1 = 0x4e4c4a48u;  //  4,  5,  6,  7
+    constexpr uint32_t neg0 = 0xcaccced0u;  // -8, -7, -6, -5
+    constexpr uint32_t neg1 = 0xb8c0c4c8u;  // -4, -3, -2, -1
+    return code < 8u ?
+        (__byte_perm(pos0, pos1, code) & 0xffu) :
+        (__byte_perm(neg0, neg1, code - 8u) & 0xffu);
+}
+
+CUTLASS_DEVICE uint32_t int4_symx4_to_e4m3x4(uint32_t packed) {
+    uint32_t out = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t nib = (packed >> (i * 4)) & 0x0fu;
+        out |= int4_sym_to_e4m3_byte(nib) << (i * 8);
+    }
+    return out;
+}
+
 CUTLASS_DEVICE int32_t pow2_scale_to_exp_shift(float scale) {
     const uint32_t scale_bits = *reinterpret_cast<uint32_t*>(&scale);
     return static_cast<int32_t>((scale_bits >> 23) & 0xffu) - 127;
@@ -712,7 +733,6 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                      "DG_W4_SCALE_K_GROUP does not support per-32 FP4 scaling");
     DG_STATIC_ASSERT(kScaleKGroup == 1 or kScaleKGroup == 2 or kScaleKGroup == 4,
                      "DG_W4_SCALE_K_GROUP only supports 1/2/4");
-    DG_STATIC_ASSERT(not kBIsInt4Sym, "RS-mode FP8xFP4 kernel does not support INT4-sym B");
     DG_STATIC_ASSERT(not (kScaleBBF16 and kScaleBE8M0), "Scale-B cannot be both BF16 and E8M0");
     DG_STATIC_ASSERT((not kScaleBBF16 and not kScaleBE8M0) or (kScaleBDirectLoad and kScaleBGranK == 32),
                      "Compressed Scale-B dtypes are only supported by direct-load per-32 path");
@@ -1387,7 +1407,9 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                                     if constexpr (kDecodeStub) {
                                         a_regs[mat] = 0x38383838u;
                                     } else {
-                                        a_regs[mat] = fp4_rs_detail::fp4x4_to_e4m3x4(packed_shifted);
+                                        a_regs[mat] = kBIsInt4Sym ?
+                                            fp4_rs_detail::int4_symx4_to_e4m3x4(packed_shifted) :
+                                            fp4_rs_detail::fp4x4_to_e4m3x4(packed_shifted);
                                     }
                                 }
                             };
@@ -1576,7 +1598,9 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                                         // Four E4M3 1.0 values. Keeps the LDS/address path but removes FP4 decode.
                                         a_regs[mat] = 0x38383838u;
                                     } else {
-                                        a_regs[mat] = fp4_rs_detail::fp4x4_to_e4m3x4(packed_shifted);
+                                        a_regs[mat] = kBIsInt4Sym ?
+                                            fp4_rs_detail::int4_symx4_to_e4m3x4(packed_shifted) :
+                                            fp4_rs_detail::fp4x4_to_e4m3x4(packed_shifted);
                                     }
                                 }
                             };
@@ -1620,7 +1644,9 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                                     #pragma unroll
                                     for (uint32_t mat = 0; mat < 4; ++mat) {
                                         const uint32_t packed_shifted = load_packed_word(mat) >> packed_shift;
-                                        a_regs[mat] = fp4_rs_detail::fp4x4_to_e4m3x4(packed_shifted);
+                                        a_regs[mat] = kBIsInt4Sym ?
+                                            fp4_rs_detail::int4_symx4_to_e4m3x4(packed_shifted) :
+                                            fp4_rs_detail::fp4x4_to_e4m3x4(packed_shifted);
                                     }
                                 } else if constexpr (kFuseScaleBDecodeAssumeExp == 5) {
                                     constexpr fp4_rs_detail::ScaledE4M3Lut kExp5Lut{0x34302800u, 0x44403c38u};
@@ -1637,7 +1663,9 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                                             #pragma unroll
                                             for (uint32_t mat = 0; mat < 4; ++mat) {
                                                 const uint32_t packed_shifted = load_packed_word(mat) >> packed_shift;
-                                                a_regs[mat] = fp4_rs_detail::fp4x4_to_e4m3x4(packed_shifted);
+                                                a_regs[mat] = kBIsInt4Sym ?
+                                                    fp4_rs_detail::int4_symx4_to_e4m3x4(packed_shifted) :
+                                                    fp4_rs_detail::fp4x4_to_e4m3x4(packed_shifted);
                                             }
                                         } else if (uniform_exp and exp_offsets[0] == 5u) {
                                             constexpr fp4_rs_detail::ScaledE4M3Lut kExp5Lut{0x34302800u, 0x44403c38u};

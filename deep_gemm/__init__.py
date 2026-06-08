@@ -253,6 +253,7 @@ try:
         (a, a_sf), (b, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
         return _C.m_grouped_fp8_fp4_gemm_nt_masked(a, a_sf, b, b_sf, d, masked_m, expected_m, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
 
+    m_grouped_fp8_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
     fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
     
     def m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout, compiled_dims='nk', use_psum_layout=False, expected_m_for_psum_layout=None):
