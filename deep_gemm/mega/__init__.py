@@ -149,6 +149,42 @@ def transform_weights_for_mega_moe_sm90(
     return (_interleave_one(l1_fp8), l1_sf), l2_weights
 
 
+def transform_weights_for_mega_moe_sm90_fp4(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor]
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    """SM90 FP4 variant of `transform_weights_for_mega_moe`.
+
+    Weight tensors are packed FP4 storage with shape ``[E, N, K // 2]``.
+    Scale tensors are FP32 per-32-K SFB with shape ``[E, N, K // 32]`` and are
+    packed into contiguous ``[E, N, K // 128]`` int32 UE8M0 words for the SM90
+    FP4 kernel.
+    """
+    def _pack_fp32_sf_to_ue8m0_kmajor(sf_fp32: torch.Tensor) -> torch.Tensor:
+        assert sf_fp32.dtype == torch.float32, f"unexpected SF dtype {sf_fp32.dtype}"
+        e, n, k_groups = sf_fp32.shape
+        assert k_groups % 4 == 0, f"K/32={k_groups} must be a multiple of 4"
+        bits = sf_fp32.view(torch.int32)
+        ue8m0 = (bits.bitwise_right_shift(23).bitwise_and(0xff)).to(torch.uint8)
+        ue8m0 = ue8m0.contiguous().view(e, n, k_groups // 4, 4)
+        return ue8m0.view(torch.int32).reshape(e, n, k_groups // 4).contiguous()
+
+    def _as_packed_fp4_storage(fp4: torch.Tensor) -> torch.Tensor:
+        assert fp4.dtype in (torch.int8, torch.uint8), f"unexpected FP4 dtype {fp4.dtype}"
+        return fp4.contiguous().view(torch.int8)
+
+    l1_fp4, l1_sf_fp32 = l1_weights
+    l2_fp4, l2_sf_fp32 = l2_weights
+    l1_fp4 = _as_packed_fp4_storage(l1_fp4)
+    l2_fp4 = _as_packed_fp4_storage(l2_fp4)
+    l1_fp4 = _interleave_weights(l1_fp4)
+    l1_sf_fp32 = _interleave_weights(l1_sf_fp32)
+    return (
+        (l1_fp4, _pack_fp32_sf_to_ue8m0_kmajor(l1_sf_fp32)),
+        (l2_fp4, _pack_fp32_sf_to_ue8m0_kmajor(l2_sf_fp32)),
+    )
+
+
 def fp8_fp4_mega_moe(y: torch.Tensor,
                      l1_weights: Tuple[torch.Tensor, torch.Tensor],
                      l2_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -158,7 +194,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True):
-    _C.fp8_fp4_mega_moe(
+    fn = _C.fp8_fp4_mega_moe_sm90 if _is_sm90() else _C.fp8_fp4_mega_moe
+    fn(
         y,
         l1_weights, l2_weights,
         cumulative_local_expert_recv_stats,
@@ -170,7 +207,6 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         activation, activation_clamp,
         fast_math
     )
-
 
 def fp8_mega_moe(y: torch.Tensor,
                  l1_weights: Tuple[torch.Tensor, torch.Tensor],
