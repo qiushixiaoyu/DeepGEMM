@@ -97,8 +97,6 @@ def _dequant_fp4_per32(fp4: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
     val = table[mag]
     val = torch.where(sign & (mag != 0), -val, val)
     # Broadcast SF: each 32 K-cols share one SF.
-    if os.getenv('DSV4_FP4_REFERENCE_CLAMP_SF_MIN_2M6', '0') == '1':
-        sf = sf.clamp_min(2.0 ** -6)
     sf_broad = sf.unsqueeze(-1).expand(g, n, sf.size(-1), 32).reshape(g, n, k)
     return val * sf_broad
 
@@ -531,7 +529,12 @@ def _layer5_dsv4_shape(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
 
 def _layer6_dsv4_checkpoint(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
     assert num_ranks == 8, 'DSV4 checkpoint test expects 8 ranks'
-    model_path = os.getenv('DSV4_FP4_MODEL_PATH', '/data00/models/DeepSeek-V4-Flash')
+    model_path = os.getenv('DSV4_FP4_MODEL_PATH')
+    if not model_path:
+        dist_print(
+            '[SKIP] layer 6 DSV4 checkpoint test requires DSV4_FP4_MODEL_PATH',
+            once_in_node=True)
+        return []
     return [('L6.dsv4_ckpt_layer0_h4096_ih2048_e256_k6', dict(
         num_max_tokens_per_rank=128, num_tokens=64,
         hidden=4096, intermediate_hidden=2048,

@@ -19,13 +19,10 @@ namespace deep_gemm {
 // ----------------------------------------------------------------------------
 // Counterpart of `SM90FP8MegaMoERuntime` with these differences:
 //   * L1/L2 weights are packed E2M1 (FP4): each storage byte holds 2 nibbles
-//     (low nibble = even K, high nibble = odd K). The TMA descriptors
-//     therefore use `kPackedFP4` view of the weight tensors so that
-//     `aten_dtype_to_tensor_map_dtype` selects the FP4 descriptor type
-//     (`CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B` - dense, 2 nibbles/byte).
-//     We pass `fp4_unpacked_smem=false` so the smem layout is also dense
-//     (1 byte = 2 elements), matching the `b_packed_dtype_t = int8_t` SMEM
-//     tile that the kernel expects.
+//     (low nibble = even K, high nibble = odd K). Host code builds the TMA
+//     descriptors from a byte view of the packed tensors, so TensorMap sees
+//     dense bytes while the kernel interprets each byte as two FP4 elements
+//     in the `b_packed_dtype_t = int8_t` SMEM tile.
 //   * Weight scale factors switch from per-128 K float to per-32 K UE8M0,
 //     packed as int32 along K (4 bytes = 4 K-groups = BLOCK_K=128 K-cols
 //     for one N-row). They are passed as `const uint32_t*` instead of
@@ -58,8 +55,8 @@ public:
         // decode work and can run ahead through pipeline stages.
         bool math_wg_participates_in_fp4_decode;
         // Limit how many warps inside the math warpgroup help decode.
-        // This keeps CTA size fixed while testing whether reducing math-side
-        // non-tensor-core work improves WGMMA feed.
+        // This keeps CTA size fixed while reducing math-side non-tensor-core
+        // work that can interfere with WGMMA issue.
         int num_math_wg_decode_warps;
         // Skip early non-epilogue warps as FP4 decode helpers.
         // 0 keeps the existing 4 assist warps; 2 skips the two TMA loader
@@ -75,8 +72,9 @@ public:
         // readiness, avoiding the bitmask update's CTA-wide epilogue sync.
         bool use_l2_arrival_counter;
         // Split each SS N=128 WGMMA into two N=64 WGMMAs so the
-        // per-K-block accumulator is 32 floats instead of 64. This targets the
-        // 2-WG split-M path's structural accum spill while leaving defaults off.
+        // per-K-block accumulator is 32 floats instead of 64. Large-token SS
+        // shapes enable this to reduce accumulator pressure while keeping SS
+        // scheduling.
         bool use_ss_nsplit;
         MegaMoESM90Config config;
 
@@ -202,7 +200,7 @@ static void sm90_fp8_fp4_mega_moe(
     const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
 
     // Sanity: SFB tensors must be uint32 (UE8M0 packed) and weight tensors
-    // must be `kPackedFP4`-viewable storage (1 byte = 2 nibbles).
+    // must use byte-addressable packed FP4 storage (1 byte = 2 nibbles).
     DG_HOST_ASSERT(l1_weights_sf.scalar_type() == torch::kInt);
     DG_HOST_ASSERT(l2_weights_sf.scalar_type() == torch::kInt);
     DG_HOST_ASSERT(num_math_wg_decode_warps >= 0 and num_math_wg_decode_warps <= 4);

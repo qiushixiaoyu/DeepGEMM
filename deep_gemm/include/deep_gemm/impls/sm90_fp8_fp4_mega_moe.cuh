@@ -1154,8 +1154,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
         // Decompose `epilogue_wg_idx` into (m,n) coordinates over the
         // (kWarpgroupSplitM, kWarpgroupSplitN) grid:
-        //   - split-M (legacy):  kWarpgroupSplitN == 1, n_idx == 0
-        //   - split-N (new):     kWarpgroupSplitM == 1, m_idx == 0
+        //   - split-M path: kWarpgroupSplitN == 1, n_idx == 0
+        //   - split-N path: kWarpgroupSplitM == 1, m_idx == 0
         // Both factors collapse cleanly so the same expressions cover both.
         const uint32_t epilogue_wg_m_idx = epilogue_wg_idx / kWarpgroupSplitN;
         const uint32_t epilogue_wg_n_idx = epilogue_wg_idx - epilogue_wg_m_idx * kWarpgroupSplitN;
