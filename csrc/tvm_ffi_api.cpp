@@ -343,7 +343,7 @@ void dg_m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma(
     auto expected_m_opt = expected_m_for_psum_layout.has_value()? std::make_optional((int) expected_m_for_psum_layout.value()) : std::nullopt;
     auto block_m_opt = block_m_override.has_value()? std::make_optional((int) block_m_override.value()) : std::nullopt;
     auto block_n_opt = block_n_override.has_value()? std::make_optional((int) block_n_override.value()) : std::nullopt;
-    gemm::sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
+    sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
         std::make_pair(convert_to_torch_tensor(a), convert_to_torch_tensor(a_sf)),
         std::make_pair(convert_to_torch_tensor(b), convert_to_torch_tensor(b_sf)),
         convert_to_torch_tensor(d), convert_to_torch_tensor(grouped_layout),
@@ -396,7 +396,7 @@ void dg_m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma(
     auto block_n_opt = block_n_override.has_value()? std::make_optional((int) block_n_override.value()) : std::nullopt;
     auto masked_m_max_opt = masked_m_max_hint.has_value()? std::make_optional((int) masked_m_max_hint.value()) : std::nullopt;
     auto active_groups_opt = active_groups_hint.has_value()? std::make_optional((int) active_groups_hint.value()) : std::nullopt;
-    gemm::sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
+    sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         std::make_pair(convert_to_torch_tensor(a), convert_to_torch_tensor(a_sf)),
         std::make_pair(convert_to_torch_tensor(b), convert_to_torch_tensor(b_sf)),
         convert_to_torch_tensor(d), convert_to_torch_tensor(masked_m),
