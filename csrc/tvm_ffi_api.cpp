@@ -289,6 +289,20 @@ void dg_fp8_fp4_gemm_tt(TensorView a, TensorView a_sf,
                            compiled_dims, disable_ue8m0_cast);
 }
 
+void dg_fp8_fp4_gemm_nt_sm90_fused_wgmma(TensorView a, TensorView a_sf,
+                                         TensorView b, TensorView b_sf,
+                                         TensorView d,
+                                         Optional<TensorView> c,
+                                         int64_t gran_k,
+                                         std::string compiled_dims) {
+    auto c_opt = c.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(c.value())) : std::nullopt;
+    gemm::fp8_fp4_gemm_nt_sm90_fused_wgmma(
+        std::make_pair(convert_to_torch_tensor(a), convert_to_torch_tensor(a_sf)),
+        std::make_pair(convert_to_torch_tensor(b), convert_to_torch_tensor(b_sf)),
+        convert_to_torch_tensor(d), c_opt, (int) gran_k, compiled_dims
+    );
+}
+
 void dg_m_grouped_fp8_fp4_gemm_nt_contiguous(TensorView a, TensorView a_sf,
                                              TensorView b, TensorView b_sf,
                                              TensorView d,
@@ -314,6 +328,30 @@ void dg_m_grouped_fp8_fp4_gemm_nt_contiguous(TensorView a, TensorView a_sf,
     );
 }
 
+void dg_m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma(
+        TensorView a, TensorView a_sf,
+        TensorView b, TensorView b_sf,
+        TensorView d,
+        TensorView grouped_layout,
+        int64_t gran_k,
+        std::string compiled_dims,
+        bool use_psum_layout,
+        Optional<int64_t> expected_m_for_psum_layout,
+        Optional<int64_t> block_m_override,
+        Optional<int64_t> block_n_override,
+        bool decode_stub) {
+    auto expected_m_opt = expected_m_for_psum_layout.has_value()? std::make_optional((int) expected_m_for_psum_layout.value()) : std::nullopt;
+    auto block_m_opt = block_m_override.has_value()? std::make_optional((int) block_m_override.value()) : std::nullopt;
+    auto block_n_opt = block_n_override.has_value()? std::make_optional((int) block_n_override.value()) : std::nullopt;
+    gemm::sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
+        std::make_pair(convert_to_torch_tensor(a), convert_to_torch_tensor(a_sf)),
+        std::make_pair(convert_to_torch_tensor(b), convert_to_torch_tensor(b_sf)),
+        convert_to_torch_tensor(d), convert_to_torch_tensor(grouped_layout),
+        (int) gran_k, compiled_dims, use_psum_layout, expected_m_opt,
+        block_m_opt, block_n_opt, decode_stub
+    );
+}
+
 void dg_m_grouped_fp8_fp4_gemm_nn_contiguous(TensorView a, TensorView a_sf,
                                              TensorView b, TensorView b_sf,
                                              TensorView d,
@@ -333,6 +371,38 @@ void dg_m_grouped_fp8_fp4_gemm_nn_contiguous(TensorView a, TensorView a_sf,
         convert_to_torch_tensor(d), convert_to_torch_tensor(grouped_layout),
         recipe_opt, recipe_a_opt, recipe_b_opt,
         compiled_dims, disable_ue8m0_cast, use_psum_layout
+    );
+}
+
+void dg_m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma(
+        TensorView a, TensorView a_sf,
+        TensorView b, TensorView b_sf,
+        TensorView d,
+        TensorView masked_m,
+        int64_t expected_m,
+        int64_t gran_k,
+        Optional<int64_t> gran_k_a,
+        Optional<int64_t> gran_k_b,
+        std::string compiled_dims,
+        Optional<int64_t> block_m_override,
+        Optional<int64_t> block_n_override,
+        bool decode_stub,
+        bool b_is_int4_sym,
+        Optional<int64_t> masked_m_max_hint,
+        Optional<int64_t> active_groups_hint) {
+    auto gran_k_a_opt = gran_k_a.has_value()? std::make_optional((int) gran_k_a.value()) : std::nullopt;
+    auto gran_k_b_opt = gran_k_b.has_value()? std::make_optional((int) gran_k_b.value()) : std::nullopt;
+    auto block_m_opt = block_m_override.has_value()? std::make_optional((int) block_m_override.value()) : std::nullopt;
+    auto block_n_opt = block_n_override.has_value()? std::make_optional((int) block_n_override.value()) : std::nullopt;
+    auto masked_m_max_opt = masked_m_max_hint.has_value()? std::make_optional((int) masked_m_max_hint.value()) : std::nullopt;
+    auto active_groups_opt = active_groups_hint.has_value()? std::make_optional((int) active_groups_hint.value()) : std::nullopt;
+    gemm::sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
+        std::make_pair(convert_to_torch_tensor(a), convert_to_torch_tensor(a_sf)),
+        std::make_pair(convert_to_torch_tensor(b), convert_to_torch_tensor(b_sf)),
+        convert_to_torch_tensor(d), convert_to_torch_tensor(masked_m),
+        (int) expected_m, (int) gran_k, gran_k_a_opt, gran_k_b_opt,
+        compiled_dims, block_m_opt, block_n_opt, decode_stub, b_is_int4_sym,
+        masked_m_max_opt, active_groups_opt
     );
 }
 
@@ -415,9 +485,13 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_gemm_nt, dg_fp8_fp4_gemm_nt);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_gemm_nn, dg_fp8_fp4_gemm_nn);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_gemm_tn, dg_fp8_fp4_gemm_tn);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_gemm_tt, dg_fp8_fp4_gemm_tt);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_gemm_nt_sm90_fused_wgmma, dg_fp8_fp4_gemm_nt_sm90_fused_wgmma);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(m_grouped_fp8_fp4_gemm_nt_contiguous, dg_m_grouped_fp8_fp4_gemm_nt_contiguous);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma, dg_m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(m_grouped_fp8_fp4_gemm_nn_contiguous, dg_m_grouped_fp8_fp4_gemm_nn_contiguous);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(m_grouped_fp8_fp4_gemm_nt_masked, dg_m_grouped_fp8_fp4_gemm_nt_masked);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma, dg_m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(m_grouped_fp8_fp4_gemm_nt_mask_sm90_fused_wgmma, dg_m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(bf16_gemm_nt, dg_bf16_gemm_nt);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(bf16_gemm_nn, dg_bf16_gemm_nn);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(bf16_gemm_tn, dg_bf16_gemm_tn);

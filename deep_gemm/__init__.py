@@ -264,22 +264,43 @@ try:
     bf16_m_grouped_gemm_nt_masked = m_grouped_bf16_gemm_nt_masked
 
     try:
-        fp8_fp4_gemm_nt_sm90_fused_wgmma = _C.fp8_fp4_gemm_nt_sm90_fused_wgmma
+        _C.fp8_fp4_gemm_nt_sm90_fused_wgmma
+
+        def fp8_fp4_gemm_nt_sm90_fused_wgmma(a, b, d, c=None, gran_k=128, compiled_dims='nk'):
+            (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+            _C.fp8_fp4_gemm_nt_sm90_fused_wgmma(a_data, a_sf, b_data, b_sf, d, c, gran_k, compiled_dims)
     except AttributeError:
         pass
     try:
-        m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma = (
-            _C.m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma
-        )
+        _C.m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma
+
+        def m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma(
+                a, b, d, grouped_layout, gran_k=128, compiled_dims='nk',
+                use_psum_layout=False, expected_m_for_psum_layout=None,
+                block_m_override=None, block_n_override=None, decode_stub=False):
+            (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+            _C.m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma(
+                a_data, a_sf, b_data, b_sf, d, grouped_layout, gran_k,
+                compiled_dims, use_psum_layout, expected_m_for_psum_layout,
+                block_m_override, block_n_override, decode_stub)
     except AttributeError:
         pass
     try:
-        m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma = (
-            _C.m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma
-        )
-        m_grouped_fp8_fp4_gemm_nt_mask_sm90_fused_wgmma = (
-            _C.m_grouped_fp8_fp4_gemm_nt_mask_sm90_fused_wgmma
-        )
+        _C.m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma
+
+        def m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma(
+                a, b, d, masked_m, expected_m, gran_k=128, gran_k_a=None,
+                gran_k_b=None, compiled_dims='nk', block_m_override=None,
+                block_n_override=None, decode_stub=False, b_is_int4_sym=False,
+                masked_m_max_hint=None, active_groups_hint=None):
+            (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+            _C.m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma(
+                a_data, a_sf, b_data, b_sf, d, masked_m, expected_m, gran_k,
+                gran_k_a, gran_k_b, compiled_dims, block_m_override,
+                block_n_override, decode_stub, b_is_int4_sym,
+                masked_m_max_hint, active_groups_hint)
+
+        m_grouped_fp8_fp4_gemm_nt_mask_sm90_fused_wgmma = m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma
     except AttributeError:
         pass
 
