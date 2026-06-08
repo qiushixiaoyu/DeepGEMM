@@ -182,16 +182,20 @@ struct MegaMoEScheduler {
         return {BlockPhase::None, 0, 0, 0};
     }
 
-    CUTLASS_DEVICE void fetch_expert_recv_count() {
+    CUTLASS_DEVICE void fetch_expert_recv_count(const uint32_t* cached_recv_counts = nullptr) {
         // NOTES: each lane caches experts at indices (i * 32 + lane_idx)
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
-                do {
-                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                if (cached_recv_counts != nullptr) {
+                    value = cached_recv_counts[expert_idx];
+                } else {
+                    do {
+                        value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                    } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                }
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }
@@ -199,9 +203,9 @@ struct MegaMoEScheduler {
     }
 
     template <typename Func>
-    CUTLASS_DEVICE void for_each_block(Func&& func) {
+    CUTLASS_DEVICE void for_each_block(Func&& func, const uint32_t* cached_recv_counts = nullptr) {
         // Wait for all expert counters to be finalized
-        fetch_expert_recv_count();
+        fetch_expert_recv_count(cached_recv_counts);
 
         // Initialize current expert with 0
         set_expert_idx(0);

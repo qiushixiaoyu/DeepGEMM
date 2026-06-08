@@ -54,6 +54,9 @@ public:
         // this as a JIT-time specialization so the default helper does not
         // carry both code paths and pollute small-batch codegen.
         bool use_kg_pair_decode;
+        // Read the four packed FP4 words for one K/32 group with a
+        // single wide shared load while keeping the default work partition.
+        bool use_wide_load_decode;
         // Reduce decoded-tile shared-store instruction count by
         // writing two adjacent u64 outputs with one st.shared.v2.u64.
         bool use_vector_store_decode;
@@ -145,6 +148,8 @@ public:
         // per-K-block accumulator is 32 floats instead of 64. This targets the
         // 2-WG split-M path's structural accum spill while leaving defaults off.
         bool use_ss_nsplit;
+        // Cache scheduler expert recv counts in shared memory once per CTA.
+        bool cache_expert_recv_counts;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -207,7 +212,9 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}, {},
+        {},
         {},
         {},
         {},
@@ -232,6 +239,7 @@ static void __instantiate_kernel() {{
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
     args.use_kg_pair_decode ? "true" : "false",
+    args.use_wide_load_decode ? "true" : "false",
     args.use_vector_store_decode ? "true" : "false",
     args.use_skip_zero_sfb_decode ? "true" : "false",
     args.use_dynamic_lut_decode ? "true" : "false",
@@ -258,7 +266,8 @@ static void __instantiate_kernel() {{
     args.use_decode_done_mbarrier ? "true" : "false",
     args.use_l2_arrival_counter ? "true" : "false",
     args.skip_l2_epilogue_sync ? "true" : "false",
-    args.use_ss_nsplit ? "true" : "false");
+    args.use_ss_nsplit ? "true" : "false",
+    args.cache_expert_recv_counts ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -301,6 +310,7 @@ static void sm90_fp8_fp4_mega_moe(
     const int& num_math_wg_decode_warps = 4,
     const int& first_fp4_decode_assist_warp = 0,
     const bool& use_kg_pair_decode = false,
+    const bool& use_wide_load_decode = false,
     const bool& use_vector_store_decode = false,
     const bool& use_skip_zero_sfb_decode = false,
     const bool& use_dynamic_lut_decode = false,
@@ -321,7 +331,8 @@ static void sm90_fp8_fp4_mega_moe(
     const bool& use_decode_done_mbarrier = false,
     const bool& use_l2_arrival_counter = false,
     const bool& skip_l2_epilogue_sync = false,
-    const bool& use_ss_nsplit = false
+    const bool& use_ss_nsplit = false,
+    const bool& cache_expert_recv_counts = true
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -392,14 +403,14 @@ static void sm90_fp8_fp4_mega_moe(
     const int wg_block_n = config.block_n / wg_split_n;
     const int wg_l1_out_block_n = wg_block_n / 2;
     const int l1_output_box_m = wg_block_m;
-    // share-SF 路径要求合并 TMA store，box 退化回单 WG 的
-    // (L1_OUT_BLOCK_N, BLOCK_M)。这里的 kL2ActsSFGranK 与 kernel 端
-    // `kL2ActsSFGranK` 的语义保持一致：BLOCK_N=64 时 per-32 K，否则 per-64 K。
-    const int kL2ActsSFGranK_h = config.block_n == 64 ? 32 : 64;
+    // Split-N with 32 post-SwiGLU cols per WG still uses one combined 64-col TMA
+    // store from wg0; the 32-col per-WG store shape is not used on this path.
+    const int kL2ActsSFGranK_h = kL2ActsSFGranK;
+    const bool split_n_combines_l1_store = split_n_warpgroups and wg_l1_out_block_n < 64;
     const bool split_n_shares_sf = split_n_warpgroups and
                                   (wg_l1_out_block_n < kL2ActsSFGranK_h);
-    const int tma_l1_out_box_n = split_n_shares_sf ? (config.block_n / 2) : wg_l1_out_block_n;
-    const int tma_l1_out_box_m = split_n_shares_sf ? config.block_m : l1_output_box_m;
+    const int tma_l1_out_box_n = split_n_combines_l1_store ? (config.block_n / 2) : wg_l1_out_block_n;
+    const int tma_l1_out_box_m = split_n_combines_l1_store ? config.block_m : l1_output_box_m;
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
                                                        intermediate_hidden, config.num_max_pool_tokens,
                                                        tma_l1_out_box_n, tma_l1_out_box_m,
@@ -436,6 +447,7 @@ static void sm90_fp8_fp4_mega_moe(
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
         .use_kg_pair_decode = use_kg_pair_decode,
+        .use_wide_load_decode = use_wide_load_decode,
         .use_vector_store_decode = use_vector_store_decode,
         .use_skip_zero_sfb_decode = use_skip_zero_sfb_decode,
         .use_dynamic_lut_decode = use_dynamic_lut_decode,
@@ -463,6 +475,7 @@ static void sm90_fp8_fp4_mega_moe(
         .use_l2_arrival_counter = use_l2_arrival_counter,
         .skip_l2_epilogue_sync = skip_l2_epilogue_sync,
         .use_ss_nsplit = use_ss_nsplit,
+        .cache_expert_recv_counts = cache_expert_recv_counts,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

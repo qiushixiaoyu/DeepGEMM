@@ -117,6 +117,118 @@ template <
     bool kFuseScaleBHummingDecode,
     typename PackedT,
     typename DecodedT>
+__device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_wide_load(
+    const uint32_t decode_thread_idx,
+    const uint32_t num_decode_threads,
+    const PackedT* __restrict__ smem_b_packed_stage,
+    DecodedT* __restrict__ smem_b_stage,
+    const uint32_t* __restrict__ smem_sfb_stage) {
+    constexpr uint32_t kPackedWordsPerKG = kScaleBGranK / 8;  // 4
+    constexpr uint32_t kGroupsPerTile = LOAD_BLOCK_N * kNumSFBPerBlockK;
+    DG_STATIC_ASSERT(kPackedWordsPerKG == 4, "Wide-load decode assumes per-32K groups");
+
+    for (uint32_t group = decode_thread_idx; group < kGroupsPerTile; group += num_decode_threads) {
+        const uint32_t n_row = group / kNumSFBPerBlockK;
+        const uint32_t kg = group - n_row * kNumSFBPerBlockK;
+        const uint32_t sfb_word = smem_sfb_stage[n_row];
+        const uint32_t e8m0 = (sfb_word >> (kg * 8)) & 0xffu;
+
+        const auto* packed_row = reinterpret_cast<const uint32_t*>(
+            smem_b_packed_stage + n_row * (BLOCK_K / 2));
+        auto* decoded_row_u64 = reinterpret_cast<uint64_t*>(
+            smem_b_stage + n_row * BLOCK_K);
+        const uint32_t row_swizzle = n_row & 7u;
+
+        const uint32_t seg_base = kg * 2u;
+        const uint32_t swz_seg_0 = seg_base ^ row_swizzle;
+        const uint32_t swz_seg_1 = (seg_base + 1u) ^ row_swizzle;
+        if constexpr (kSkipZeroSFBDecode) {
+            if (e8m0 == 0u) {
+                ptx::st_shared_v2_u64(decoded_row_u64 + swz_seg_0 * 2u, 0ull, 0ull);
+                ptx::st_shared_v2_u64(decoded_row_u64 + swz_seg_1 * 2u, 0ull, 0ull);
+                continue;
+            }
+        }
+
+        uint32_t scaled_lut_lo = 0;
+        uint32_t scaled_lut_hi = 0;
+        if constexpr (!kFuseScaleBHummingDecode) {
+            if constexpr (kUseDynamicLutDecode) {
+                const auto scaled_lut =
+                    fp4_rs_detail::make_scaled_e4m3_lut_from_e8m0_fast(e8m0);
+                scaled_lut_lo = scaled_lut.lo;
+                scaled_lut_hi = scaled_lut.hi;
+            } else {
+                const uint64_t scaled_lut =
+                    kUseCommonLutFastPath ?
+                    fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_common_const(e8m0) :
+                    fp4_rs_detail::pack_scaled_e4m3_lut_from_e8m0_const(e8m0);
+                scaled_lut_lo = static_cast<uint32_t>(scaled_lut);
+                scaled_lut_hi = static_cast<uint32_t>(scaled_lut >> 32);
+            }
+        }
+
+        const uint4 packed = reinterpret_cast<const uint4*>(packed_row)[kg];
+        uint32_t lo_0, hi_0, lo_1, hi_1, lo_2, hi_2, lo_3, hi_3;
+        if constexpr (kFuseScaleBHummingDecode) {
+            if (e8m0 >= 121u and e8m0 <= 149u) {
+                const uint32_t exp_offset = e8m0 - 121u;
+                lo_0 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed.x & 0xffffu, exp_offset);
+                hi_0 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed.x >> 16, exp_offset);
+                lo_1 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed.y & 0xffffu, exp_offset);
+                hi_1 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed.y >> 16, exp_offset);
+                lo_2 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed.z & 0xffffu, exp_offset);
+                hi_2 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed.z >> 16, exp_offset);
+                lo_3 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed.w & 0xffffu, exp_offset);
+                hi_3 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_humming(packed.w >> 16, exp_offset);
+            } else {
+                lo_0 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0_fast(packed.x & 0xffffu, e8m0);
+                hi_0 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0_fast(packed.x >> 16, e8m0);
+                lo_1 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0_fast(packed.y & 0xffffu, e8m0);
+                hi_1 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0_fast(packed.y >> 16, e8m0);
+                lo_2 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0_fast(packed.z & 0xffffu, e8m0);
+                hi_2 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0_fast(packed.z >> 16, e8m0);
+                lo_3 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0_fast(packed.w & 0xffffu, e8m0);
+                hi_3 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_e8m0_fast(packed.w >> 16, e8m0);
+            }
+        } else {
+            lo_0 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_lut(
+                packed.x & 0xffffu, scaled_lut_lo, scaled_lut_hi);
+            hi_0 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_lut(
+                packed.x >> 16, scaled_lut_lo, scaled_lut_hi);
+            lo_1 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_lut(
+                packed.y & 0xffffu, scaled_lut_lo, scaled_lut_hi);
+            hi_1 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_lut(
+                packed.y >> 16, scaled_lut_lo, scaled_lut_hi);
+            lo_2 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_lut(
+                packed.z & 0xffffu, scaled_lut_lo, scaled_lut_hi);
+            hi_2 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_lut(
+                packed.z >> 16, scaled_lut_lo, scaled_lut_hi);
+            lo_3 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_lut(
+                packed.w & 0xffffu, scaled_lut_lo, scaled_lut_hi);
+            hi_3 = fp4_rs_detail::fp4x4_to_scaled_e4m3x4_lut(
+                packed.w >> 16, scaled_lut_lo, scaled_lut_hi);
+        }
+        ptx::st_shared(
+            decoded_row_u64 + swz_seg_0 * 2u,
+            lo_0, hi_0, lo_1, hi_1);
+        ptx::st_shared(
+            decoded_row_u64 + swz_seg_1 * 2u,
+            lo_2, hi_2, lo_3, hi_3);
+    }
+}
+
+template <
+    uint32_t LOAD_BLOCK_N,
+    uint32_t BLOCK_K,
+    uint32_t kScaleBGranK,
+    uint32_t kNumSFBPerBlockK,
+    bool kUseDynamicLutDecode,
+    bool kUseCommonLutFastPath,
+    bool kSkipZeroSFBDecode,
+    bool kFuseScaleBHummingDecode,
+    typename PackedT,
+    typename DecodedT>
 __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_vec_store(
     const uint32_t decode_thread_idx,
     const uint32_t num_decode_threads,
@@ -412,6 +524,7 @@ template <
     uint32_t kScaleBGranK,
     uint32_t kNumSFBPerBlockK,
     bool kUseKGPairDecode,
+    bool kUseWideLoadDecode,
     bool kUseVectorStoreDecode,
     bool kSkipZeroSFBDecode,
     bool kUseDynamicLutDecode,
@@ -427,6 +540,13 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_dispatch(
     const uint32_t* __restrict__ smem_sfb_stage) {
     if constexpr (kUseKGPairDecode) {
         dequant_fp4_b_tile_to_e4m3_smem_kg_pair<
+            LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
+            kUseDynamicLutDecode, kUseCommonLutFastPath,
+            kSkipZeroSFBDecode, kFuseScaleBHummingDecode>(
+            decode_thread_idx, num_decode_threads,
+            smem_b_packed_stage, smem_b_stage, smem_sfb_stage);
+    } else if constexpr (kUseWideLoadDecode) {
+        dequant_fp4_b_tile_to_e4m3_smem_wide_load<
             LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
             kUseDynamicLutDecode, kUseCommonLutFastPath,
             kSkipZeroSFBDecode, kFuseScaleBHummingDecode>(
@@ -502,6 +622,7 @@ template <
     bool kFastMath,
     // FP4-specific knobs (all defaults match the design doc's "Plan C" path).
     bool kUseKGPairDecode          = false,  // Decode two consecutive K-groups per work item
+    bool kUseWideLoadDecode        = false,  // Read the four packed words for one K-group as uint4
     bool kUseVectorStoreDecode     = false,  // Write adjacent decoded u64 values with one v2.u64 store
     bool kSkipZeroSFBDecode        = false,  // Skip LUT decode when UE8M0 scale byte is zero
     bool kUseDynamicLutDecode      = false,  // Build per-SFB LUT in registers instead of constant-cache lookup
@@ -529,6 +650,7 @@ template <
     bool kL2ArrivalCounter        = false,  // Count ready L1 output slices instead of bitmask + CTA sync
     bool kSkipL2EpilogueSync      = false,  // Rely on following grid/NVLink sync after L2 scatter
     bool kFP4SSNSplit             = false,  // Split SS N=128 WGMMA into 2x N=64 to reduce accum pressure
+    bool kCacheExpertRecvCounts   = true,   // Cache scheduler recv counts in SMEM once per CTA
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -614,10 +736,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden);
     // Per-128 K float SF: 4 bytes per per-128 group => `kHidden / 32` bytes/token (same as SM100 packing)
     constexpr auto fp8_sf_layout                 = layout::Data(kHidden / 32);
-    // L2 activation SF is per-64 for the default BLOCK_N=128 path.  When
-    // BLOCK_N=64, each L1 block emits only 32 post-SwiGLU columns, so the
-    // intermediate SF buffer switches to per-32 to keep quant/dequant exact.
-    constexpr uint32_t kL2ActsSFGranK  = BLOCK_N == 64 ? 32 : 64;
+    // L2 activation SF is per-64 for BLOCK_N=128 and per-32 for BLOCK_N=64.
+    constexpr uint32_t kL2ActsSFGranK = BLOCK_N == 64 ? 32 : 64;
     constexpr auto fp8_intermediate_sf_layout =
         layout::Data(kIntermediateHidden * sizeof(float) / kL2ActsSFGranK);
     constexpr auto input_topk_idx_layout         = layout::Data(kNumTopk * sizeof(int64_t), false);
@@ -695,10 +815,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t L1_OUT_BLOCK_N  = BLOCK_N / 2;  // post-SwiGLU
     constexpr uint32_t WG_L1_OUT_BLOCK_N = WG_BLOCK_N / 2;
     // FP4 split-N=2 + BLOCK_N=128 路径下，每 WG 只生成 WG_L1_OUT_BLOCK_N
-    // 列 post-SwiGLU 输出（=32 列），但 L2 acts SF 仍是 per-`kL2ActsSFGranK`=64
-    // K granularity，于是两个 WG 共享同一个 SF group。此时必须把 amax 在
-    // 两 WG 间合并归约后再算 SF/SF_inv，并由其中一个 WG 一次性写 SF +
-    // 发起合并 TMA store。
+    // 列 post-SwiGLU 输出（=32 列）。TMA store 仍由 wg0 合并发 64 列，避免
+    // 32 列 store 形态；L2 acts SF 是 per-64，因此两个 WG 的 amax 需要
+    // 合并后只写一个共享 SF group。
+    constexpr bool kSplitNCombinesL1Store = kSplitNWarpgroups and (WG_L1_OUT_BLOCK_N < 64);
     constexpr bool kSplitNSharesSF = kSplitNWarpgroups and (WG_L1_OUT_BLOCK_N < kL2ActsSFGranK);
     DG_STATIC_ASSERT(not kSplitNSharesSF or kSplitNWarpgroups,
                      "share-SF only meaningful under split-N");
@@ -775,10 +895,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // 跨 WG 归约。每个 lane 持有一对 (amax_r0, amax_r1)，但只有 col_idx==0
     // 的 lane 在写 SF。我们让所有 col_idx==0 的 lane 都参与 amax 归约，
     // 即每个 WG 内有 32 个 active lane（对应 32 个唯一 row pair）。
-    // 跨 WG 把每个 row pair 的 amax 合并到唯一 slot：
-    //   slot = warp_idx_in_wg * 8 + row_idx  (row_idx = lane_idx / 4)
-    // 共 32 行（8 row 每 warp × 4 warp）× 2（r0, r1）= 64 个 float slot。
-    constexpr uint32_t kAmaxScratchSlots = 32 * 2;  // 每行 (r_0, r_1)
+    // 两个 N-split WG 先写各自的 amax，再同步后读两份取 max，避免 atomicMax
+    // 和第二次 epilogue-wide barrier：
+    //   row_slot = warp_idx_in_wg * 8 + row_idx  (row_idx = lane_idx / 4)
+    //   scratch[row_slot][wg_n_idx][r0/r1]
+    // 共 32 行 × 2 WG × 2（r0, r1）= 128 个 float slot。
+    constexpr uint32_t kAmaxScratchSlots = 32 * 2 * 2;
     constexpr uint32_t SMEM_AMAX_SCRATCH_SIZE = kSplitNSharesSF ?
         math::constexpr_align<uint32_t>(kAmaxScratchSlots * sizeof(uint32_t),
                                         kSharedMemoryAlignment) : 0;
@@ -928,7 +1050,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank, kNumExpertsPerWave,
         kNumSMs, kNumRanks>(workspace);
-
     // Pipeline state shared by TMA loaders and math warpgroups
     uint32_t stage_idx = 0, phase = 0;
     auto advance_pipeline = [&](uint32_t& k_block_idx) {
@@ -942,7 +1063,23 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kDispatchWithEpilogueBarrierIdx  = 1;
     constexpr uint32_t kEpilogueFullBarrierIdx          = 2;
     constexpr uint32_t kEpilogueWGBarrierStartIdx       = 3;
+    constexpr uint32_t kSchedulerCountCacheBarrierIdx   = 14;
     constexpr uint32_t kFP4DecodeBarrierIdx             = 15;
+    DG_STATIC_ASSERT(kEpilogueWGBarrierStartIdx + kNumEpilogueWarpgroups <= kSchedulerCountCacheBarrierIdx,
+                     "Epilogue WG barriers overlap scheduler-count cache barrier");
+    const uint32_t* cached_recv_counts = kCacheExpertRecvCounts ? smem_expert_count : nullptr;
+    auto cache_expert_recv_counts = [&]() {
+        if constexpr (kCacheExpertRecvCounts) {
+            if (thread_idx < kNumExpertsPerRank) {
+                uint64_t value = 0;
+                do {
+                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(thread_idx));
+                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                smem_expert_count[thread_idx] = static_cast<uint32_t>(value);
+            }
+            ptx::sync_unaligned(kNumThreads, kSchedulerCountCacheBarrierIdx);
+        }
+    };
 
     // Cross-rank NVLink barrier tags
     constexpr uint32_t kBeforeDispatchPullBarrierTag    = 1;
@@ -950,11 +1087,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kAfterWorkspaceCleanBarrierTag   = 3;
 
     // Register reconfiguration counts (chosen to fit in 64512 reg budget).
-    // For the 256-epilogue-thread case (block_m=128, 2 math WGs):
-    //   128*48 + 128*40 + 256*208 = 64512 exactly.
+    // Split-N halves the live accumulator footprint per math warpgroup, so it
+    // does not need the full 208-register epilogue allocation used by the
+    // regular N=128 path.
     constexpr uint32_t kNumDispatchRegisters    = 48;
     constexpr uint32_t kNumNonEpilogueRegisters = 40;
-    constexpr uint32_t kNumEpilogueRegisters    = 208;
+    constexpr uint32_t kNumEpilogueRegisters    = kSplitNWarpgroups ? 160 : 208;
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
                      kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
@@ -1017,7 +1155,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         } else {
             dequant_fp4_b_tile_to_e4m3_smem_dispatch<
                 LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
-                kUseKGPairDecode, kUseVectorStoreDecode,
+                kUseKGPairDecode, kUseWideLoadDecode, kUseVectorStoreDecode,
                 kSkipZeroSFBDecode, kUseDynamicLutDecode,
                 kUseCommonLutFastPath, kFuseScaleBHummingDecode>(
                 decode_thread_idx, kNumFP4DecodeWorkerThreads,
@@ -1107,6 +1245,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             false, true);
 
+        // Cache finalized expert counts before the dispatch/epilogue rendezvous
+        // so loader warps can leave the all-CTA count barrier and start waiting
+        // on L1 arrivals while dispatch and epilogue complete their handshake.
+        cache_expert_recv_counts();
+
         // Sync with epilogue warps before pulling tokens
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
@@ -1115,7 +1258,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
         const auto pull_mbarrier = dispatch_barriers[warp_idx];
 
-        scheduler.fetch_expert_recv_count();
+        scheduler.fetch_expert_recv_count(cached_recv_counts);
 
         constexpr uint32_t kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32u);
         int      current_expert_idx = -1;
@@ -1299,6 +1442,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // =====================================================================
     } else if (warp_idx == kNumDispatchWarps) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        cache_expert_recv_counts();
 
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
@@ -1376,10 +1520,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     decode_fp4_b_stage(stage_idx, decode_thread_idx);
                 }
             }
-        });
+        }, cached_recv_counts);
 
     } else if (warp_idx == kNumDispatchWarps + 1) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        cache_expert_recv_counts();
 
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
@@ -1446,13 +1591,14 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     decode_fp4_b_stage(stage_idx, decode_thread_idx);
                 }
             }
-        });
+        }, cached_recv_counts);
 
     } else if (warp_idx < kNumDispatchWarps + kNumMMANonEpilogueWarps) {
         // Idle non-epilogue warps (kNumDispatchWarps+2, +3). They must still
         // participate in the warpgroup-collective `setmaxnreg.dec.sync.aligned`
         // so that the math warpgroup's `warpgroup_reg_alloc` can succeed.
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        cache_expert_recv_counts();
 
         if constexpr (!kUseRSMode) {
             const uint32_t non_epilogue_warp_idx = warp_idx - kNumDispatchWarps;
@@ -1468,7 +1614,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         wait_fp4_decode_input_ready(stage_idx, phase);
                         decode_fp4_b_stage(stage_idx, decode_thread_idx);
                     }
-                });
+                }, cached_recv_counts);
             }
         }
 
@@ -1522,6 +1668,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         // Likewise the L2 BF16 staging tile is BLOCK_M x BLOCK_N.
         const uint32_t smem_cd_l2_wg_offset =
             wg_m_offset * BLOCK_N + wg_n_offset;
+
+        cache_expert_recv_counts();
 
         // Sync with dispatch
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -2133,7 +2281,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 kNumFP4DecodeAssistThreads + epilogue_thread_idx;
                             dequant_fp4_b_tile_to_e4m3_smem_dispatch<
                                 LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
-                                kUseKGPairDecode, kUseVectorStoreDecode,
+                                kUseKGPairDecode, kUseWideLoadDecode, kUseVectorStoreDecode,
                                 kSkipZeroSFBDecode, kUseDynamicLutDecode,
                                 kUseCommonLutFastPath, kFuseScaleBHummingDecode>(
                                 decode_thread_idx, kNumFP4DecodeWorkerThreads,
@@ -2561,41 +2709,34 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
                 // === Phase A+: share-SF 跨 WG 归约 ===
                 // kSplitNSharesSF 时，相同 (warp_idx_in_wg, row_idx) 但不同
-                // epilogue_wg_n_idx 的两个 lane 持有同一行的两半列 amax。把它们
-                // atomicMax 到 SMEM 上，sync 后两 WG 都读出合并后的 amax 用于 sf。
+                // epilogue_wg_n_idx 的两个 lane 持有同一行的两半列 amax。
+                // 两个 WG 各写自己的 scratch slot；一次 epilogue-wide sync 后，
+                // 两边都读出两份 amax 并在寄存器里取 max，避免 atomicMax 和
+                // 第二次 barrier。
                 if constexpr (kSplitNSharesSF) {
                     if (col_idx == 0) {
-                        // 32 row × 2 r_idx 个 slot
                         const uint32_t row_slot = warp_idx_in_wg * 8 + row_idx;
-                        // 初始化：第一个写者写入，后续 atomicMax 归约。
-                        // 因为 amax 是非负 float，把它 reinterpret 为 uint32 后，
-                        // 同符号下 uint32 的字节序保留浮点序，atomicMax 即逐 bit 比大小。
-                        if (epilogue_wg_n_idx == 0) {
-                            ptx::st_shared(smem_amax_scratch + row_slot * 2 + 0,
-                                           __float_as_uint(amax_r0));
-                            ptx::st_shared(smem_amax_scratch + row_slot * 2 + 1,
-                                           __float_as_uint(amax_r1));
-                        }
-                    }
-                    // 让两个 WG 都到达：用 epilogue full barrier。
-                    // kEpilogueFullBarrierIdx 是已经存在的 epilogue-wide barrier，
-                    // 等所有 epilogue 线程到齐后，第二个 WG 再做 atomicMax。
-                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                    if (col_idx == 0 and epilogue_wg_n_idx == 1) {
-                        const uint32_t row_slot = warp_idx_in_wg * 8 + row_idx;
-                        atomicMax(reinterpret_cast<int*>(smem_amax_scratch + row_slot * 2 + 0),
-                                  __float_as_int(amax_r0));
-                        atomicMax(reinterpret_cast<int*>(smem_amax_scratch + row_slot * 2 + 1),
-                                  __float_as_int(amax_r1));
+                        const uint32_t slot = row_slot * 4 + epilogue_wg_n_idx * 2;
+                        ptx::st_shared(smem_amax_scratch + slot + 0,
+                                       __float_as_uint(amax_r0));
+                        ptx::st_shared(smem_amax_scratch + slot + 1,
+                                       __float_as_uint(amax_r1));
                     }
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                     // 两个 WG 都读出合并后的 amax
                     if (col_idx == 0) {
                         const uint32_t row_slot = warp_idx_in_wg * 8 + row_idx;
-                        amax_r0 = __uint_as_float(
-                            ptx::ld_shared(smem_amax_scratch + row_slot * 2 + 0));
-                        amax_r1 = __uint_as_float(
-                            ptx::ld_shared(smem_amax_scratch + row_slot * 2 + 1));
+                        const uint32_t slot = row_slot * 4;
+                        const float wg0_r0 = __uint_as_float(
+                            ptx::ld_shared(smem_amax_scratch + slot + 0));
+                        const float wg0_r1 = __uint_as_float(
+                            ptx::ld_shared(smem_amax_scratch + slot + 1));
+                        const float wg1_r0 = __uint_as_float(
+                            ptx::ld_shared(smem_amax_scratch + slot + 2));
+                        const float wg1_r1 = __uint_as_float(
+                            ptx::ld_shared(smem_amax_scratch + slot + 3));
+                        amax_r0 = cute::max(wg0_r0, wg1_r0);
+                        amax_r1 = cute::max(wg0_r1, wg1_r1);
                     }
                     // amax 是 col_idx==0 lane 持有的，需要在 col-lane 间广播
                     // （保持后续 quantize 用同一个 sf_inv）。
@@ -2668,11 +2809,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         sf_base_ptr[k_sf_idx * kNumPaddedSFPoolTokens + token_r1] = sf_r1;
                 }
 
-                // Sync before TMA store. share-SF 模式下 wg=0 一次性合并写出
+                // Sync before TMA store. split-N combined-store 模式下 wg=0 一次性合并写出
                 // 整个 BLOCK_M × L1_OUT_BLOCK_N 的 L1 staging，必须等 wg=1
                 // 把它的列切片也写入 smem_cd_l1，因此用 epilogue-wide barrier；
                 // 其它路径仍然只同步本 WG 自己的 128 线程。
-                if constexpr (kSplitNSharesSF) {
+                if constexpr (kSplitNCombinesL1Store) {
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 } else {
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
@@ -2688,10 +2829,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 // STSM'd into smem). Using TMA for partial tiles is a large
                 // win for low-batch / decode where every tile is partial.
                 if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
-                    // share-SF 时 TMA store 也合并：只由 epilogue_wg_n_idx==0
-                    // 一次写 BLOCK_M × L1_OUT_BLOCK_N。其他 split-N 大块路径
-                    // 仍每 WG 各自写自己的 WG_L1_OUT_BLOCK_N 列。
-                    if constexpr (kSplitNSharesSF) {
+                    // split-N 32-col/WG 路径合并 TMA store：只由
+                    // epilogue_wg_n_idx==0 一次写 BLOCK_M × L1_OUT_BLOCK_N。
+                    // 其他 split-N 大块路径仍每 WG 各自写自己的切片。
+                    if constexpr (kSplitNCombinesL1Store) {
                         if (epilogue_wg_n_idx == 0) {
                             const uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N;
                             cute::tma_store_fence();
@@ -2702,8 +2843,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 m_idx);
                             cute::tma_store_arrive();
                         }
-                        // share-SF + epilogue_wg_n_idx==1：什么都不发，由 wg=0
-                        // 合并 store 已经覆盖。
+                        // epilogue_wg_n_idx==1：什么都不发，由 wg=0 合并
+                        // store 已经覆盖。
                     } else {
                         // The TMA descriptor was built with box
                         // (WG_L1_OUT_BLOCK_N, l1_output_box_m=WG_BLOCK_M), so each
@@ -2726,10 +2867,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
                 // Notify L2 that this N block's L1 output (and SF) is ready
                 if constexpr (kL2ArrivalCounter) {
-                    if constexpr (kSplitNSharesSF) {
-                        // share-SF 时只有 wg=0 实际发起合并 TMA store，其
+                    if constexpr (kSplitNCombinesL1Store) {
+                        // split-N combined-store 时只有 wg=0 实际发起 TMA store，其
                         // tma_store_wait<0> 完成后整 BLOCK_M × L1_OUT_BLOCK_N
-                        // 的 L1 输出和共享 SF 都已可见。wg=1 没有 store
+                        // 的 L1 输出已可见。wg=1 没有 store
                         // 不应也无需写 counter；由 wg=0 一次性 +kWarpgroupSplitN
                         // 代表两个 WG 各自的 N-slice 全部 ready。等待端的
                         // expected = kNumL1BlockNs * kNumEpilogueWarpgroups
@@ -2752,13 +2893,13 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
                 __syncwarp();
-                // share-SF + counter 模式下 bitmask 分支自带的
+                // split-N combined-store + counter 模式下 bitmask 分支自带的
                 // sync_aligned(kNumEpilogueThreads) 不会执行；wg=1 没有
                 // 发起 TMA store 也没有任何与 wg=0 的合流点，可能在下一
                 // 个 N-block 提前重新写入共享 smem_cd_l1，覆盖 wg=0 仍在
                 // drain 的 store。补一个 epilogue-wide barrier，等价于
                 // 0530 FP8 commit 在 share-SF 路径末尾加的尾同步。
-                if constexpr (kSplitNSharesSF and kL2ArrivalCounter)
+                if constexpr (kSplitNCombinesL1Store and kL2ArrivalCounter)
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             } else {
                 // ---------------- L2 EPILOGUE: BF16 cast + NVLink scatter ----------------
@@ -2949,7 +3090,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 if constexpr (not kSkipL2EpilogueSync)
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             }
-        });
+        }, cached_recv_counts);
 
         // ---------------- COMBINE ----------------
         // NVLink barrier first: signals remote ranks that this rank's GEMM
@@ -2969,9 +3110,13 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
         constexpr uint32_t kNumChunkSlots = 3;
         constexpr uint32_t kNumMaxRegistersForBuffer = 128;
+        constexpr bool kOneCombineChunkFits =
+            kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes <= SMEM_BEFORE_BARRIER_SIZE;
+        constexpr bool kTwoCombineChunksFit =
+            kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes / 2 <= SMEM_BEFORE_BARRIER_SIZE;
         constexpr uint32_t kNumChunks =
-            (kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes <= SMEM_BEFORE_BARRIER_SIZE
-             and kHidden <= 32 * kNumMaxRegistersForBuffer) ? 1 : 2;
+            (kOneCombineChunkFits and kHidden <= 32 * kNumMaxRegistersForBuffer) ? 1 :
+            (kTwoCombineChunksFit ? 2 : 4);
         constexpr uint32_t kNumChunkBytes = kNumHiddenBytes / kNumChunks;
         constexpr uint32_t kNumChunkUint4 = kNumChunkBytes / sizeof(uint4);
         constexpr uint32_t kNumUint4PerLane = kNumChunkUint4 / 32;

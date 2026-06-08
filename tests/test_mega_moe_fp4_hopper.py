@@ -564,8 +564,20 @@ def _layer7_dsv4_2wg(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
 
 def _layer8_pro_smoke(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
     return [
+        ('L8.pro_b64_mid_h7168_ih3072_e384_k6', dict(
+            num_max_tokens_per_rank=128, num_tokens=64,
+            hidden=7168, intermediate_hidden=3072,
+            num_experts=384, num_topk=6,
+            activation_clamp=10.0,
+        )),
         ('L8.pro_b128_1wg_h7168_ih3072_e384_k6', dict(
             num_max_tokens_per_rank=128, num_tokens=128,
+            hidden=7168, intermediate_hidden=3072,
+            num_experts=384, num_topk=6,
+            activation_clamp=10.0,
+        )),
+        ('L8.pro_b256_1wg_h7168_ih3072_e384_k6', dict(
+            num_max_tokens_per_rank=256, num_tokens=256,
             hidden=7168, intermediate_hidden=3072,
             num_experts=384, num_topk=6,
             activation_clamp=10.0,
@@ -891,6 +903,35 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
 
     fused_out = run_fp4_fused()
     assert fused_out.shape == (num_tokens, hidden)
+    if args.bench_check_reference:
+        y_ref = _reference_fused(
+            x_fp8, x_sf, topk_idx, topk_weights,
+            l1_fp4[0], l1_fp4[1], l2_fp4[0], l2_fp4[1],
+            rank_idx, num_ranks, group,
+            num_experts, num_topk,
+            hidden, intermediate_hidden,
+            args.activation_clamp,
+        )
+        diff = calc_diff(fused_out, y_ref)
+        ok = diff < args.diff_tol
+        if rank_idx == 0:
+            print(
+                "BENCH_REFERENCE_JSON " + json.dumps(
+                    {
+                        "batch_per_rank": num_tokens,
+                        "hidden": hidden,
+                        "intermediate_hidden": intermediate_hidden,
+                        "num_experts": num_experts,
+                        "num_topk": num_topk,
+                        "diff": round(float(diff), 6),
+                        "diff_tol": args.diff_tol,
+                        "ok": bool(ok),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        assert ok, f"bench reference diff={diff} >= tol={args.diff_tol}"
     if run_fp8_normal_baseline_enabled:
         normal_out = run_fp8_normal_baseline()
         assert normal_out.shape == (num_tokens, hidden)
@@ -1169,6 +1210,8 @@ if __name__ == '__main__':
                         help='calc_diff tolerance (default 0.10; FP4 weights '
                              'introduce more quantization noise than FP8).')
     parser.add_argument('--fail-fast', action='store_true')
+    parser.add_argument('--bench-check-reference', action='store_true',
+                        help='With --bench, run the FP32 reference on the same shape before timing')
 
     parser.add_argument('--num-max-tokens-per-rank', type=int, default=1)
     parser.add_argument('--num-tokens', type=int, default=0)

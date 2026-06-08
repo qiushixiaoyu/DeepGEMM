@@ -313,7 +313,7 @@ cute::GmmaDescriptor make_gmma_desc(dtype_t* base_smem_ptr, uint32_t mn_idx, uin
 
         // Must have no in-atom MN-idx
         // NOTES: no worries for the runtime assert, the `mn_idx` are constants at compilation time
-        DG_DEVICE_ASSERT(mn_idx % BLOCK_MN_ATOM == 0);
+        DG_TRAP_ONLY_DEVICE_ASSERT(mn_idx % BLOCK_MN_ATOM == 0);
         DG_STATIC_ASSERT(kSwizzleMode > 0, "Invalid swizzling");
 
         // Atom size: `kSwizzleMode` (in bytes, on MN) x 8
