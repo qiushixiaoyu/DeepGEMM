@@ -414,7 +414,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         ((expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f) or
          (intermediate_hidden <= 2048 and
           expected_tokens_per_expert >= 3.0f and expected_tokens_per_expert < 6.0f) or
-         (expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f));
+         (expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f and
+          !fp4_pro_two_token_stage4));
     const bool fp4_stage5_decode_heavy_batch =
         fp4_small_block_n and
         expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert <= 24.0f;
