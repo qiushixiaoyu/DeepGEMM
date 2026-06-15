@@ -134,49 +134,93 @@ static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
     const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms) {
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-    if (block_m == 64 and block_n == 128 and
+    const bool fp4_small_block_n =
+        block_m == 64 and block_n == 128;
+    if (fp4_small_block_n and
         intermediate_hidden <= 2048 and
         expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 2.0f and
-        num_experts_per_rank % 32 == 0) {
-        return 32;
+        num_experts_per_rank % 16 == 0) {
+        return 16;
     }
-    if (block_m == 64 and block_n == 128 and
+    if (fp4_small_block_n and
+        intermediate_hidden <= 2048 and
+        expected_tokens_per_expert >= 3.0f and expected_tokens_per_expert < 6.0f and
+        num_experts_per_rank % 16 == 0) {
+        return 16;
+    }
+    if (fp4_small_block_n and
+        intermediate_hidden <= 2048 and
+        expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f and
+        num_experts_per_rank % 8 == 0) {
+        return 8;
+    }
+    if (fp4_small_block_n and
         intermediate_hidden <= 2048 and
         expected_tokens_per_expert >= 12.0f and expected_tokens_per_expert < 32.0f and
         num_experts_per_rank % 8 == 0) {
         return 8;
     }
-    if (block_m == 64 and block_n == 128 and
+    if (fp4_small_block_n and
+        intermediate_hidden <= 2048 and
+        expected_tokens_per_expert >= 32.0f and expected_tokens_per_expert < 64.0f and
+        num_experts_per_rank % 16 == 0) {
+        return 16;
+    }
+    if (fp4_small_block_n and
+        intermediate_hidden >= 3072 and
+        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.25f and
+        num_experts_per_rank % 16 == 0) {
+        return 16;
+    }
+    if (fp4_small_block_n and
+        intermediate_hidden >= 3072 and
+        expected_tokens_per_expert >= 0.25f and expected_tokens_per_expert < 0.375f and
+        num_experts_per_rank % 16 == 0) {
+        return 16;
+    }
+    if (fp4_small_block_n and
+        intermediate_hidden >= 3072 and
+        expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f and
+        num_experts_per_rank % 16 == 0) {
+        return 16;
+    }
+    if (fp4_small_block_n and
         intermediate_hidden >= 3072 and
         expected_tokens_per_expert >= 0.25f and expected_tokens_per_expert < 1.0f and
         num_experts_per_rank % 24 == 0) {
         return 24;
     }
-    if (block_m == 64 and block_n == 128 and
+    if (fp4_small_block_n and
         intermediate_hidden >= 3072 and
         expected_tokens_per_expert >= 1.0f and expected_tokens_per_expert < 1.5f and
         num_experts_per_rank > 0) {
         return num_experts_per_rank;
     }
-    if (block_m == 64 and block_n == 128 and
+    if (fp4_small_block_n and
         intermediate_hidden >= 3072 and
         expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f and
-        num_experts_per_rank > 0) {
-        return num_experts_per_rank;
-    }
-    if (block_m == 64 and block_n == 128 and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert >= 3.0f and expected_tokens_per_expert < 6.0f and
         num_experts_per_rank % 16 == 0) {
         return 16;
     }
-    if (block_m == 64 and block_n == 128 and
+    if (fp4_small_block_n and
+        intermediate_hidden >= 3072 and
+        expected_tokens_per_expert >= 3.0f and expected_tokens_per_expert < 6.0f and
+        num_experts_per_rank % 8 == 0) {
+        return 8;
+    }
+    if (fp4_small_block_n and
+        intermediate_hidden >= 3072 and
+        expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f and
+        num_experts_per_rank % 8 == 0) {
+        return 8;
+    }
+    if (fp4_small_block_n and
         intermediate_hidden >= 3072 and
         expected_tokens_per_expert >= 12.0f and expected_tokens_per_expert < 24.0f and
         num_experts_per_rank % 8 == 0) {
         return 8;
     }
-    if (block_m == 64 and block_n == 128 and
+    if (fp4_small_block_n and
         intermediate_hidden >= 3072 and
         expected_tokens_per_expert >= 24.0f and expected_tokens_per_expert < 64.0f and
         num_experts_per_rank % 8 == 0) {
@@ -269,10 +313,10 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const bool& use_decode_done_mbarrier = false) {
     const auto [block_m, num_epilogue_threads] = get_block_config_for_mega_moe_sm90_fp4(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens);
-    const int block_n = 128;
     const int block_k = 128;
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
+    const int block_n = 128;
 
     int fp4_num_epilogue_warpgroups = num_epilogue_threads / 128;
     const bool fp4_split_n_eligible =
@@ -286,10 +330,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         intermediate_hidden <= 2048 and
         expected_tokens_per_expert >= 0.75f and expected_tokens_per_expert < 64.0f;
     const bool fp4_small_split_n_band =
-        (intermediate_hidden <= 2048 and
-         expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.5f) or
-        fp4_flash_split_n_band or
-        fp4_pro_split_n_band;
+        fp4_flash_split_n_band or fp4_pro_split_n_band;
     const bool default_fp4_split_n =
         fp4_split_n_eligible and (fp4_split_n_band or fp4_small_split_n_band) and
         (intermediate_hidden <= 2048 or intermediate_hidden >= 3072);
@@ -313,19 +354,21 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms);
 
+    const bool fp4_small_block_n =
+        block_m == 64 and block_n == 128;
     const bool fp4_decode_heavy_small_batch =
-        block_m == 64 and block_n == 128 and
+        fp4_small_block_n and
         expected_tokens_per_expert > 0.0f and expected_tokens_per_expert <= 24.0f;
     const bool fp4_pro_large_decode_assist_batch =
-        block_m == 64 and block_n == 128 and
+        fp4_small_block_n and
         intermediate_hidden >= 3072 and
         expected_tokens_per_expert >= 24.0f and expected_tokens_per_expert < 64.0f;
     const bool fp4_pro_split_n_decode_threads =
-        block_m == 64 and block_n == 128 and
+        fp4_small_block_n and
         intermediate_hidden >= 3072 and
         expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 64.0f;
     const bool fp4_flash_split_n_decode_threads =
-        block_m == 64 and block_n == 128 and
+        fp4_small_block_n and
         intermediate_hidden <= 2048 and
         expected_tokens_per_expert >= 0.75f and expected_tokens_per_expert < 64.0f;
     const bool fp4_2wg_decode_offload_band =
@@ -347,20 +390,38 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);
 
     const bool fp4_stage4_decode_band =
-        block_m == 64 and block_n == 128 and
+        fp4_small_block_n and
         intermediate_hidden <= 2048 and
         expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f;
+    const bool fp4_pro_ultra_small_stage4 =
+        fp4_small_block_n and
+        intermediate_hidden >= 3072 and
+        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.25f;
+    const bool fp4_pro_half_token_stage4 =
+        fp4_small_block_n and
+        intermediate_hidden >= 3072 and
+        expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f;
+    const bool fp4_pro_single_token_stage4 =
+        fp4_small_block_n and
+        intermediate_hidden >= 3072 and
+        expected_tokens_per_expert >= 1.0f and expected_tokens_per_expert < 1.5f;
+    const bool fp4_pro_two_token_stage4 =
+        fp4_small_block_n and
+        intermediate_hidden >= 3072 and
+        expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f;
     const bool fp4_stage6_decode_band =
-        block_m == 64 and block_n == 128 and
+        fp4_small_block_n and
         ((expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f) or
          (intermediate_hidden <= 2048 and
           expected_tokens_per_expert >= 3.0f and expected_tokens_per_expert < 6.0f) or
          (expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f));
     const bool fp4_stage5_decode_heavy_batch =
-        block_m == 64 and block_n == 128 and
+        fp4_small_block_n and
         expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert <= 24.0f;
     const int default_num_stages_cap =
-        fp4_stage4_decode_band ? 4 :
+        (fp4_stage4_decode_band or fp4_pro_ultra_small_stage4 or
+         fp4_pro_half_token_stage4 or fp4_pro_single_token_stage4 or
+         fp4_pro_two_token_stage4) ? 4 :
         (fp4_pro_large_decode_assist_batch ? 5 :
          (fp4_stage6_decode_band ? 6 : (fp4_stage5_decode_heavy_batch ? 5 : 0)));
 

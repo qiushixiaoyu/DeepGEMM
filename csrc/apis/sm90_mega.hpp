@@ -318,12 +318,9 @@ static void fp8_fp4_mega_moe_sm90(
         intermediate_hidden >= 3072 and
         expected_tokens_per_expert >= 1.0f and expected_tokens_per_expert < 1.5f and
         num_experts_per_rank % 8 == 0;
-    const bool fp4_pro_fractional_token_band =
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert >= 0.25f and expected_tokens_per_expert < 1.0f;
     const bool fp4_pro_split_n_mbarrier_band =
         intermediate_hidden >= 3072 and
-        expected_tokens_per_expert >= 0.25f and expected_tokens_per_expert < 64.0f;
+        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 64.0f;
     const bool fp4_pro_two_tokens_per_expert_band =
         intermediate_hidden >= 3072 and
         expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f;
@@ -345,9 +342,18 @@ static void fp8_fp4_mega_moe_sm90(
     const bool fp4_flash_stage4_no_early_band =
         intermediate_hidden <= 2048 and
         expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f;
+    const bool fp4_flash_wide_load_decode_band =
+        intermediate_hidden <= 2048 and
+        expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 64.0f;
+    const bool fp4_pro_wide_load_decode_band =
+        intermediate_hidden >= 3072 and
+        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 6.0f;
     const bool fp4_flash_split_n_mbarrier_band =
         intermediate_hidden <= 2048 and
         expected_tokens_per_expert >= 0.75f and expected_tokens_per_expert < 64.0f;
+    const bool fp4_flash_small_mbarrier_band =
+        intermediate_hidden <= 2048 and
+        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.5f;
     const bool fp4_2wg_decode_offload_band =
         expected_tokens_per_expert >= 64.0f;
     const bool default_math_wg_decode =
@@ -375,13 +381,13 @@ static void fp8_fp4_mega_moe_sm90(
     const int first_fp4_decode_assist_warp =
         default_skip_loader_decode_assist ? 2 : 0;
     const bool default_wide_load_decode =
-        (fp4_pro_fractional_token_band and !fp4_pro_split_n_mbarrier_band) or
-        (fp4_pro_single_token_per_expert_band and !fp4_pro_split_n_mbarrier_band) or
+        (fp4_pro_wide_load_decode_band and
+         !fp4_pro_two_tokens_per_expert_band) or
         fp4_pro_mid_decode_assist_band or
         fp4_flash_half_token_per_expert_band or
         fp4_flash_two_tokens_per_expert_band or
         fp4_flash_decode_lookahead_band or
-        (intermediate_hidden >= 3072 and fp4_bigband_lookahead_band) or
+        fp4_flash_wide_load_decode_band or
         fp4_pro_large_decode_assist_batch;
     const bool use_wide_load_decode = default_wide_load_decode;
     const bool default_ss_early_b_decode =
@@ -389,7 +395,8 @@ static void fp8_fp4_mega_moe_sm90(
           !fp4_pro_two_tokens_per_expert_band and
           !fp4_flash_two_tokens_per_expert_band and
           !fp4_flash_decode_lookahead_band) or
-         (expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert <= 24.0f and
+         (intermediate_hidden >= 3072 and
+          expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert <= 24.0f and
           !fp4_pro_mid_decode_assist_band and
           !fp4_flash_stage4_no_early_band) or
          fp4_2wg_decode_offload_band);
@@ -397,6 +404,7 @@ static void fp8_fp4_mega_moe_sm90(
     const bool default_decode_done_mbarrier =
         fp4_pro_split_n_mbarrier_band or
         fp4_flash_split_n_mbarrier_band or
+        fp4_flash_small_mbarrier_band or
         (fp4_decode_lookahead_band and
          !fp4_flash_decode_lookahead_band and
          !fp4_flash_stage4_no_early_band) or
@@ -405,7 +413,7 @@ static void fp8_fp4_mega_moe_sm90(
     const bool use_decode_done_mbarrier = default_decode_done_mbarrier;
     const bool default_l2_arrival_counter =
         ((intermediate_hidden <= 2048 and
-          expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert <= 0.75f and
+          expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f and
           !fp4_flash_half_token_per_expert_band) or
          (intermediate_hidden >= 3072 and
           expected_tokens_per_expert >= 0.25f and expected_tokens_per_expert < 0.375f));

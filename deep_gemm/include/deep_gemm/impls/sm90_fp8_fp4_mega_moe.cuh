@@ -1254,9 +1254,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         }, cached_recv_counts);
 
     } else if (warp_idx < kNumDispatchWarps + kNumMMANonEpilogueWarps) {
-        // Idle non-epilogue warps (kNumDispatchWarps+2, +3). They must still
-        // participate in the warpgroup-collective `setmaxnreg.dec.sync.aligned`
-        // so that the math warpgroup's `warpgroup_reg_alloc` can succeed.
+        // Remaining non-epilogue warps assist FP4 decode and still participate
+        // in the warpgroup-collective `setmaxnreg.dec.sync.aligned` so that the
+        // math warpgroup's `warpgroup_reg_alloc` can succeed.
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
         cache_expert_recv_counts();
 
