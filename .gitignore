@@ -20,5 +20,8 @@ deep_gemm/include/cutlass
 # Generated stub files
 stubs/
 
+# Local experiment logs
+/logs/
+
 # Symlinks to compiled extensions
 deep_gemm/*.so

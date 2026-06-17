@@ -131,132 +131,162 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
     return {block_m, num_epilogue_warpgroups * 128};
 }
 
+struct FP4SM90WaveRule {
+    float min_tokens_per_expert;
+    float max_tokens_per_expert;
+    bool include_min;
+    int required_expert_divisor;
+    int num_experts_per_wave;
+};
+
+enum class FP4SM90StageShape {
+    Any,
+    Flash,
+    Pro,
+    NotPro,
+};
+
+struct FP4SM90StageCapRule {
+    float min_tokens_per_expert;
+    float max_tokens_per_expert;
+    bool include_min;
+    bool include_max;
+    FP4SM90StageShape shape;
+    int num_stages_cap;
+};
+
+static bool try_get_num_experts_per_wave_for_sm90_fp4(
+    const FP4SM90WaveRule* rules, const int& num_rules,
+    const float& expected_tokens_per_expert, const int& num_experts_per_rank,
+    int& num_experts_per_wave) {
+    for (int i = 0; i < num_rules; ++ i) {
+        const auto& rule = rules[i];
+        const bool in_lower_bound = rule.include_min
+            ? expected_tokens_per_expert >= rule.min_tokens_per_expert
+            : expected_tokens_per_expert > rule.min_tokens_per_expert;
+        if (!in_lower_bound or expected_tokens_per_expert >= rule.max_tokens_per_expert)
+            continue;
+
+        if (rule.num_experts_per_wave == 0) {
+            if (num_experts_per_rank <= 0)
+                continue;
+            num_experts_per_wave = num_experts_per_rank;
+            return true;
+        }
+        DG_HOST_ASSERT(rule.required_expert_divisor > 0);
+        if (num_experts_per_rank % rule.required_expert_divisor == 0) {
+            num_experts_per_wave = rule.num_experts_per_wave;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool fp4_sm90_stage_shape_matches(
+    const FP4SM90StageShape& shape, const bool& fp4_flash_shape, const bool& fp4_pro_shape) {
+    switch (shape) {
+        case FP4SM90StageShape::Any:
+            return true;
+        case FP4SM90StageShape::Flash:
+            return fp4_flash_shape;
+        case FP4SM90StageShape::Pro:
+            return fp4_pro_shape;
+        case FP4SM90StageShape::NotPro:
+            return !fp4_pro_shape;
+    }
+    DG_HOST_ASSERT(false);
+    return false;
+}
+
+static int get_default_num_stages_cap_for_mega_moe_sm90_fp4(
+    const int& intermediate_hidden, const int& block_m, const int& block_n,
+    const float& expected_tokens_per_expert) {
+    if (!(block_m == 64 and block_n == 128)) {
+        return 0;
+    }
+
+    const bool fp4_flash_shape = intermediate_hidden <= 2048;
+    const bool fp4_pro_shape = intermediate_hidden >= 3072;
+    // Ordered first-match rules preserve the historical stage-cap priority.
+    static constexpr FP4SM90StageCapRule stage_cap_rules[] = {
+        {6.0f, 12.0f, true, false, FP4SM90StageShape::Flash, 4},
+        {3.0f, 6.0f, false, false, FP4SM90StageShape::Flash, 4},
+        {0.0f, 0.25f, false, false, FP4SM90StageShape::Pro, 4},
+        {0.375f, 0.75f, true, false, FP4SM90StageShape::Pro, 4},
+        {1.5f, 3.0f, true, false, FP4SM90StageShape::Pro, 4},
+        {1.0f, 1.5f, true, false, FP4SM90StageShape::Pro, 5},
+        {24.0f, 64.0f, true, false, FP4SM90StageShape::Pro, 5},
+        {0.375f, 0.75f, true, false, FP4SM90StageShape::Any, 6},
+        {3.0f, 6.0f, false, false, FP4SM90StageShape::Flash, 6},
+        {1.5f, 3.0f, true, false, FP4SM90StageShape::NotPro, 6},
+        {1.5f, 24.0f, true, true, FP4SM90StageShape::Any, 5},
+    };
+    for (const auto& rule: stage_cap_rules) {
+        const bool in_lower_bound = rule.include_min
+            ? expected_tokens_per_expert >= rule.min_tokens_per_expert
+            : expected_tokens_per_expert > rule.min_tokens_per_expert;
+        const bool in_upper_bound = rule.include_max
+            ? expected_tokens_per_expert <= rule.max_tokens_per_expert
+            : expected_tokens_per_expert < rule.max_tokens_per_expert;
+        if (in_lower_bound and in_upper_bound and
+            fp4_sm90_stage_shape_matches(rule.shape, fp4_flash_shape, fp4_pro_shape)) {
+            return rule.num_stages_cap;
+        }
+    }
+    return 0;
+}
+
 static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
     const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms) {
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-    const bool fp4_small_block_n =
+    const bool fp4_small_block_n_kernel =
         block_m == 64 and block_n == 128;
-    if (fp4_small_block_n and
-        intermediate_hidden <= 2048 and
-        expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 2.0f and
-        num_experts_per_rank % 16 == 0) {
-        return 16;
+    const bool fp4_flash_shape = intermediate_hidden <= 2048;
+    const bool fp4_pro_shape = intermediate_hidden >= 3072;
+    int fp4_num_experts_per_wave = 0;
+    if (fp4_small_block_n_kernel and fp4_flash_shape) {
+        static constexpr FP4SM90WaveRule flash_wave_rules[] = {
+            {1.5f, 2.0f, true, 16, 16},
+            {3.0f, 6.0f, true, 16, 16},
+            {6.0f, 12.0f, true, 32, 32},
+            {6.0f, 12.0f, true, 8, 8},
+            {24.0f, 32.0f, true, 16, 16},
+            {12.0f, 24.0f, true, 32, 32},
+            {12.0f, 24.0f, true, 8, 8},
+            {32.0f, 64.0f, true, 16, 16},
+        };
+        if (try_get_num_experts_per_wave_for_sm90_fp4(
+                flash_wave_rules,
+                static_cast<int>(sizeof(flash_wave_rules) / sizeof(flash_wave_rules[0])),
+                expected_tokens_per_expert, num_experts_per_rank,
+                fp4_num_experts_per_wave)) {
+            return fp4_num_experts_per_wave;
+        }
     }
-    if (fp4_small_block_n and
-        intermediate_hidden <= 2048 and
-        expected_tokens_per_expert >= 3.0f and expected_tokens_per_expert < 6.0f and
-        num_experts_per_rank % 16 == 0) {
-        return 16;
-    }
-    if (fp4_small_block_n and
-        intermediate_hidden <= 2048 and
-        expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f and
-        num_experts_per_rank % 32 == 0) {
-        return 32;
-    }
-    if (fp4_small_block_n and
-        intermediate_hidden <= 2048 and
-        expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f and
-        num_experts_per_rank % 8 == 0) {
-        return 8;
-    }
-    if (fp4_small_block_n and
-        intermediate_hidden <= 2048 and
-        expected_tokens_per_expert >= 24.0f and expected_tokens_per_expert < 32.0f and
-        num_experts_per_rank % 16 == 0) {
-        return 16;
-    }
-    if (fp4_small_block_n and
-        intermediate_hidden <= 2048 and
-        expected_tokens_per_expert >= 12.0f and expected_tokens_per_expert < 24.0f and
-        num_experts_per_rank % 32 == 0) {
-        return 32;
-    }
-    if (fp4_small_block_n and
-        intermediate_hidden <= 2048 and
-        expected_tokens_per_expert >= 12.0f and expected_tokens_per_expert < 24.0f and
-        num_experts_per_rank % 8 == 0) {
-        return 8;
-    }
-    if (fp4_small_block_n and
-        intermediate_hidden <= 2048 and
-        expected_tokens_per_expert >= 32.0f and expected_tokens_per_expert < 64.0f and
-        num_experts_per_rank % 16 == 0) {
-        return 16;
-    }
-    if (fp4_small_block_n and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.25f and
-        num_experts_per_rank % 16 == 0) {
-        return 16;
-    }
-    if (fp4_small_block_n and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert >= 0.25f and expected_tokens_per_expert < 0.375f and
-        num_experts_per_rank % 16 == 0) {
-        return 16;
-    }
-    if (fp4_small_block_n and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f and
-        num_experts_per_rank % 16 == 0) {
-        return 16;
-    }
-    if (fp4_small_block_n and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert >= 0.25f and expected_tokens_per_expert < 1.0f and
-        num_experts_per_rank % 24 == 0) {
-        return 24;
-    }
-    if (fp4_small_block_n and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert >= 1.0f and expected_tokens_per_expert < 1.5f and
-        num_experts_per_rank > 0) {
-        return num_experts_per_rank;
-    }
-    if (fp4_small_block_n and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f and
-        num_experts_per_rank % 16 == 0) {
-        return 16;
-    }
-    if (fp4_small_block_n and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert >= 3.0f and expected_tokens_per_expert < 6.0f and
-        num_experts_per_rank % 8 == 0) {
-        return 8;
-    }
-    if (fp4_small_block_n and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f and
-        num_experts_per_rank % 16 == 0) {
-        return 16;
-    }
-    if (fp4_small_block_n and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f and
-        num_experts_per_rank % 8 == 0) {
-        return 8;
-    }
-    if (fp4_small_block_n and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert >= 12.0f and expected_tokens_per_expert < 24.0f and
-        num_experts_per_rank % 24 == 0) {
-        return 24;
-    }
-    if (fp4_small_block_n and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert >= 12.0f and expected_tokens_per_expert < 24.0f and
-        num_experts_per_rank % 8 == 0) {
-        return 8;
-    }
-    if (fp4_small_block_n and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert >= 24.0f and expected_tokens_per_expert < 64.0f and
-        num_experts_per_rank % 8 == 0) {
-        return 8;
+    if (fp4_small_block_n_kernel and fp4_pro_shape) {
+        static constexpr FP4SM90WaveRule pro_wave_rules[] = {
+            {0.0f, 0.25f, false, 16, 16},
+            {0.25f, 0.375f, true, 16, 16},
+            {0.375f, 0.75f, true, 16, 16},
+            {0.25f, 1.0f, true, 24, 24},
+            {1.0f, 1.5f, true, 1, 0},
+            {1.5f, 3.0f, true, 16, 16},
+            {3.0f, 6.0f, true, 8, 8},
+            {6.0f, 12.0f, true, 16, 16},
+            {6.0f, 12.0f, true, 8, 8},
+            {12.0f, 24.0f, true, 24, 24},
+            {12.0f, 24.0f, true, 8, 8},
+            {24.0f, 64.0f, true, 8, 8},
+        };
+        if (try_get_num_experts_per_wave_for_sm90_fp4(
+                pro_wave_rules,
+                static_cast<int>(sizeof(pro_wave_rules) / sizeof(pro_wave_rules[0])),
+                expected_tokens_per_expert, num_experts_per_rank,
+                fp4_num_experts_per_wave)) {
+            return fp4_num_experts_per_wave;
+        }
     }
     if (expected_tokens_per_expert < 1.0f or expected_tokens_per_expert > 4.0f) {
         return num_experts_per_rank;
@@ -359,31 +389,18 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const int block_k = 128;
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-    int block_n = 128;
-    if (const auto env_block_n = get_env<int>("DG_SM90_FP4_BLOCK_N", 0);
-        env_block_n > 0) {
-        DG_HOST_ASSERT(env_block_n == 64 or env_block_n == 128 or env_block_n == 256);
-        DG_HOST_ASSERT((2 * intermediate_hidden) % env_block_n == 0);
-        DG_HOST_ASSERT(hidden % env_block_n == 0);
-        block_n = env_block_n;
-    }
+    const int block_n = 128;
     int fp4_num_epilogue_warpgroups = num_epilogue_threads / 128;
+    const bool fp4_flash_shape = intermediate_hidden <= 2048;
+    const bool fp4_pro_shape = intermediate_hidden >= 3072;
+    const bool fp4_flash_or_pro_shape = fp4_flash_shape or fp4_pro_shape;
+    // Shape bands depend only on model shape and routing density; kernel bands add tile/thread constraints.
     const bool fp4_split_n_eligible =
         block_m == 64 and block_n % 128 == 0;
-    const bool fp4_split_n_band =
-        expected_tokens_per_expert >= 32.0f and expected_tokens_per_expert < 64.0f;
-    const bool fp4_pro_split_n_band =
-        intermediate_hidden >= 3072 and
+    const bool fp4_split_n_shape_band =
+        fp4_flash_or_pro_shape and
         expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 64.0f;
-    const bool fp4_flash_split_n_band =
-        intermediate_hidden <= 2048 and
-        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 64.0f;
-    const bool fp4_small_split_n_band =
-        fp4_flash_split_n_band or fp4_pro_split_n_band;
-    const bool default_fp4_split_n =
-        fp4_split_n_eligible and (fp4_split_n_band or fp4_small_split_n_band) and
-        (intermediate_hidden <= 2048 or intermediate_hidden >= 3072);
-    if (fp4_split_n_eligible and default_fp4_split_n) {
+    if (fp4_split_n_eligible and fp4_split_n_shape_band) {
         fp4_num_epilogue_warpgroups = 2;
     }
     DG_HOST_ASSERT(fp4_num_epilogue_warpgroups >= 1);
@@ -403,85 +420,32 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms);
 
-    const bool fp4_small_block_n =
+    const bool fp4_small_block_n_kernel =
         block_m == 64 and block_n == 128;
-    const bool fp4_decode_heavy_small_batch =
-        fp4_small_block_n and
-        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert <= 24.0f;
-    const bool fp4_pro_large_decode_assist_batch =
-        fp4_small_block_n and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert >= 24.0f and expected_tokens_per_expert < 64.0f;
-    const bool fp4_pro_split_n_decode_threads =
-        fp4_small_block_n and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 64.0f;
-    const bool fp4_flash_split_n_decode_threads =
-        fp4_small_block_n and
-        intermediate_hidden <= 2048 and
-        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 64.0f;
-    const bool fp4_2wg_decode_offload_band =
+    const bool fp4_split_n_decode_thread_kernel_band =
+        fp4_small_block_n_kernel and fp4_split_n_shape_band;
+    const bool fp4_2wg_decode_offload_kernel_band =
         block_m == 128 and block_n == 128 and
         fp4_num_epilogue_threads == 256 and expected_tokens_per_expert >= 64.0f;
+    const bool fp4_decode_assist_thread_kernel_band =
+        fp4_2wg_decode_offload_kernel_band or
+        (fp4_small_block_n_kernel and
+         expected_tokens_per_expert > 0.0f and expected_tokens_per_expert <= 24.0f);
     const int default_num_dispatch_threads =
-        (fp4_decode_heavy_small_batch or fp4_flash_split_n_decode_threads or
-         fp4_pro_large_decode_assist_batch or
-         fp4_2wg_decode_offload_band) ? 64 : 128;
-    const int num_dispatch_threads = get_env<int>(
-        "DG_SM90_FP4_NUM_DISPATCH_THREADS", default_num_dispatch_threads);
+        (fp4_split_n_decode_thread_kernel_band or
+         fp4_decode_assist_thread_kernel_band) ? 64 : 128;
+    const int num_dispatch_threads = default_num_dispatch_threads;
     DG_HOST_ASSERT(num_dispatch_threads == 64 or num_dispatch_threads == 128);
     const int default_num_non_epilogue_threads =
-        (fp4_pro_split_n_decode_threads or fp4_flash_split_n_decode_threads) ? 320 :
-        ((fp4_decode_heavy_small_batch or fp4_pro_large_decode_assist_batch or
-          fp4_2wg_decode_offload_band) ? 192 : 128);
-    const int num_non_epilogue_threads = get_env<int>(
-        "DG_SM90_FP4_NUM_NON_EPILOGUE_THREADS", default_num_non_epilogue_threads);
+        fp4_split_n_decode_thread_kernel_band ? 320 :
+        (fp4_decode_assist_thread_kernel_band ? 192 : 128);
+    const int num_non_epilogue_threads = default_num_non_epilogue_threads;
     DG_HOST_ASSERT(num_non_epilogue_threads >= 128 and
                    num_non_epilogue_threads % 64 == 0);
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);
 
-    const bool fp4_stage4_decode_band =
-        fp4_small_block_n and
-        intermediate_hidden <= 2048 and
-        expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f;
-    const bool fp4_flash_lookahead_stage4 =
-        fp4_small_block_n and
-        intermediate_hidden <= 2048 and
-        expected_tokens_per_expert > 3.0f and expected_tokens_per_expert < 6.0f;
-    const bool fp4_pro_ultra_small_stage4 =
-        fp4_small_block_n and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.25f;
-    const bool fp4_pro_half_token_stage4 =
-        fp4_small_block_n and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f;
-    const bool fp4_pro_single_token_stage4 =
-        fp4_small_block_n and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert >= 1.0f and expected_tokens_per_expert < 1.5f;
-    const bool fp4_pro_single_token_stage5 =
-        fp4_pro_single_token_stage4;
-    const bool fp4_pro_two_token_stage4 =
-        fp4_small_block_n and
-        intermediate_hidden >= 3072 and
-        expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f;
-    const bool fp4_stage6_decode_band =
-        fp4_small_block_n and
-        ((expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f) or
-         (intermediate_hidden <= 2048 and
-          expected_tokens_per_expert > 3.0f and expected_tokens_per_expert < 6.0f) or
-         (expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f and
-          !fp4_pro_two_token_stage4));
-    const bool fp4_stage5_decode_heavy_batch =
-        fp4_small_block_n and
-        expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert <= 24.0f;
-    const int default_num_stages_cap =
-        (fp4_stage4_decode_band or fp4_flash_lookahead_stage4 or
-         fp4_pro_ultra_small_stage4 or fp4_pro_half_token_stage4 or
-         fp4_pro_two_token_stage4) ? 4 :
-        (fp4_pro_single_token_stage5 or fp4_pro_large_decode_assist_batch) ? 5 :
-        (fp4_stage6_decode_band ? 6 : (fp4_stage5_decode_heavy_batch ? 5 : 0));
+    const int default_num_stages_cap = get_default_num_stages_cap_for_mega_moe_sm90_fp4(
+        intermediate_hidden, block_m, block_n, expected_tokens_per_expert);
 
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90_fp4(
         SM90ArchSpec::smem_capacity,

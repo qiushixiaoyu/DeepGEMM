@@ -23,10 +23,670 @@ import math
 import os
 import random
 import sys
-import torch
-import torch.distributed as dist
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+
+# ----------------------------------------------------------------------------
+# CPU-only SM90 FP4 heuristic equivalence guard
+# ----------------------------------------------------------------------------
+
+GENERIC_FALLBACK = "generic"
+
+
+def legacy_wave(
+    num_experts_per_rank: int,
+    expected_tokens_per_expert: float,
+    intermediate_hidden: int,
+    block_m: int,
+    block_n: int,
+):
+    small_block_n = block_m == 64 and block_n == 128
+    e = expected_tokens_per_expert
+    n = num_experts_per_rank
+    if small_block_n and intermediate_hidden <= 2048 and 1.5 <= e < 2.0 and n % 16 == 0:
+        return 16
+    if small_block_n and intermediate_hidden <= 2048 and 3.0 <= e < 6.0 and n % 16 == 0:
+        return 16
+    if small_block_n and intermediate_hidden <= 2048 and 6.0 <= e < 12.0 and n % 32 == 0:
+        return 32
+    if small_block_n and intermediate_hidden <= 2048 and 6.0 <= e < 12.0 and n % 8 == 0:
+        return 8
+    if small_block_n and intermediate_hidden <= 2048 and 24.0 <= e < 32.0 and n % 16 == 0:
+        return 16
+    if small_block_n and intermediate_hidden <= 2048 and 12.0 <= e < 24.0 and n % 32 == 0:
+        return 32
+    if small_block_n and intermediate_hidden <= 2048 and 12.0 <= e < 24.0 and n % 8 == 0:
+        return 8
+    if small_block_n and intermediate_hidden <= 2048 and 32.0 <= e < 64.0 and n % 16 == 0:
+        return 16
+    if small_block_n and intermediate_hidden >= 3072 and 0.0 < e < 0.25 and n % 16 == 0:
+        return 16
+    if small_block_n and intermediate_hidden >= 3072 and 0.25 <= e < 0.375 and n % 16 == 0:
+        return 16
+    if small_block_n and intermediate_hidden >= 3072 and 0.375 <= e < 0.75 and n % 16 == 0:
+        return 16
+    if small_block_n and intermediate_hidden >= 3072 and 0.25 <= e < 1.0 and n % 24 == 0:
+        return 24
+    if small_block_n and intermediate_hidden >= 3072 and 1.0 <= e < 1.5 and n > 0:
+        return n
+    if small_block_n and intermediate_hidden >= 3072 and 1.5 <= e < 3.0 and n % 16 == 0:
+        return 16
+    if small_block_n and intermediate_hidden >= 3072 and 3.0 <= e < 6.0 and n % 8 == 0:
+        return 8
+    if small_block_n and intermediate_hidden >= 3072 and 6.0 <= e < 12.0 and n % 16 == 0:
+        return 16
+    if small_block_n and intermediate_hidden >= 3072 and 6.0 <= e < 12.0 and n % 8 == 0:
+        return 8
+    if small_block_n and intermediate_hidden >= 3072 and 12.0 <= e < 24.0 and n % 24 == 0:
+        return 24
+    if small_block_n and intermediate_hidden >= 3072 and 12.0 <= e < 24.0 and n % 8 == 0:
+        return 8
+    if small_block_n and intermediate_hidden >= 3072 and 24.0 <= e < 64.0 and n % 8 == 0:
+        return 8
+    if e < 1.0 or e > 4.0:
+        return n
+    return GENERIC_FALLBACK
+
+
+FLASH_RULES = (
+    (1.5, 2.0, True, 16, 16),
+    (3.0, 6.0, True, 16, 16),
+    (6.0, 12.0, True, 32, 32),
+    (6.0, 12.0, True, 8, 8),
+    (24.0, 32.0, True, 16, 16),
+    (12.0, 24.0, True, 32, 32),
+    (12.0, 24.0, True, 8, 8),
+    (32.0, 64.0, True, 16, 16),
+)
+
+PRO_RULES = (
+    (0.0, 0.25, False, 16, 16),
+    (0.25, 0.375, True, 16, 16),
+    (0.375, 0.75, True, 16, 16),
+    (0.25, 1.0, True, 24, 24),
+    (1.0, 1.5, True, 1, None),
+    (1.5, 3.0, True, 16, 16),
+    (3.0, 6.0, True, 8, 8),
+    (6.0, 12.0, True, 16, 16),
+    (6.0, 12.0, True, 8, 8),
+    (12.0, 24.0, True, 24, 24),
+    (12.0, 24.0, True, 8, 8),
+    (24.0, 64.0, True, 8, 8),
+)
+
+
+def apply_rules(rules, num_experts_per_rank: int, expected_tokens_per_expert: float):
+    for min_e, max_e, include_min, divisor, wave in rules:
+        lower_ok = expected_tokens_per_expert >= min_e if include_min else expected_tokens_per_expert > min_e
+        if not lower_ok or expected_tokens_per_expert >= max_e:
+            continue
+        if wave is None:
+            if num_experts_per_rank <= 0:
+                continue
+            return num_experts_per_rank
+        if num_experts_per_rank % divisor == 0:
+            return wave
+    return None
+
+
+def table_wave(
+    num_experts_per_rank: int,
+    expected_tokens_per_expert: float,
+    intermediate_hidden: int,
+    block_m: int,
+    block_n: int,
+):
+    small_block_n = block_m == 64 and block_n == 128
+    if small_block_n and intermediate_hidden <= 2048:
+        selected = apply_rules(FLASH_RULES, num_experts_per_rank, expected_tokens_per_expert)
+        if selected is not None:
+            return selected
+    if small_block_n and intermediate_hidden >= 3072:
+        selected = apply_rules(PRO_RULES, num_experts_per_rank, expected_tokens_per_expert)
+        if selected is not None:
+            return selected
+    if expected_tokens_per_expert < 1.0 or expected_tokens_per_expert > 4.0:
+        return num_experts_per_rank
+    return GENERIC_FALLBACK
+
+
+def legacy_threads(
+    expected_tokens_per_expert: float,
+    intermediate_hidden: int,
+    block_m: int,
+    block_n: int,
+    num_epilogue_threads: int,
+):
+    small_block_n = block_m == 64 and block_n == 128
+    e = expected_tokens_per_expert
+    decode_heavy_small_batch = small_block_n and 0.0 < e <= 24.0
+    pro_large_decode_assist_batch = small_block_n and intermediate_hidden >= 3072 and 24.0 <= e < 64.0
+    pro_split_n_decode_threads = small_block_n and intermediate_hidden >= 3072 and 0.0 < e < 64.0
+    flash_split_n_decode_threads = small_block_n and intermediate_hidden <= 2048 and 0.0 < e < 64.0
+    two_wg_decode_offload = (
+        block_m == 128 and block_n == 128 and num_epilogue_threads == 256 and e >= 64.0
+    )
+    dispatch = (
+        64
+        if decode_heavy_small_batch
+        or flash_split_n_decode_threads
+        or pro_large_decode_assist_batch
+        or two_wg_decode_offload
+        else 128
+    )
+    non_epilogue = (
+        320
+        if pro_split_n_decode_threads or flash_split_n_decode_threads
+        else (
+            192
+            if decode_heavy_small_batch or pro_large_decode_assist_batch or two_wg_decode_offload
+            else 128
+        )
+    )
+    return dispatch, non_epilogue
+
+
+def legacy_epilogue_threads(
+    expected_tokens_per_expert: float,
+    intermediate_hidden: int,
+    block_m: int,
+    block_n: int,
+    num_epilogue_threads: int,
+):
+    e = expected_tokens_per_expert
+    epilogue_warpgroups = num_epilogue_threads // 128
+    split_n_eligible = block_m == 64 and block_n % 128 == 0
+    split_n_band = 32.0 <= e < 64.0
+    pro_split_n_band = intermediate_hidden >= 3072 and 0.0 < e < 64.0
+    flash_split_n_band = intermediate_hidden <= 2048 and 0.0 < e < 64.0
+    small_split_n_band = flash_split_n_band or pro_split_n_band
+    default_split_n = (
+        split_n_eligible
+        and (split_n_band or small_split_n_band)
+        and (intermediate_hidden <= 2048 or intermediate_hidden >= 3072)
+    )
+    if split_n_eligible and default_split_n:
+        epilogue_warpgroups = 2
+    return epilogue_warpgroups * 128
+
+
+def table_epilogue_threads(
+    expected_tokens_per_expert: float,
+    intermediate_hidden: int,
+    block_m: int,
+    block_n: int,
+    num_epilogue_threads: int,
+):
+    e = expected_tokens_per_expert
+    epilogue_warpgroups = num_epilogue_threads // 128
+    split_n_eligible = block_m == 64 and block_n % 128 == 0
+    split_n_shape_band = (
+        (intermediate_hidden <= 2048 or intermediate_hidden >= 3072) and 0.0 < e < 64.0
+    )
+    if split_n_eligible and split_n_shape_band:
+        epilogue_warpgroups = 2
+    return epilogue_warpgroups * 128
+
+
+def table_threads(
+    expected_tokens_per_expert: float,
+    intermediate_hidden: int,
+    block_m: int,
+    block_n: int,
+    num_epilogue_threads: int,
+):
+    small_block_n_kernel = block_m == 64 and block_n == 128
+    e = expected_tokens_per_expert
+    split_n_shape_band = (
+        (intermediate_hidden <= 2048 or intermediate_hidden >= 3072) and 0.0 < e < 64.0
+    )
+    split_n_decode_thread_kernel_band = small_block_n_kernel and split_n_shape_band
+    two_wg_decode_offload_kernel_band = (
+        block_m == 128 and block_n == 128 and num_epilogue_threads == 256 and e >= 64.0
+    )
+    decode_assist_thread_kernel_band = two_wg_decode_offload_kernel_band or (
+        small_block_n_kernel and 0.0 < e <= 24.0
+    )
+    dispatch = 64 if split_n_decode_thread_kernel_band or decode_assist_thread_kernel_band else 128
+    non_epilogue = (
+        320
+        if split_n_decode_thread_kernel_band
+        else (192 if decode_assist_thread_kernel_band else 128)
+    )
+    return dispatch, non_epilogue
+
+
+def legacy_stage_cap(
+    expected_tokens_per_expert: float,
+    intermediate_hidden: int,
+    block_m: int,
+    block_n: int,
+):
+    small_block_n = block_m == 64 and block_n == 128
+    e = expected_tokens_per_expert
+    stage4_decode_band = small_block_n and intermediate_hidden <= 2048 and 6.0 <= e < 12.0
+    flash_lookahead_stage4 = small_block_n and intermediate_hidden <= 2048 and 3.0 < e < 6.0
+    pro_ultra_small_stage4 = small_block_n and intermediate_hidden >= 3072 and 0.0 < e < 0.25
+    pro_half_token_stage4 = small_block_n and intermediate_hidden >= 3072 and 0.375 <= e < 0.75
+    pro_single_token_stage5 = small_block_n and intermediate_hidden >= 3072 and 1.0 <= e < 1.5
+    pro_two_token_stage4 = small_block_n and intermediate_hidden >= 3072 and 1.5 <= e < 3.0
+    pro_large_batch_stage5 = small_block_n and intermediate_hidden >= 3072 and 24.0 <= e < 64.0
+    stage6_decode_band = small_block_n and (
+        (0.375 <= e < 0.75)
+        or (intermediate_hidden <= 2048 and 3.0 < e < 6.0)
+        or (1.5 <= e < 3.0 and not pro_two_token_stage4)
+    )
+    stage5_decode_heavy_batch = small_block_n and 1.5 <= e <= 24.0
+    if (
+        stage4_decode_band
+        or flash_lookahead_stage4
+        or pro_ultra_small_stage4
+        or pro_half_token_stage4
+        or pro_two_token_stage4
+    ):
+        return 4
+    if pro_single_token_stage5 or pro_large_batch_stage5:
+        return 5
+    if stage6_decode_band:
+        return 6
+    if stage5_decode_heavy_batch:
+        return 5
+    return 0
+
+
+STAGE_SHAPE_ANY = "any"
+STAGE_SHAPE_FLASH = "flash"
+STAGE_SHAPE_PRO = "pro"
+STAGE_SHAPE_NOT_PRO = "not_pro"
+
+STAGE_RULES = (
+    (6.0, 12.0, True, False, STAGE_SHAPE_FLASH, 4),
+    (3.0, 6.0, False, False, STAGE_SHAPE_FLASH, 4),
+    (0.0, 0.25, False, False, STAGE_SHAPE_PRO, 4),
+    (0.375, 0.75, True, False, STAGE_SHAPE_PRO, 4),
+    (1.5, 3.0, True, False, STAGE_SHAPE_PRO, 4),
+    (1.0, 1.5, True, False, STAGE_SHAPE_PRO, 5),
+    (24.0, 64.0, True, False, STAGE_SHAPE_PRO, 5),
+    (0.375, 0.75, True, False, STAGE_SHAPE_ANY, 6),
+    (3.0, 6.0, False, False, STAGE_SHAPE_FLASH, 6),
+    (1.5, 3.0, True, False, STAGE_SHAPE_NOT_PRO, 6),
+    (1.5, 24.0, True, True, STAGE_SHAPE_ANY, 5),
+)
+
+
+def stage_shape_matches(shape, intermediate_hidden: int):
+    flash_shape = intermediate_hidden <= 2048
+    pro_shape = intermediate_hidden >= 3072
+    if shape == STAGE_SHAPE_ANY:
+        return True
+    if shape == STAGE_SHAPE_FLASH:
+        return flash_shape
+    if shape == STAGE_SHAPE_PRO:
+        return pro_shape
+    if shape == STAGE_SHAPE_NOT_PRO:
+        return not pro_shape
+    raise AssertionError(f"unknown stage shape {shape}")
+
+
+def table_stage_cap(
+    expected_tokens_per_expert: float,
+    intermediate_hidden: int,
+    block_m: int,
+    block_n: int,
+):
+    if not (block_m == 64 and block_n == 128):
+        return 0
+    e = expected_tokens_per_expert
+    for min_e, max_e, include_min, include_max, shape, cap in STAGE_RULES:
+        lower_ok = e >= min_e if include_min else e > min_e
+        upper_ok = e <= max_e if include_max else e < max_e
+        if lower_ok and upper_ok and stage_shape_matches(shape, intermediate_hidden):
+            return cap
+    return 0
+
+
+def legacy_config(
+    num_experts_per_rank: int,
+    expected_tokens_per_expert: float,
+    intermediate_hidden: int,
+    block_m: int,
+    block_n: int,
+    num_epilogue_threads: int,
+):
+    epilogue_threads = legacy_epilogue_threads(
+        expected_tokens_per_expert, intermediate_hidden, block_m, block_n, num_epilogue_threads
+    )
+    dispatch_threads, non_epilogue_threads = legacy_threads(
+        expected_tokens_per_expert, intermediate_hidden, block_m, block_n, epilogue_threads
+    )
+    return {
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": 128,
+        "num_experts_per_wave": legacy_wave(
+            num_experts_per_rank, expected_tokens_per_expert, intermediate_hidden, block_m, block_n
+        ),
+        "num_dispatch_threads": dispatch_threads,
+        "num_non_epilogue_threads": non_epilogue_threads,
+        "num_epilogue_threads": epilogue_threads,
+        "default_num_stages_cap": legacy_stage_cap(
+            expected_tokens_per_expert, intermediate_hidden, block_m, block_n
+        ),
+    }
+
+
+def table_config(
+    num_experts_per_rank: int,
+    expected_tokens_per_expert: float,
+    intermediate_hidden: int,
+    block_m: int,
+    block_n: int,
+    num_epilogue_threads: int,
+):
+    epilogue_threads = table_epilogue_threads(
+        expected_tokens_per_expert, intermediate_hidden, block_m, block_n, num_epilogue_threads
+    )
+    dispatch_threads, non_epilogue_threads = table_threads(
+        expected_tokens_per_expert, intermediate_hidden, block_m, block_n, epilogue_threads
+    )
+    return {
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": 128,
+        "num_experts_per_wave": table_wave(
+            num_experts_per_rank, expected_tokens_per_expert, intermediate_hidden, block_m, block_n
+        ),
+        "num_dispatch_threads": dispatch_threads,
+        "num_non_epilogue_threads": non_epilogue_threads,
+        "num_epilogue_threads": epilogue_threads,
+        "default_num_stages_cap": table_stage_cap(
+            expected_tokens_per_expert, intermediate_hidden, block_m, block_n
+        ),
+    }
+
+
+def legacy_api_features(
+    num_experts_per_rank: int,
+    expected_tokens_per_expert: float,
+    intermediate_hidden: int,
+):
+    e = expected_tokens_per_expert
+    fp4_decode_lookahead_band = 3.0 <= e <= 6.0
+    fp4_bigband_lookahead_band = 12.0 <= e <= 24.0
+    fp4_pro_bigband_lookahead_band = intermediate_hidden >= 3072 and fp4_bigband_lookahead_band
+    fp4_b4_skip_decode_band = 0.5 <= e < 1.0
+    fp4_pro_single_token_per_expert_band = (
+        intermediate_hidden >= 3072 and 1.0 <= e < 1.5 and num_experts_per_rank % 8 == 0
+    )
+    fp4_pro_split_n_mbarrier_band = intermediate_hidden >= 3072 and 0.0 < e < 64.0
+    fp4_pro_two_tokens_per_expert_band = intermediate_hidden >= 3072 and 1.5 <= e < 3.0
+    fp4_pro_mid_decode_assist_band = intermediate_hidden >= 3072 and 6.0 <= e < 12.0
+    fp4_pro_large_decode_assist_batch = intermediate_hidden >= 3072 and 24.0 <= e < 64.0
+    fp4_flash_two_tokens_per_expert_band = intermediate_hidden <= 2048 and 1.5 <= e < 2.0
+    fp4_flash_half_token_per_expert_band = intermediate_hidden <= 2048 and 0.375 <= e < 0.5
+    fp4_flash_decode_lookahead_band = intermediate_hidden <= 2048 and 3.0 <= e < 6.0
+    fp4_flash_stage4_no_early_band = intermediate_hidden <= 2048 and 6.0 <= e < 12.0
+    fp4_flash_wide_load_decode_band = intermediate_hidden <= 2048 and 6.0 <= e < 64.0
+    fp4_pro_wide_load_decode_band = intermediate_hidden >= 3072 and 0.0 < e < 6.0
+    fp4_flash_split_n_mbarrier_band = intermediate_hidden <= 2048 and 0.75 <= e < 64.0
+    fp4_flash_small_mbarrier_band = intermediate_hidden <= 2048 and 0.0 < e < 0.5
+    fp4_2wg_decode_offload_band = e >= 64.0
+    default_math_wg_decode = (
+        (0.0 < e < 0.375)
+        or fp4_flash_half_token_per_expert_band
+        or (1.0 <= e < 2.0)
+        or fp4_pro_two_tokens_per_expert_band
+        or fp4_decode_lookahead_band
+        or fp4_b4_skip_decode_band
+        or fp4_flash_split_n_mbarrier_band
+        or fp4_pro_mid_decode_assist_band
+        or fp4_pro_large_decode_assist_batch
+        or fp4_bigband_lookahead_band
+        or fp4_2wg_decode_offload_band
+    )
+    default_skip_loader_decode_assist = (
+        (0.0 < e < 0.375)
+        or fp4_flash_half_token_per_expert_band
+        or fp4_pro_single_token_per_expert_band
+        or (1.5 <= e < 3.0)
+        or fp4_decode_lookahead_band
+        or fp4_b4_skip_decode_band
+        or fp4_flash_split_n_mbarrier_band
+        or fp4_pro_mid_decode_assist_band
+        or fp4_pro_large_decode_assist_batch
+        or fp4_bigband_lookahead_band
+        or fp4_2wg_decode_offload_band
+    )
+    default_wide_load_decode = (
+        fp4_pro_wide_load_decode_band
+        or fp4_pro_mid_decode_assist_band
+        or fp4_pro_bigband_lookahead_band
+        or fp4_flash_half_token_per_expert_band
+        or fp4_flash_two_tokens_per_expert_band
+        or fp4_flash_wide_load_decode_band
+        or fp4_pro_large_decode_assist_batch
+    )
+    default_ss_early_b_decode = (
+        (
+            1.5 <= e <= 3.0
+            and not fp4_pro_two_tokens_per_expert_band
+            and not fp4_flash_two_tokens_per_expert_band
+            and not fp4_flash_decode_lookahead_band
+        )
+        or (
+            intermediate_hidden >= 3072
+            and 6.0 <= e <= 24.0
+            and not fp4_pro_mid_decode_assist_band
+            and not fp4_pro_bigband_lookahead_band
+            and not fp4_flash_stage4_no_early_band
+        )
+        or fp4_2wg_decode_offload_band
+    )
+    default_decode_done_mbarrier = (
+        fp4_pro_split_n_mbarrier_band
+        or fp4_flash_split_n_mbarrier_band
+        or fp4_flash_small_mbarrier_band
+        or (
+            fp4_decode_lookahead_band
+            and not fp4_flash_decode_lookahead_band
+            and not fp4_flash_stage4_no_early_band
+        )
+        or fp4_bigband_lookahead_band
+        or fp4_2wg_decode_offload_band
+    )
+    default_l2_arrival_counter = (
+        (intermediate_hidden <= 2048 and 0.375 <= e < 0.75)
+        or (intermediate_hidden >= 3072 and 0.25 <= e < 0.375)
+    )
+    return {
+        "math_wg_participates": not default_math_wg_decode,
+        "first_decode_assist_warp": 2 if default_skip_loader_decode_assist else 0,
+        "wide_load_decode": default_wide_load_decode,
+        "early_b_decode": default_ss_early_b_decode,
+        "decode_done_mbarrier": default_decode_done_mbarrier,
+        "l2_arrival_counter": default_l2_arrival_counter,
+        "ss_nsplit": e >= 64.0,
+        "swap_ab": (intermediate_hidden <= 2048 or intermediate_hidden >= 3072) and 0.0 < e <= 24.0,
+        "swap_ab_fast_amax": intermediate_hidden >= 3072 and 12.0 <= e <= 24.0,
+    }
+
+
+def table_api_features(
+    num_experts_per_rank: int,
+    expected_tokens_per_expert: float,
+    intermediate_hidden: int,
+):
+    e = expected_tokens_per_expert
+    fp4_flash_shape = intermediate_hidden <= 2048
+    fp4_pro_shape = intermediate_hidden >= 3072
+    fp4_middle_shape = not fp4_flash_shape and not fp4_pro_shape
+    fp4_decode_lookahead_shape_band = 3.0 <= e <= 6.0
+    fp4_bigband_lookahead_shape_band = 12.0 <= e <= 24.0
+    fp4_b4_skip_decode_shape_band = 0.5 <= e < 1.0
+    fp4_pro_single_token_per_expert_shape_band = (
+        fp4_pro_shape and 1.0 <= e < 1.5 and num_experts_per_rank % 8 == 0
+    )
+    fp4_pro_split_n_mbarrier_shape_band = fp4_pro_shape and 0.0 < e < 64.0
+    fp4_pro_two_tokens_per_expert_shape_band = fp4_pro_shape and 1.5 <= e < 3.0
+    fp4_pro_mid_decode_assist_shape_band = fp4_pro_shape and 6.0 <= e < 12.0
+    fp4_pro_large_decode_assist_shape_band = fp4_pro_shape and 24.0 <= e < 64.0
+    fp4_flash_two_tokens_per_expert_shape_band = fp4_flash_shape and 1.5 <= e < 2.0
+    fp4_flash_half_token_per_expert_shape_band = fp4_flash_shape and 0.375 <= e < 0.5
+    fp4_flash_decode_lookahead_shape_band = fp4_flash_shape and 3.0 <= e < 6.0
+    fp4_flash_wide_load_decode_shape_band = fp4_flash_shape and 6.0 <= e < 64.0
+    fp4_pro_wide_load_decode_shape_band = fp4_pro_shape and 0.0 < e < 64.0
+    fp4_flash_split_n_mbarrier_shape_band = fp4_flash_shape and 0.75 <= e < 64.0
+    fp4_flash_small_mbarrier_shape_band = fp4_flash_shape and 0.0 < e < 0.5
+    fp4_2wg_decode_offload_shape_band = e >= 64.0
+    fp4_shared_decode_assist_shape_band = (
+        (0.0 < e < 0.375)
+        or fp4_flash_half_token_per_expert_shape_band
+        or fp4_b4_skip_decode_shape_band
+        or fp4_decode_lookahead_shape_band
+        or fp4_flash_split_n_mbarrier_shape_band
+        or fp4_pro_mid_decode_assist_shape_band
+        or fp4_pro_large_decode_assist_shape_band
+        or fp4_bigband_lookahead_shape_band
+        or fp4_2wg_decode_offload_shape_band
+    )
+    default_math_wg_decode = (
+        fp4_shared_decode_assist_shape_band
+        or (1.0 <= e < 2.0)
+        or fp4_pro_two_tokens_per_expert_shape_band
+    )
+    default_skip_loader_decode_assist = (
+        fp4_shared_decode_assist_shape_band
+        or fp4_pro_single_token_per_expert_shape_band
+        or (1.5 <= e < 3.0)
+    )
+    default_wide_load_decode = (
+        fp4_pro_wide_load_decode_shape_band
+        or fp4_flash_half_token_per_expert_shape_band
+        or fp4_flash_two_tokens_per_expert_shape_band
+        or fp4_flash_wide_load_decode_shape_band
+    )
+    default_ss_early_b_decode = (
+        (
+            1.5 <= e <= 3.0
+            and not fp4_pro_two_tokens_per_expert_shape_band
+            and not fp4_flash_two_tokens_per_expert_shape_band
+            and not fp4_flash_decode_lookahead_shape_band
+        )
+        or fp4_2wg_decode_offload_shape_band
+    )
+    default_decode_done_mbarrier = (
+        fp4_pro_split_n_mbarrier_shape_band
+        or fp4_flash_split_n_mbarrier_shape_band
+        or fp4_flash_small_mbarrier_shape_band
+        or (fp4_middle_shape and fp4_decode_lookahead_shape_band)
+        or (fp4_middle_shape and fp4_bigband_lookahead_shape_band)
+        or fp4_2wg_decode_offload_shape_band
+    )
+    default_l2_arrival_counter = (
+        (fp4_flash_shape and 0.375 <= e < 0.75)
+        or (fp4_pro_shape and 0.25 <= e < 0.375)
+    )
+    return {
+        "math_wg_participates": not default_math_wg_decode,
+        "first_decode_assist_warp": 2 if default_skip_loader_decode_assist else 0,
+        "wide_load_decode": default_wide_load_decode,
+        "early_b_decode": default_ss_early_b_decode,
+        "decode_done_mbarrier": default_decode_done_mbarrier,
+        "l2_arrival_counter": default_l2_arrival_counter,
+        "ss_nsplit": e >= 64.0,
+        "swap_ab": (fp4_flash_shape or fp4_pro_shape) and 0.0 < e <= 24.0,
+        "swap_ab_fast_amax": fp4_pro_shape and 12.0 <= e <= 24.0,
+    }
+
+
+def check_case(num_experts_per_rank, e, intermediate_hidden, block_m, block_n, num_epilogue_threads):
+    old = legacy_wave(num_experts_per_rank, e, intermediate_hidden, block_m, block_n)
+    new = table_wave(num_experts_per_rank, e, intermediate_hidden, block_m, block_n)
+    assert old == new, (
+        f"wave mismatch n={num_experts_per_rank} e={e} ih={intermediate_hidden} "
+        f"block=({block_m},{block_n}) old={old} new={new}"
+    )
+    old_threads = legacy_threads(e, intermediate_hidden, block_m, block_n, num_epilogue_threads)
+    new_threads = table_threads(e, intermediate_hidden, block_m, block_n, num_epilogue_threads)
+    assert old_threads == new_threads, (
+        f"thread mismatch n={num_experts_per_rank} e={e} ih={intermediate_hidden} "
+        f"block=({block_m},{block_n}) epilogue_threads={num_epilogue_threads} "
+        f"old={old_threads} new={new_threads}"
+    )
+    old_epilogue = legacy_epilogue_threads(
+        e, intermediate_hidden, block_m, block_n, num_epilogue_threads
+    )
+    new_epilogue = table_epilogue_threads(
+        e, intermediate_hidden, block_m, block_n, num_epilogue_threads
+    )
+    assert old_epilogue == new_epilogue, (
+        f"epilogue mismatch n={num_experts_per_rank} e={e} ih={intermediate_hidden} "
+        f"block=({block_m},{block_n}) epilogue_threads={num_epilogue_threads} "
+        f"old={old_epilogue} new={new_epilogue}"
+    )
+    old_stage_cap = legacy_stage_cap(e, intermediate_hidden, block_m, block_n)
+    new_stage_cap = table_stage_cap(e, intermediate_hidden, block_m, block_n)
+    assert old_stage_cap == new_stage_cap, (
+        f"stage cap mismatch n={num_experts_per_rank} e={e} ih={intermediate_hidden} "
+        f"block=({block_m},{block_n}) old={old_stage_cap} new={new_stage_cap}"
+    )
+    old_config = legacy_config(
+        num_experts_per_rank, e, intermediate_hidden, block_m, block_n, num_epilogue_threads
+    )
+    new_config = table_config(
+        num_experts_per_rank, e, intermediate_hidden, block_m, block_n, num_epilogue_threads
+    )
+    assert old_config == new_config, (
+        f"config mismatch n={num_experts_per_rank} e={e} ih={intermediate_hidden} "
+        f"block=({block_m},{block_n}) epilogue_threads={num_epilogue_threads} "
+        f"old={old_config} new={new_config}"
+    )
+    old_features = legacy_api_features(num_experts_per_rank, e, intermediate_hidden)
+    new_features = table_api_features(num_experts_per_rank, e, intermediate_hidden)
+    assert old_features == new_features, (
+        f"API feature mismatch n={num_experts_per_rank} e={e} "
+        f"ih={intermediate_hidden} old={old_features} new={new_features}"
+    )
+
+
+def _run_sm90_fp4_heuristic_checks():
+    e_values = {
+        0.0, 0.125, 0.249, 0.25, 0.374, 0.375, 0.499, 0.5,
+        0.749, 0.75, 0.999, 1.0, 1.499, 1.5, 1.999, 2.0,
+        2.999, 3.0, 3.001, 4.0, 5.999, 6.0, 6.001, 11.999,
+        12.0, 12.001, 23.999, 24.0, 24.001, 31.999, 32.0,
+        47.999, 48.0, 63.999, 64.0, 64.001,
+    }
+    num_experts_per_rank_values = (1, 7, 8, 15, 16, 23, 24, 31, 32, 47, 48, 64, 96)
+    intermediate_hidden_values = (1024, 2048, 2500, 3072, 4096)
+    block_values = ((64, 128), (64, 256), (128, 128), (64, 64))
+    epilogue_thread_values = (128, 256, 512)
+
+    checked = 0
+    for n in num_experts_per_rank_values:
+        for e in sorted(e_values):
+            for ih in intermediate_hidden_values:
+                for block_m, block_n in block_values:
+                    for num_epilogue_threads in epilogue_thread_values:
+                        check_case(n, e, ih, block_m, block_n, num_epilogue_threads)
+                        checked += 1
+
+    for batch in (1, 2, 4, 8, 16, 32, 64, 128, 256):
+        check_case(32, batch * 6 / 32, 2048, 64, 128, 256)
+        check_case(48, batch * 6 / 48, 3072, 64, 128, 256)
+        checked += 2
+
+    print(f"SM90 FP4 heuristic equivalence passed: {checked} cases")
+
+
+
+if __name__ == '__main__' and '--check-heuristics-only' in sys.argv:
+    _run_sm90_fp4_heuristic_checks()
+    sys.exit(0)
+
+import torch
+import torch.distributed as dist
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
@@ -1374,6 +2034,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Hopper FP4 MegaMoE tests and benchmark')
+    parser.add_argument('--check-heuristics-only', action='store_true',
+                        help='Run CPU-only SM90 FP4 heuristic equivalence checks and exit')
     parser.add_argument('--bench', action='store_true',
                         help='Run FP4 fused vs FP8 low-latency benchmark mode')
     parser.add_argument('--ncu-profile-only', action='store_true',
