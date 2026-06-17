@@ -101,6 +101,55 @@ def _dequant_fp4_per32(fp4: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
     return val * sf_broad
 
 
+def _predecode_grouped_fp4_to_fp8_block_128_128(
+    fp4: torch.Tensor,
+    sf: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert FP4 weights to the FP8 grouped-GEMM layout outside timed regions."""
+    g, n, half_k = fp4.shape
+    k = half_k * 2
+    assert n % 128 == 0 and k % 128 == 0
+
+    w_fp8 = torch.empty((g, n, k), device=fp4.device, dtype=torch.float8_e4m3fn)
+    w_sf = torch.empty((g, n // 128, k // 128), device=fp4.device, dtype=torch.float32)
+    for expert_idx in range(g):
+        w_deq = _dequant_fp4_per32(
+            fp4[expert_idx:expert_idx + 1],
+            sf[expert_idx:expert_idx + 1],
+        ).to(torch.bfloat16)
+        q_fp8, q_sf = _quantize_grouped_fp8_block_128_128(w_deq)
+        w_fp8[expert_idx:expert_idx + 1].copy_(q_fp8)
+        w_sf[expert_idx:expert_idx + 1].copy_(q_sf)
+        del w_deq, q_fp8, q_sf
+        if expert_idx % 4 == 3:
+            torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
+    return w_fp8, w_sf
+
+
+def _randn_quantize_grouped_fp8_block_128_128(
+    shape: Tuple[int, int, int],
+    weight_scale: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Generate and quantize grouped FP8 weights one expert at a time."""
+    g, n, k = shape
+    assert n % 128 == 0 and k % 128 == 0
+    w_fp8 = torch.empty((g, n, k), device="cuda", dtype=torch.float8_e4m3fn)
+    w_sf = torch.empty((g, n // 128, k // 128), device="cuda", dtype=torch.float32)
+    for expert_idx in range(g):
+        w_bf16 = torch.empty((1, n, k), device="cuda", dtype=torch.bfloat16)
+        w_bf16.normal_()
+        w_bf16.mul_(weight_scale)
+        q_fp8, q_sf = _quantize_grouped_fp8_block_128_128(w_bf16)
+        w_fp8[expert_idx:expert_idx + 1].copy_(q_fp8)
+        w_sf[expert_idx:expert_idx + 1].copy_(q_sf)
+        del w_bf16, q_fp8, q_sf
+        if expert_idx % 4 == 3:
+            torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
+    return w_fp8, w_sf
+
+
 def _dequant_per_token_per_128_k(
     x_fp8: torch.Tensor, sf: torch.Tensor
 ) -> torch.Tensor:
@@ -619,11 +668,25 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
     num_experts = args.num_experts
     num_topk = args.num_topk
     num_experts_per_rank = num_experts // num_ranks
+    run_fp4_runtime_enabled = args.fp4_mode == "runtime"
+    run_fp4_predecode_enabled = args.fp4_mode == "predecode"
+    run_fp4_timing_enabled = run_fp4_runtime_enabled or run_fp4_predecode_enabled
     run_fp8_normal_baseline_enabled = (
         args.run_normal_baseline and not args.ncu_profile_only
     )
     run_fp8_ll_baseline_enabled = (
         not args.skip_fp8_ll_baseline and not args.ncu_profile_only
+    )
+    run_low_latency_path_enabled = (
+        run_fp8_ll_baseline_enabled or run_fp4_predecode_enabled
+    )
+    need_original_fp8_weights = (
+        run_fp8_normal_baseline_enabled or run_fp8_ll_baseline_enabled
+    )
+    baseline_only_weights = (
+        not run_fp4_timing_enabled and
+        need_original_fp8_weights and
+        not args.bench_check_reference
     )
 
     assert num_tokens <= num_max_tokens_per_rank
@@ -632,16 +695,19 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
     assert intermediate_hidden % 128 == 0
     assert intermediate_hidden // 64 <= 64
     x_bf16 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
-    l1_bf16 = torch.randn(
-        (num_experts_per_rank, intermediate_hidden * 2, hidden),
-        dtype=torch.bfloat16,
-        device="cuda",
-    ) * args.weight_scale
-    l2_bf16 = torch.randn(
-        (num_experts_per_rank, hidden, intermediate_hidden),
-        dtype=torch.bfloat16,
-        device="cuda",
-    ) * args.weight_scale
+    l1_bf16 = None
+    l2_bf16 = None
+    if not baseline_only_weights:
+        l1_bf16 = torch.randn(
+            (num_experts_per_rank, intermediate_hidden * 2, hidden),
+            dtype=torch.bfloat16,
+            device="cuda",
+        ) * args.weight_scale
+        l2_bf16 = torch.randn(
+            (num_experts_per_rank, hidden, intermediate_hidden),
+            dtype=torch.bfloat16,
+            device="cuda",
+        ) * args.weight_scale
 
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device="cuda")
     topk_weights, topk_idx = torch.topk(
@@ -653,34 +719,77 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
         x_bf16, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False
     )
 
-    l1_fp4 = _quantize_grouped_fp4_per32(l1_bf16)
-    l2_fp4 = _quantize_grouped_fp4_per32(l2_bf16)
-    transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe_sm90_fp4(
-        l1_fp4, l2_fp4
+    l1_fp4 = None
+    l2_fp4 = None
+    transformed_l1 = None
+    transformed_l2 = None
+    need_fp4_weights = (
+        run_fp4_timing_enabled or args.bench_check_reference
     )
+    if need_fp4_weights:
+        assert l1_bf16 is not None and l2_bf16 is not None
+        l1_fp4 = _quantize_grouped_fp4_per32(l1_bf16)
+        l2_fp4 = _quantize_grouped_fp4_per32(l2_bf16)
+    if run_fp4_runtime_enabled:
+        transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe_sm90_fp4(
+            l1_fp4, l2_fp4
+        )
 
-    l1_fp8 = _quantize_grouped_fp8_block_128_128(l1_bf16)
-    l2_fp8 = _quantize_grouped_fp8_block_128_128(l2_bf16)
+    l1_fp8 = None
+    l2_fp8 = None
+    if baseline_only_weights:
+        l1_fp8 = _randn_quantize_grouped_fp8_block_128_128(
+            (num_experts_per_rank, intermediate_hidden * 2, hidden),
+            args.weight_scale,
+        )
+        torch.cuda.empty_cache()
+        l2_fp8 = _randn_quantize_grouped_fp8_block_128_128(
+            (num_experts_per_rank, hidden, intermediate_hidden),
+            args.weight_scale,
+        )
+    elif need_original_fp8_weights:
+        assert l1_bf16 is not None and l2_bf16 is not None
+        l1_fp8 = _quantize_grouped_fp8_block_128_128(l1_bf16)
+        l2_fp8 = _quantize_grouped_fp8_block_128_128(l2_bf16)
+    if l1_bf16 is not None:
+        del l1_bf16
+    if l2_bf16 is not None:
+        del l2_bf16
+    torch.cuda.empty_cache()
+
+    predecode_l1_fp8 = None
+    predecode_l2_fp8 = None
+    if run_fp4_predecode_enabled:
+        predecode_l1_fp8 = _predecode_grouped_fp4_to_fp8_block_128_128(*l1_fp4)
+        predecode_l2_fp8 = _predecode_grouped_fp4_to_fp8_block_128_128(*l2_fp4)
 
     clamp_arg = args.activation_clamp if math.isfinite(args.activation_clamp) else None
-    cum_stats = torch.zeros((num_experts_per_rank,), dtype=torch.int, device="cuda")
-    sym_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
-        group,
-        num_experts,
-        num_max_tokens_per_rank,
-        num_topk,
-        hidden,
-        intermediate_hidden,
-    )
-    y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    cum_stats = None
+    sym_buffer = None
+    y_fused = None
+    if run_fp4_runtime_enabled:
+        if not args.bench_skip_cum_stats:
+            cum_stats = torch.zeros((num_experts_per_rank,), dtype=torch.int, device="cuda")
+        sym_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+            group,
+            num_experts,
+            num_max_tokens_per_rank,
+            num_topk,
+            hidden,
+            intermediate_hidden,
+        )
+        y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
 
     def fp4_prepare_inputs():
+        assert sym_buffer is not None
         sym_buffer.x[:num_tokens].copy_(x_fp8)
         sym_buffer.x_sf[:num_tokens].copy_(x_sf)
         sym_buffer.topk_idx[:num_tokens].copy_(topk_idx)
         sym_buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
     def fp4_fused_kernel():
+        assert transformed_l1 is not None and transformed_l2 is not None
+        assert sym_buffer is not None and y_fused is not None
         deep_gemm.fp8_fp4_mega_moe(
             y_fused,
             transformed_l1,
@@ -699,6 +808,7 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
         return fp4_fused_kernel()
 
     if args.ncu_profile_only:
+        assert run_fp4_runtime_enabled, "--ncu-profile-only requires --fp4-mode runtime"
         dist_print(
             f"[NCU] FP4 Hopper tokens={num_tokens} hidden={hidden} "
             f"ih={intermediate_hidden}",
@@ -707,13 +817,14 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
         run_fp4_fused()
         torch.cuda.synchronize()
         dist.barrier()
-        sym_buffer.destroy()
+        if sym_buffer is not None:
+            sym_buffer.destroy()
         dist.destroy_process_group()
         return
 
     normal_buffer = None
     ll_buffer = None
-    if run_fp8_normal_baseline_enabled or run_fp8_ll_baseline_enabled:
+    if run_fp8_normal_baseline_enabled or run_low_latency_path_enabled:
         deep_ep = _import_deep_ep()
         if deep_ep is None:
             raise RuntimeError("deep_ep is required for baseline comparisons")
@@ -727,7 +838,7 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
             num_max_tokens_per_rank,
             hidden,
             num_topk,
-            sym_buffer.buffer.nbytes,
+            0 if sym_buffer is None else sym_buffer.buffer.nbytes,
         )
         normal_cum_stats = torch.zeros(
             (num_experts_per_rank,), dtype=torch.int, device="cuda"
@@ -810,7 +921,7 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
         fp8_normal_l2_gemm()
         return fp8_normal_combine()
 
-    if run_fp8_ll_baseline_enabled:
+    if run_low_latency_path_enabled:
 
         ll_buffer = _make_deep_ep_low_latency_buffer(
             deep_ep, group, num_max_tokens_per_rank, hidden, num_experts
@@ -834,7 +945,7 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
         ll_combined = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
         ll_state = {}
 
-    def fp8_ll_dispatch():
+    def fp8_ll_dispatch_into(state):
         (recv_x_data, recv_x_sf), masked_m, ll_handle, event, hook = (
             ll_buffer.low_latency_dispatch(
                 x_bf16,
@@ -848,65 +959,97 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
                 return_recv_hook=False,
             )
         )
-        ll_state["recv"] = (recv_x_data, recv_x_sf)
-        ll_state["masked_m"] = masked_m
-        ll_state["ll_handle"] = ll_handle
+        state["recv"] = (recv_x_data, recv_x_sf)
+        state["masked_m"] = masked_m
+        state["ll_handle"] = ll_handle
 
-    def fp8_ll_l1_gemm():
+    def fp8_ll_l1_gemm_with(state, weights):
         _m_grouped_fp8_gemm_nt_masked(
-            ll_state["recv"],
-            l1_fp8,
+            state["recv"],
+            weights,
             ll_l1_y,
-            ll_state["masked_m"],
+            state["masked_m"],
             expected_m_ll,
             disable_ue8m0_cast=True,
         )
 
-    def fp8_ll_swiglu_quant():
+    def fp8_ll_swiglu_quant_into(state):
         l1_act_fp8, l1_act_sf = swiglu_masked_post_quant_to_fp8(
             ll_l1_y,
-            ll_state["masked_m"],
+            state["masked_m"],
             quant_group_size=BASELINE_L2_ACT_SF_GRAN,
             clamp_value=clamp_arg,
             use_ue8m0_scale=False,
         )
-        ll_state["l1_act"] = (l1_act_fp8, l1_act_sf)
+        state["l1_act"] = (l1_act_fp8, l1_act_sf)
 
-    def fp8_ll_l2_gemm():
+    def fp8_ll_l2_gemm_with(state, weights):
         _m_grouped_fp8_gemm_nt_masked(
-            ll_state["l1_act"],
-            l2_fp8,
+            state["l1_act"],
+            weights,
             ll_l2_y,
-            ll_state["masked_m"],
+            state["masked_m"],
             expected_m_ll,
             disable_ue8m0_cast=True,
         )
 
-    def fp8_ll_combine():
+    def fp8_ll_combine_from(state):
         combined, event, hook = ll_buffer.low_latency_combine(
             ll_l2_y,
             topk_idx_ll,
             topk_weights,
-            ll_state["ll_handle"],
+            state["ll_handle"],
             use_logfmt=False,
             zero_copy=False,
             async_finish=False,
             return_recv_hook=False,
             out=ll_combined,
         )
-        ll_state["combined"] = combined
+        state["combined"] = combined
         return combined
 
-    def run_fp8_low_latency_baseline():
-        fp8_ll_dispatch()
-        fp8_ll_l1_gemm()
-        fp8_ll_swiglu_quant()
-        fp8_ll_l2_gemm()
-        return fp8_ll_combine()
+    def fp8_ll_dispatch():
+        fp8_ll_dispatch_into(ll_state)
 
-    fused_out = run_fp4_fused()
-    assert fused_out.shape == (num_tokens, hidden)
+    def fp8_ll_l1_gemm():
+        fp8_ll_l1_gemm_with(ll_state, l1_fp8)
+
+    def fp8_ll_swiglu_quant():
+        fp8_ll_swiglu_quant_into(ll_state)
+
+    def fp8_ll_l2_gemm():
+        fp8_ll_l2_gemm_with(ll_state, l2_fp8)
+
+    def fp8_ll_combine():
+        return fp8_ll_combine_from(ll_state)
+
+    def run_low_latency_with_weights(l1_weights, l2_weights, state):
+        fp8_ll_dispatch_into(state)
+        fp8_ll_l1_gemm_with(state, l1_weights)
+        fp8_ll_swiglu_quant_into(state)
+        fp8_ll_l2_gemm_with(state, l2_weights)
+        return fp8_ll_combine_from(state)
+
+    def run_fp8_low_latency_baseline():
+        return run_low_latency_with_weights(l1_fp8, l2_fp8, ll_state)
+
+    predecode_state = {}
+
+    def run_fp4_predecode_low_latency():
+        return run_low_latency_with_weights(
+            predecode_l1_fp8, predecode_l2_fp8, predecode_state)
+
+    fused_out = None
+    if fused_out is None:
+        if run_fp4_predecode_enabled:
+            fused_out = run_fp4_predecode_low_latency()
+        elif run_fp4_runtime_enabled:
+            fused_out = run_fp4_fused()
+    if fused_out is not None:
+        assert fused_out.shape == (num_tokens, hidden)
     if args.bench_check_reference:
+        assert fused_out is not None, "--bench-check-reference requires an FP4 mode"
+        assert l1_fp4 is not None and l2_fp4 is not None
         y_ref = _reference_fused(
             x_fp8, x_sf, topk_idx, topk_weights,
             l1_fp4[0], l1_fp4[1], l2_fp4[0], l2_fp4[1],
@@ -953,10 +1096,23 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
     num_touched_experts = int(torch.unique(local_expert_ids).numel())
 
     if args.profile_breakdown:
-        fp4_sections = [
-            ("fp4_prepare_inputs", fp4_prepare_inputs),
-            ("fp4_fused_kernel", fp4_fused_kernel),
-        ]
+        if run_fp4_predecode_enabled:
+            fp4_sections = [
+                ("fp4_predecode_ll_dispatch", lambda: fp8_ll_dispatch_into(predecode_state)),
+                ("fp4_predecode_ll_l1_gemm",
+                 lambda: fp8_ll_l1_gemm_with(predecode_state, predecode_l1_fp8)),
+                ("fp4_predecode_ll_swiglu_quant",
+                 lambda: fp8_ll_swiglu_quant_into(predecode_state)),
+                ("fp4_predecode_ll_l2_gemm",
+                 lambda: fp8_ll_l2_gemm_with(predecode_state, predecode_l2_fp8)),
+                ("fp4_predecode_ll_combine",
+                 lambda: fp8_ll_combine_from(predecode_state)),
+            ]
+        else:
+            fp4_sections = [
+                ("fp4_prepare_inputs", fp4_prepare_inputs),
+                ("fp4_fused_kernel", fp4_fused_kernel),
+            ]
         dist.barrier()
         fp4_profile, fp4_profile_total = _bench_cuda_event_sections(
             fp4_sections,
@@ -1018,24 +1174,44 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
             print("PROFILE_JSON " + json.dumps(profile_result, sort_keys=True), flush=True)
         dist.barrier()
 
-    t_fused = bench_kineto(
-        run_fp4_fused,
-        SM90_FP4_KERNEL_NAME,
-        num_tests=args.num_bench_tests,
-        barrier=dist.barrier,
-        flush_l2=bool(args.kineto_flush_l2),
-    )
-    kineto_ok = torch.tensor([1 if t_fused > 0 else 0], dtype=torch.int, device="cuda")
-    dist.all_reduce(kineto_ok, op=dist.ReduceOp.MIN)
-    fused_timing_method = "kineto_kernel"
-    if kineto_ok.item() == 0:
-        fused_timing_method = "cuda_events_fallback"
-        t_fused = _bench_cuda_events(
-            run_fp4_fused,
+    def bench_low_latency_pipeline(fn):
+        _, total = _bench_cuda_event_sections(
+            [("pipeline", fn)],
             num_warmup=args.num_warmup,
             num_repeat=args.num_repeat,
             l2_flush_gb=args.l2_flush_gb,
+            barrier=dist.barrier,
         )
+        return total
+
+    if run_fp4_predecode_enabled:
+        fused_timing_method = "cuda_events_predecode_ll_barrier"
+        t_fused = bench_low_latency_pipeline(run_fp4_predecode_low_latency)
+    elif run_fp4_runtime_enabled and args.fp4_runtime_timing == "cuda-events":
+        fused_timing_method = "cuda_events_runtime_barrier"
+        t_fused = bench_low_latency_pipeline(run_fp4_fused)
+    elif run_fp4_runtime_enabled:
+        t_fused = bench_kineto(
+            run_fp4_fused,
+            SM90_FP4_KERNEL_NAME,
+            num_tests=args.num_bench_tests,
+            barrier=dist.barrier,
+            flush_l2=bool(args.kineto_flush_l2),
+        )
+        kineto_ok = torch.tensor([1 if t_fused > 0 else 0], dtype=torch.int, device="cuda")
+        dist.all_reduce(kineto_ok, op=dist.ReduceOp.MIN)
+        fused_timing_method = "kineto_kernel"
+        if kineto_ok.item() == 0:
+            fused_timing_method = "cuda_events_fallback"
+            t_fused = _bench_cuda_events(
+                run_fp4_fused,
+                num_warmup=args.num_warmup,
+                num_repeat=args.num_repeat,
+                l2_flush_gb=args.l2_flush_gb,
+            )
+    else:
+        fused_timing_method = "disabled"
+        t_fused = 0.0
 
     t_ll = float("nan")
     t_normal = float("nan")
@@ -1051,12 +1227,7 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
 
     if run_fp8_ll_baseline_enabled:
         dist.barrier()
-        t_ll = _bench_cuda_events(
-            run_fp8_low_latency_baseline,
-            num_warmup=args.num_warmup,
-            num_repeat=args.num_repeat,
-            l2_flush_gb=args.l2_flush_gb,
-        )
+        t_ll = bench_low_latency_pipeline(run_fp8_low_latency_baseline)
         dist.barrier()
 
     metrics = _all_rank_metrics(
@@ -1069,24 +1240,29 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
         )
     )
     if rank_idx == 0:
-        fused_us_max = float(metrics[:, 0].max().item() * 1e6)
-        fused_us_mean = float(metrics[:, 0].mean().item() * 1e6)
+        fused_us_max = None
+        fused_us_mean = None
+        if run_fp4_timing_enabled:
+            fused_us_max = float(metrics[:, 0].max().item() * 1e6)
+            fused_us_mean = float(metrics[:, 0].mean().item() * 1e6)
         normal_us_max = None
         normal_us_mean = None
         speedup_vs_fp8_normal_max = None
         if run_fp8_normal_baseline_enabled:
             normal_us_max = float(metrics[:, 1].max().item() * 1e6)
             normal_us_mean = float(metrics[:, 1].mean().item() * 1e6)
-            speedup_vs_fp8_normal_max = round(
-                _safe_div(normal_us_max, fused_us_max), 4
-            )
+            if fused_us_max is not None:
+                speedup_vs_fp8_normal_max = round(
+                    _safe_div(normal_us_max, fused_us_max), 4
+                )
         ll_us_max = None
         ll_us_mean = None
         speedup_vs_fp8_ll_max = None
         if run_fp8_ll_baseline_enabled:
             ll_us_max = float(metrics[:, 2].max().item() * 1e6)
             ll_us_mean = float(metrics[:, 2].mean().item() * 1e6)
-            speedup_vs_fp8_ll_max = round(_safe_div(ll_us_max, fused_us_max), 4)
+            if fused_us_max is not None:
+                speedup_vs_fp8_ll_max = round(_safe_div(ll_us_max, fused_us_max), 4)
         result = {
             "batch_per_rank": num_tokens,
             "num_ranks": num_ranks,
@@ -1096,9 +1272,9 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
             "num_topk": num_topk,
             "recv_tokens_total": int(metrics[:, 3].sum().item()),
             "active_experts_max": int(metrics[:, 4].max().item()),
-            "fp4_megamoe_us_max": round(fused_us_max, 3),
-            "fp4_megamoe_us_mean": round(fused_us_mean, 3),
-            "fp4_mode": "runtime",
+            "fp4_megamoe_us_max": None if fused_us_max is None else round(fused_us_max, 3),
+            "fp4_megamoe_us_mean": None if fused_us_mean is None else round(fused_us_mean, 3),
+            "fp4_mode": args.fp4_mode,
             "fp4_timing_method": fused_timing_method,
             "fp8_normal_baseline_enabled": run_fp8_normal_baseline_enabled,
             "fp8_normal_baseline_us_max": (
@@ -1121,7 +1297,8 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
         print("RESULT_JSON " + json.dumps(result, sort_keys=True), flush=True)
 
     dist.barrier()
-    sym_buffer.destroy()
+    if sym_buffer is not None:
+        sym_buffer.destroy()
     if normal_buffer is not None:
         normal_buffer.destroy()
     if ll_buffer is not None:
@@ -1215,6 +1392,8 @@ if __name__ == '__main__':
     parser.add_argument('--fail-fast', action='store_true')
     parser.add_argument('--bench-check-reference', action='store_true',
                         help='With --bench, run the FP32 reference on the same shape before timing')
+    parser.add_argument('--bench-skip-cum-stats', action='store_true',
+                        help='With --bench, pass None for FP4 cumulative expert recv stats')
 
     parser.add_argument('--num-max-tokens-per-rank', type=int, default=1)
     parser.add_argument('--num-tokens', type=int, default=0)
@@ -1227,9 +1406,9 @@ if __name__ == '__main__':
     parser.add_argument('--weight-scale', type=float, default=0.05)
     parser.add_argument(
         '--fp4-mode',
-        choices=('runtime',),
+        choices=('runtime', 'predecode', 'none'),
         default='runtime',
-        help='Benchmark mode; runtime FP4 weights only',
+        help='Benchmark mode: runtime FP4 kernel, FP4-predecoded low-latency lower bound, or FP8-baseline only',
     )
     parser.add_argument('--num-bench-tests', type=int, default=20)
     parser.add_argument('--num-warmup', type=int, default=5)
@@ -1245,6 +1424,12 @@ if __name__ == '__main__':
     parser.add_argument('--profile-repeat', type=int, default=10)
     parser.add_argument('--profile-l2-flush-gb', type=float, default=0.0)
     parser.add_argument('--kineto-flush-l2', type=int, default=0)
+    parser.add_argument(
+        '--fp4-runtime-timing',
+        choices=('kineto', 'cuda-events'),
+        default='kineto',
+        help='Timing backend for --fp4-mode runtime',
+    )
     args = parser.parse_args()
 
     np_ = args.num_processes

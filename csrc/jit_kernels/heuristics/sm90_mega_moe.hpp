@@ -115,8 +115,10 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
     const bool auto_split_mn = expected_tokens_per_expert >= 64.0f;
+    const bool ultra_small_split_n =
+        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f;
     int block_m = auto_split_mn ? 128 : 64;
-    int num_epilogue_warpgroups = auto_split_mn ? 2 : block_m / 64;
+    int num_epilogue_warpgroups = (auto_split_mn or ultra_small_split_n) ? 2 : block_m / 64;
     DG_HOST_ASSERT(block_m >= 64 and block_m % 64 == 0);
     DG_HOST_ASSERT(num_epilogue_warpgroups >= 1 and
                    ((block_m / num_epilogue_warpgroups == 64) or
@@ -151,12 +153,30 @@ static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
     if (fp4_small_block_n and
         intermediate_hidden <= 2048 and
         expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f and
+        num_experts_per_rank % 32 == 0) {
+        return 32;
+    }
+    if (fp4_small_block_n and
+        intermediate_hidden <= 2048 and
+        expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f and
         num_experts_per_rank % 8 == 0) {
         return 8;
     }
     if (fp4_small_block_n and
         intermediate_hidden <= 2048 and
-        expected_tokens_per_expert >= 12.0f and expected_tokens_per_expert < 32.0f and
+        expected_tokens_per_expert >= 24.0f and expected_tokens_per_expert < 32.0f and
+        num_experts_per_rank % 16 == 0) {
+        return 16;
+    }
+    if (fp4_small_block_n and
+        intermediate_hidden <= 2048 and
+        expected_tokens_per_expert >= 12.0f and expected_tokens_per_expert < 24.0f and
+        num_experts_per_rank % 32 == 0) {
+        return 32;
+    }
+    if (fp4_small_block_n and
+        intermediate_hidden <= 2048 and
+        expected_tokens_per_expert >= 12.0f and expected_tokens_per_expert < 24.0f and
         num_experts_per_rank % 8 == 0) {
         return 8;
     }
@@ -211,8 +231,20 @@ static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
     if (fp4_small_block_n and
         intermediate_hidden >= 3072 and
         expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f and
+        num_experts_per_rank % 16 == 0) {
+        return 16;
+    }
+    if (fp4_small_block_n and
+        intermediate_hidden >= 3072 and
+        expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f and
         num_experts_per_rank % 8 == 0) {
         return 8;
+    }
+    if (fp4_small_block_n and
+        intermediate_hidden >= 3072 and
+        expected_tokens_per_expert >= 12.0f and expected_tokens_per_expert < 24.0f and
+        num_experts_per_rank % 24 == 0) {
+        return 24;
     }
     if (fp4_small_block_n and
         intermediate_hidden >= 3072 and
@@ -241,7 +273,9 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int& num_dispatch_warps, const int& num_epilogue_warps,
     const bool& use_early_b_decode = false,
     const bool& use_decode_done_mbarrier = false,
-    const int& default_num_stages_cap = 0) {
+    const int& default_num_stages_cap = 0,
+    const bool& use_swap_ab = false,
+    const bool& use_swap_ab_fast_amax = false) {
     constexpr int kSmemAlignment = 1024;
 
     const int smem_expert_count_size = align(
@@ -254,13 +288,20 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const auto num_epilogue_warpgroups = num_epilogue_warps / 4;
     const int smem_cd_l1 = block_m * (block_n / 2);
     const int smem_cd_l2 = block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
-    const int smem_cd = align(std::max(smem_cd_l1, smem_cd_l2), kSmemAlignment);
+    const int smem_cd_swap_l1 = use_swap_ab
+        ? block_m * (block_n / 2) *
+              (use_swap_ab_fast_amax
+                   ? static_cast<int>(sizeof(uint8_t))
+                   : static_cast<int>(sizeof(float)) + static_cast<int>(sizeof(uint8_t)))
+        : 0;
+    const int smem_cd_base = std::max(smem_cd_l1, smem_cd_l2);
+    const int smem_cd = align(std::max(smem_cd_base, smem_cd_swap_l1), kSmemAlignment);
 
     const bool fp4_split_n_eligible =
         block_m == 64 and num_epilogue_warpgroups > 1 and
         block_n % num_epilogue_warpgroups == 0 and
         (block_n / num_epilogue_warpgroups) >= 64;
-    const int kL2ActsSFGranK = 64;
+    const int kL2ActsSFGranK = block_n == 64 ? 32 : 64;
     const int wg_l1_out_block_n = fp4_split_n_eligible
         ? (block_n / num_epilogue_warpgroups) / 2
         : 0;
@@ -310,17 +351,25 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const int& hidden, const int& intermediate_hidden,
     const int& num_padded_sf_pool_tokens,
     const bool& use_early_b_decode = false,
-    const bool& use_decode_done_mbarrier = false) {
+    const bool& use_decode_done_mbarrier = false,
+    const bool& use_swap_ab = false,
+    const bool& use_swap_ab_fast_amax = false) {
     const auto [block_m, num_epilogue_threads] = get_block_config_for_mega_moe_sm90_fp4(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens);
     const int block_k = 128;
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-    const int block_n = 128;
-
+    int block_n = 128;
+    if (const auto env_block_n = get_env<int>("DG_SM90_FP4_BLOCK_N", 0);
+        env_block_n > 0) {
+        DG_HOST_ASSERT(env_block_n == 64 or env_block_n == 128 or env_block_n == 256);
+        DG_HOST_ASSERT((2 * intermediate_hidden) % env_block_n == 0);
+        DG_HOST_ASSERT(hidden % env_block_n == 0);
+        block_n = env_block_n;
+    }
     int fp4_num_epilogue_warpgroups = num_epilogue_threads / 128;
     const bool fp4_split_n_eligible =
-        block_m == 64 and block_n == 128;
+        block_m == 64 and block_n % 128 == 0;
     const bool fp4_split_n_band =
         expected_tokens_per_expert >= 32.0f and expected_tokens_per_expert < 64.0f;
     const bool fp4_pro_split_n_band =
@@ -328,7 +377,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 64.0f;
     const bool fp4_flash_split_n_band =
         intermediate_hidden <= 2048 and
-        expected_tokens_per_expert >= 0.75f and expected_tokens_per_expert < 64.0f;
+        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 64.0f;
     const bool fp4_small_split_n_band =
         fp4_flash_split_n_band or fp4_pro_split_n_band;
     const bool default_fp4_split_n =
@@ -350,7 +399,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const int swizzle_weights_mode = 0;
 
     const int num_sms = device_runtime->get_num_sms();
-    const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90_fp4(
+    int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90_fp4(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms);
 
@@ -370,7 +419,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const bool fp4_flash_split_n_decode_threads =
         fp4_small_block_n and
         intermediate_hidden <= 2048 and
-        expected_tokens_per_expert >= 0.75f and expected_tokens_per_expert < 64.0f;
+        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 64.0f;
     const bool fp4_2wg_decode_offload_band =
         block_m == 128 and block_n == 128 and
         fp4_num_epilogue_threads == 256 and expected_tokens_per_expert >= 64.0f;
@@ -378,13 +427,15 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         (fp4_decode_heavy_small_batch or fp4_flash_split_n_decode_threads or
          fp4_pro_large_decode_assist_batch or
          fp4_2wg_decode_offload_band) ? 64 : 128;
-    const int num_dispatch_threads = default_num_dispatch_threads;
+    const int num_dispatch_threads = get_env<int>(
+        "DG_SM90_FP4_NUM_DISPATCH_THREADS", default_num_dispatch_threads);
     DG_HOST_ASSERT(num_dispatch_threads == 64 or num_dispatch_threads == 128);
     const int default_num_non_epilogue_threads =
         (fp4_pro_split_n_decode_threads or fp4_flash_split_n_decode_threads) ? 320 :
         ((fp4_decode_heavy_small_batch or fp4_pro_large_decode_assist_batch or
           fp4_2wg_decode_offload_band) ? 192 : 128);
-    const int num_non_epilogue_threads = default_num_non_epilogue_threads;
+    const int num_non_epilogue_threads = get_env<int>(
+        "DG_SM90_FP4_NUM_NON_EPILOGUE_THREADS", default_num_non_epilogue_threads);
     DG_HOST_ASSERT(num_non_epilogue_threads >= 128 and
                    num_non_epilogue_threads % 64 == 0);
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);
@@ -393,6 +444,10 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         fp4_small_block_n and
         intermediate_hidden <= 2048 and
         expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f;
+    const bool fp4_flash_lookahead_stage4 =
+        fp4_small_block_n and
+        intermediate_hidden <= 2048 and
+        expected_tokens_per_expert > 3.0f and expected_tokens_per_expert < 6.0f;
     const bool fp4_pro_ultra_small_stage4 =
         fp4_small_block_n and
         intermediate_hidden >= 3072 and
@@ -405,6 +460,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         fp4_small_block_n and
         intermediate_hidden >= 3072 and
         expected_tokens_per_expert >= 1.0f and expected_tokens_per_expert < 1.5f;
+    const bool fp4_pro_single_token_stage5 =
+        fp4_pro_single_token_stage4;
     const bool fp4_pro_two_token_stage4 =
         fp4_small_block_n and
         intermediate_hidden >= 3072 and
@@ -413,25 +470,26 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         fp4_small_block_n and
         ((expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f) or
          (intermediate_hidden <= 2048 and
-          expected_tokens_per_expert >= 3.0f and expected_tokens_per_expert < 6.0f) or
+          expected_tokens_per_expert > 3.0f and expected_tokens_per_expert < 6.0f) or
          (expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f and
           !fp4_pro_two_token_stage4));
     const bool fp4_stage5_decode_heavy_batch =
         fp4_small_block_n and
         expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert <= 24.0f;
     const int default_num_stages_cap =
-        (fp4_stage4_decode_band or fp4_pro_ultra_small_stage4 or
-         fp4_pro_half_token_stage4 or fp4_pro_single_token_stage4 or
+        (fp4_stage4_decode_band or fp4_flash_lookahead_stage4 or
+         fp4_pro_ultra_small_stage4 or fp4_pro_half_token_stage4 or
          fp4_pro_two_token_stage4) ? 4 :
-        (fp4_pro_large_decode_assist_batch ? 5 :
-         (fp4_stage6_decode_band ? 6 : (fp4_stage5_decode_heavy_batch ? 5 : 0)));
+        (fp4_pro_single_token_stage5 or fp4_pro_large_decode_assist_batch) ? 5 :
+        (fp4_stage6_decode_band ? 6 : (fp4_stage5_decode_heavy_batch ? 5 : 0));
 
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90_fp4(
         SM90ArchSpec::smem_capacity,
         num_experts, hidden,
         block_m, block_n, block_k,
         num_dispatch_threads / 32, fp4_num_epilogue_threads / 32,
-        use_early_b_decode, use_decode_done_mbarrier, default_num_stages_cap);
+        use_early_b_decode, use_decode_done_mbarrier, default_num_stages_cap,
+        use_swap_ab, use_swap_ab_fast_amax);
 
     const auto config = MegaMoESM90Config {
         block_m, block_n, block_k,
@@ -445,9 +503,10 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
 
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
         const auto key = fmt::format(
-            "MegaMoESM90FP4Config(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={}, early_b_decode={}, decode_done_mbarrier={})",
+            "MegaMoESM90FP4Config(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={}, early_b_decode={}, decode_done_mbarrier={}, swap_ab={}, swap_ab_fast_amax={})",
             num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk,
-            use_early_b_decode, use_decode_done_mbarrier);
+            use_early_b_decode, use_decode_done_mbarrier,
+            use_swap_ab, use_swap_ab_fast_amax);
         static std::unordered_set<std::string> printed;
         if (printed.count(key) == 0) {
             std::cout << key << ": " << config << std::endl;

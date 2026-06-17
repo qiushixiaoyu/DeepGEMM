@@ -76,6 +76,9 @@ public:
         // shapes enable this to reduce accumulator pressure while keeping SS
         // scheduling.
         bool use_ss_nsplit;
+        // swapAB path: use decoded weight as WGMMA-M and tokens as WGMMA-N.
+        bool use_swap_ab;
+        bool use_swap_ab_fast_amax;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -127,6 +130,8 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
+        {},
         {}
     >);
 }};
@@ -150,7 +155,9 @@ static void __instantiate_kernel() {{
     args.use_early_b_decode ? "true" : "false",
     args.use_decode_done_mbarrier ? "true" : "false",
     args.use_l2_arrival_counter ? "true" : "false",
-    args.use_ss_nsplit ? "true" : "false");
+    args.use_ss_nsplit ? "true" : "false",
+    args.use_swap_ab ? "true" : "false",
+    args.use_swap_ab_fast_amax ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -193,7 +200,9 @@ static void sm90_fp8_fp4_mega_moe(
     const bool& use_early_b_decode = false,
     const bool& use_decode_done_mbarrier = false,
     const bool& use_l2_arrival_counter = false,
-    const bool& use_ss_nsplit = false
+    const bool& use_ss_nsplit = false,
+    const bool& use_swap_ab = false,
+    const bool& use_swap_ab_fast_amax = false
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -212,7 +221,8 @@ static void sm90_fp8_fp4_mega_moe(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden, num_padded_sf_pool_tokens,
-        use_early_b_decode, use_decode_done_mbarrier);
+        use_early_b_decode, use_decode_done_mbarrier,
+        use_swap_ab, use_swap_ab_fast_amax);
 
     // Tensormap construction
     constexpr int kGranK         = 128;  // L1 acts SF granularity (per-128 K)
@@ -264,8 +274,8 @@ static void sm90_fp8_fp4_mega_moe(
     const int wg_block_n = config.block_n / wg_split_n;
     const int wg_l1_out_block_n = wg_block_n / 2;
     const int l1_output_box_m = wg_block_m;
-    // Split-N with 32 post-SwiGLU cols per WG still uses one combined 64-col TMA
-    // store from wg0; the 32-col per-WG store shape is not used on this path.
+    // Split-N with 32 post-SwiGLU cols per WG uses one combined 64-col TMA
+    // store from WG0, matching the 64-col L2 activation-scale group.
     const bool split_n_combines_l1_store = split_n_warpgroups and wg_l1_out_block_n < 64;
     const int tma_l1_out_box_n = split_n_combines_l1_store ? (config.block_n / 2) : wg_l1_out_block_n;
     const int tma_l1_out_box_m = split_n_combines_l1_store ? config.block_m : l1_output_box_m;
@@ -312,6 +322,8 @@ static void sm90_fp8_fp4_mega_moe(
         .use_decode_done_mbarrier = use_decode_done_mbarrier,
         .use_l2_arrival_counter = use_l2_arrival_counter,
         .use_ss_nsplit = use_ss_nsplit,
+        .use_swap_ab = use_swap_ab,
+        .use_swap_ab_fast_amax = use_swap_ab_fast_amax,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
