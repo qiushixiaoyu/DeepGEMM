@@ -498,6 +498,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kSwapABL2Active = kSwapABEligible;
     constexpr bool kSwapABFastAmaxActive =
         kSwapABL1Active and kFP4SwapABFastAmax;
+    // Flash b4 is assigned a distinct epw16 kernel. Keep one intermediate
+    // swap bucket there so this band avoids unnecessary padding without
+    // making the ultra-small epw32 kernel heavier.
+    constexpr bool kSwapABFlashN24Dispatch =
+        kSwapABEligible and kIntermediateHidden <= 2048 and kNumExpertsPerWave == 16;
     constexpr uint32_t kSwapABTokenChunks = BLOCK_M / 8;
     DG_STATIC_ASSERT(not kSwapABEligible or (BLOCK_M % 8 == 0),
                      "swapAB epilogue token chunks assume BLOCK_M is a multiple of 8");
@@ -1484,9 +1489,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 ptx::warpgroup_fence_operand(swap_accum[i]);
                             ptx::warpgroup_wait<0>();
 
-                            if (lane_idx == 0)
-                                empty_barriers[stage_idx]->arrive();
-
                             #pragma unroll
                             for (uint32_t i = 0; i < kSwapAccum / 4; ++ i) {
                                 const uint32_t token_0 = i * 8 + col_idx * 2;
@@ -1503,20 +1505,37 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                         final_accum[i * 4 + 3] += scale_1 * swap_accum[i * 4 + 3];
                                     }
                                 } else {
-                                    const float scale_0 = token_0 < valid_m ?
-                                        ptx::ld_shared(smem_sfa[stage_idx] + token_0) : 0.0f;
-                                    const float scale_1 = token_1 < valid_m ?
-                                        ptx::ld_shared(smem_sfa[stage_idx] + token_1) : 0.0f;
-                                    final_accum[i * 4 + 0] += scale_0 * swap_accum[i * 4 + 0];
-                                    final_accum[i * 4 + 2] += scale_0 * swap_accum[i * 4 + 2];
-                                    final_accum[i * 4 + 1] += scale_1 * swap_accum[i * 4 + 1];
-                                    final_accum[i * 4 + 3] += scale_1 * swap_accum[i * 4 + 3];
+                                    if (token_0 < valid_m) {
+                                        const float scale_0 = ptx::ld_shared(smem_sfa[stage_idx] + token_0);
+                                        final_accum[i * 4 + 0] += scale_0 * swap_accum[i * 4 + 0];
+                                        final_accum[i * 4 + 2] += scale_0 * swap_accum[i * 4 + 2];
+                                    }
+                                    if (token_1 < valid_m) {
+                                        const float scale_1 = ptx::ld_shared(smem_sfa[stage_idx] + token_1);
+                                        final_accum[i * 4 + 1] += scale_1 * swap_accum[i * 4 + 1];
+                                        final_accum[i * 4 + 3] += scale_1 * swap_accum[i * 4 + 3];
+                                    }
                                 }
                             }
+
+                            if (lane_idx == 0)
+                                empty_barriers[stage_idx]->arrive();
                         };
 
                         const uint32_t n_swap = ((valid_m + 7u) / 8u) * 8u;
-                        if constexpr (kIntermediateHidden <= 2048) {
+                        if constexpr (kSwapABFlashN24Dispatch) {
+                            if (n_swap <= 8) {
+                                run_swap_ab_l1.template operator()<8>();
+                            } else if (n_swap <= 16) {
+                                run_swap_ab_l1.template operator()<16>();
+                            } else if (n_swap <= 24) {
+                                run_swap_ab_l1.template operator()<24>();
+                            } else if (n_swap <= 32) {
+                                run_swap_ab_l1.template operator()<32>();
+                            } else {
+                                run_swap_ab_l1.template operator()<64>();
+                            }
+                        } else {
                             if (n_swap <= 8) {
                                 run_swap_ab_l1.template operator()<8>();
                             } else if (n_swap <= 16) {
@@ -1525,17 +1544,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 run_swap_ab_l1.template operator()<32>();
                             } else {
                                 run_swap_ab_l1.template operator()<64>();
-                            }
-                        } else {
-                            switch (n_swap) {
-                                case 8:  run_swap_ab_l1.template operator()<8>();  break;
-                                case 16: run_swap_ab_l1.template operator()<16>(); break;
-                                case 24: run_swap_ab_l1.template operator()<24>(); break;
-                                case 32: run_swap_ab_l1.template operator()<32>(); break;
-                                case 40: run_swap_ab_l1.template operator()<40>(); break;
-                                case 48: run_swap_ab_l1.template operator()<48>(); break;
-                                case 56: run_swap_ab_l1.template operator()<56>(); break;
-                                default: run_swap_ab_l1.template operator()<64>(); break;
                             }
                         }
                     } else {
@@ -1633,16 +1641,18 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                             final_accum[i * 4 + 3] += scale_1 * swap_accum[i * 4 + 3];
                                         }
                                     } else {
-                                        const float scale_0 = token_0 < valid_m ?
-                                            ptx::ld_shared(
-                                                smem_sfa[stage_idx] + sf_group * BLOCK_M + token_0) : 0.0f;
-                                        const float scale_1 = token_1 < valid_m ?
-                                            ptx::ld_shared(
-                                                smem_sfa[stage_idx] + sf_group * BLOCK_M + token_1) : 0.0f;
-                                        final_accum[i * 4 + 0] += scale_0 * swap_accum[i * 4 + 0];
-                                        final_accum[i * 4 + 2] += scale_0 * swap_accum[i * 4 + 2];
-                                        final_accum[i * 4 + 1] += scale_1 * swap_accum[i * 4 + 1];
-                                        final_accum[i * 4 + 3] += scale_1 * swap_accum[i * 4 + 3];
+                                        if (token_0 < valid_m) {
+                                            const float scale_0 = ptx::ld_shared(
+                                                smem_sfa[stage_idx] + sf_group * BLOCK_M + token_0);
+                                            final_accum[i * 4 + 0] += scale_0 * swap_accum[i * 4 + 0];
+                                            final_accum[i * 4 + 2] += scale_0 * swap_accum[i * 4 + 2];
+                                        }
+                                        if (token_1 < valid_m) {
+                                            const float scale_1 = ptx::ld_shared(
+                                                smem_sfa[stage_idx] + sf_group * BLOCK_M + token_1);
+                                            final_accum[i * 4 + 1] += scale_1 * swap_accum[i * 4 + 1];
+                                            final_accum[i * 4 + 3] += scale_1 * swap_accum[i * 4 + 3];
+                                        }
                                     }
                                 }
                             };
@@ -1691,7 +1701,19 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         };
 
                         const uint32_t n_swap = ((valid_m + 7u) / 8u) * 8u;
-                        if constexpr (kIntermediateHidden <= 2048) {
+                        if constexpr (kSwapABFlashN24Dispatch) {
+                            if (n_swap <= 8) {
+                                run_swap_ab_l2.template operator()<8>();
+                            } else if (n_swap <= 16) {
+                                run_swap_ab_l2.template operator()<16>();
+                            } else if (n_swap <= 24) {
+                                run_swap_ab_l2.template operator()<24>();
+                            } else if (n_swap <= 32) {
+                                run_swap_ab_l2.template operator()<32>();
+                            } else {
+                                run_swap_ab_l2.template operator()<64>();
+                            }
+                        } else {
                             if (n_swap <= 8) {
                                 run_swap_ab_l2.template operator()<8>();
                             } else if (n_swap <= 16) {
@@ -1700,17 +1722,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 run_swap_ab_l2.template operator()<32>();
                             } else {
                                 run_swap_ab_l2.template operator()<64>();
-                            }
-                        } else {
-                            switch (n_swap) {
-                                case 8:  run_swap_ab_l2.template operator()<8>();  break;
-                                case 16: run_swap_ab_l2.template operator()<16>(); break;
-                                case 24: run_swap_ab_l2.template operator()<24>(); break;
-                                case 32: run_swap_ab_l2.template operator()<32>(); break;
-                                case 40: run_swap_ab_l2.template operator()<40>(); break;
-                                case 48: run_swap_ab_l2.template operator()<48>(); break;
-                                case 56: run_swap_ab_l2.template operator()<56>(); break;
-                                default: run_swap_ab_l2.template operator()<64>(); break;
                             }
                         }
                     } else if constexpr (kL2ActsSFGranK == 32) {

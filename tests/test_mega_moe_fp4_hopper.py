@@ -44,6 +44,8 @@ def legacy_wave(
     small_block_n = block_m == 64 and block_n == 128
     e = expected_tokens_per_expert
     n = num_experts_per_rank
+    if small_block_n and intermediate_hidden <= 2048 and 0.75 <= e < 1.0 and n % 16 == 0:
+        return 16
     if small_block_n and intermediate_hidden <= 2048 and 1.5 <= e < 2.0 and n % 16 == 0:
         return 16
     if small_block_n and intermediate_hidden <= 2048 and 3.0 <= e < 6.0 and n % 16 == 0:
@@ -90,6 +92,7 @@ def legacy_wave(
 
 
 FLASH_RULES = (
+    (0.75, 1.0, True, 16, 16),
     (1.5, 2.0, True, 16, 16),
     (3.0, 6.0, True, 16, 16),
     (6.0, 12.0, True, 32, 32),
@@ -267,26 +270,29 @@ def legacy_stage_cap(
     e = expected_tokens_per_expert
     stage4_decode_band = small_block_n and intermediate_hidden <= 2048 and 6.0 <= e < 12.0
     flash_lookahead_stage4 = small_block_n and intermediate_hidden <= 2048 and 3.0 < e < 6.0
-    pro_ultra_small_stage4 = small_block_n and intermediate_hidden >= 3072 and 0.0 < e < 0.25
-    pro_half_token_stage4 = small_block_n and intermediate_hidden >= 3072 and 0.375 <= e < 0.75
+    pro_ultra_small_stage5 = small_block_n and intermediate_hidden >= 3072 and 0.0 < e < 0.25
+    pro_half_token_stage5 = small_block_n and intermediate_hidden >= 3072 and 0.375 <= e < 0.75
     pro_single_token_stage5 = small_block_n and intermediate_hidden >= 3072 and 1.0 <= e < 1.5
-    pro_two_token_stage4 = small_block_n and intermediate_hidden >= 3072 and 1.5 <= e < 3.0
+    pro_two_token_stage5 = small_block_n and intermediate_hidden >= 3072 and 1.5 <= e < 3.0
     pro_large_batch_stage5 = small_block_n and intermediate_hidden >= 3072 and 24.0 <= e < 64.0
     stage6_decode_band = small_block_n and (
         (0.375 <= e < 0.75)
         or (intermediate_hidden <= 2048 and 3.0 < e < 6.0)
-        or (1.5 <= e < 3.0 and not pro_two_token_stage4)
+        or (1.5 <= e < 3.0 and not pro_two_token_stage5)
     )
     stage5_decode_heavy_batch = small_block_n and 1.5 <= e <= 24.0
     if (
         stage4_decode_band
         or flash_lookahead_stage4
-        or pro_ultra_small_stage4
-        or pro_half_token_stage4
-        or pro_two_token_stage4
     ):
         return 4
-    if pro_single_token_stage5 or pro_large_batch_stage5:
+    if (
+        pro_ultra_small_stage5
+        or pro_half_token_stage5
+        or pro_single_token_stage5
+        or pro_two_token_stage5
+        or pro_large_batch_stage5
+    ):
         return 5
     if stage6_decode_band:
         return 6
@@ -303,9 +309,9 @@ STAGE_SHAPE_NOT_PRO = "not_pro"
 STAGE_RULES = (
     (6.0, 12.0, True, False, STAGE_SHAPE_FLASH, 4),
     (3.0, 6.0, False, False, STAGE_SHAPE_FLASH, 4),
-    (0.0, 0.25, False, False, STAGE_SHAPE_PRO, 4),
-    (0.375, 0.75, True, False, STAGE_SHAPE_PRO, 4),
-    (1.5, 3.0, True, False, STAGE_SHAPE_PRO, 4),
+    (0.0, 0.25, False, False, STAGE_SHAPE_PRO, 5),
+    (0.375, 0.75, True, False, STAGE_SHAPE_PRO, 5),
+    (1.5, 3.0, True, False, STAGE_SHAPE_PRO, 5),
     (1.0, 1.5, True, False, STAGE_SHAPE_PRO, 5),
     (24.0, 64.0, True, False, STAGE_SHAPE_PRO, 5),
     (0.375, 0.75, True, False, STAGE_SHAPE_ANY, 6),
@@ -965,6 +971,7 @@ def _reference_fused(
     num_experts: int, num_topk: int,
     hidden: int, intermediate_hidden: int,
     activation_clamp: float,
+    reference_chunk: int = 0,
 ) -> torch.Tensor:
     """FP32 reference for the SM90 FP4 mega-MoE kernel.
 
@@ -1004,7 +1011,7 @@ def _reference_fused(
     x_fp32 = _dequant_per_token_per_128_k(x_fp8_g, x_sf_g)  # (Mg, H)
 
     # Token-chunked dequant to bound peak memory of the per-token gather.
-    _CHUNK = int(os.getenv('DSV4_FP4_REFERENCE_CHUNK', '64'))
+    _CHUNK = int(reference_chunk) if reference_chunk else int(os.getenv('DSV4_FP4_REFERENCE_CHUNK', '64'))
     for k in range(num_topk):
         mask = topk_idx_g[:, k] >= 0
         if not mask.any():
@@ -1071,6 +1078,12 @@ def _run_scenario(
     masked_ratio = cfg.get('masked_ratio', 0.0)
     activation_clamp = cfg.get('activation_clamp', 10.0)
     fast_math = cfg.get('fast_math', True)
+    input_pattern = cfg.get('input_pattern', 'random')
+    routing_pattern = cfg.get('routing_pattern', 'random')
+    num_launch_repeats = int(cfg.get('num_launch_repeats', 1))
+    reference_chunk = cfg.get('reference_chunk')
+    scenario_diff_tol = cfg.get('diff_tol', diff_tol)
+    assert num_launch_repeats >= 1
 
     assert num_experts % num_ranks == 0
     num_experts_per_rank = num_experts // num_ranks
@@ -1088,8 +1101,29 @@ def _run_scenario(
 
     # ---- Inputs (bf16) ------------------------------------------------------
     x_bf = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+    if input_pattern == 'sfa_poison':
+        num_k_groups = hidden // 128
+        group_scales = torch.tensor(
+            [0.25, 1.0, 4.0, 16.0], dtype=torch.float, device='cuda')
+        group_scales = group_scales[
+            torch.arange(num_k_groups, device='cuda') % group_scales.numel()
+        ].to(torch.bfloat16)
+        x_bf = (
+            x_bf.view(num_tokens, num_k_groups, 128)
+            * group_scales.view(1, num_k_groups, 1)
+        ).reshape(num_tokens, hidden)
+    elif input_pattern != 'random':
+        raise AssertionError(f'unknown input_pattern={input_pattern}')
+
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
     topk_w, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
+    if routing_pattern == 'round_robin':
+        token_idx = torch.arange(num_tokens, device='cuda').unsqueeze(1)
+        topk_offset = torch.arange(num_topk, device='cuda').unsqueeze(0)
+        global_token_idx = rank_idx * num_tokens + token_idx
+        topk_idx = ((global_token_idx * num_topk + topk_offset) % num_experts).to(torch.long)
+    elif routing_pattern != 'random':
+        raise AssertionError(f'unknown routing_pattern={routing_pattern}')
     if masked_ratio > 0:
         rand_mask = torch.rand_like(topk_idx, dtype=torch.float)
         topk_idx.masked_fill_(rand_mask < masked_ratio, -1)
@@ -1134,22 +1168,25 @@ def _run_scenario(
     )
     cum_stats = torch.zeros(num_experts_per_rank, dtype=torch.int, device='cuda')
 
-    # ---- Run fused ----------------------------------------------------------
-    buffer.x[:num_tokens].copy_(x_fp8)
-    buffer.x_sf[:num_tokens].copy_(x_sf)
-    buffer.topk_idx[:num_tokens].copy_(topk_idx)
-    buffer.topk_weights[:num_tokens].copy_(topk_w)
-
     y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-    deep_gemm.fp8_fp4_mega_moe(
-        y_fused, transformed_l1, transformed_l2, buffer,
-        cumulative_local_expert_recv_stats=cum_stats,
-        recipe=(1, 1, 32),
-        activation='swiglu',
-        activation_clamp=activation_clamp if math.isfinite(activation_clamp) else None,
-        fast_math=fast_math,
-    )
-    torch.cuda.synchronize()
+
+    def run_fused_once():
+        buffer.x[:num_tokens].copy_(x_fp8)
+        buffer.x_sf[:num_tokens].copy_(x_sf)
+        buffer.topk_idx[:num_tokens].copy_(topk_idx)
+        buffer.topk_weights[:num_tokens].copy_(topk_w)
+        cum_stats.zero_()
+        y_fused.zero_()
+        deep_gemm.fp8_fp4_mega_moe(
+            y_fused, transformed_l1, transformed_l2, buffer,
+            cumulative_local_expert_recv_stats=cum_stats,
+            recipe=(1, 1, 32),
+            activation='swiglu',
+            activation_clamp=activation_clamp if math.isfinite(activation_clamp) else None,
+            fast_math=fast_math,
+        )
+        torch.cuda.synchronize()
+        return y_fused
 
     # ---- Reference & check --------------------------------------------------
     y_ref = _reference_fused(
@@ -1159,12 +1196,19 @@ def _run_scenario(
         num_experts, num_topk,
         hidden, intermediate_hidden,
         activation_clamp,
+        reference_chunk=reference_chunk,
     )
 
-    diff = calc_diff(y_fused, y_ref)
-    ok = diff < diff_tol
-    dist_print(f'  [{name:<32}] diff={diff:.4f} '
-               f'(tol={diff_tol:.2f}) {"OK" if ok else "FAIL"}',
+    max_diff = 0.0
+    ok = True
+    for repeat_idx in range(num_launch_repeats):
+        y_fused = run_fused_once()
+        diff = calc_diff(y_fused, y_ref)
+        max_diff = max(max_diff, float(diff))
+        ok = ok and diff < scenario_diff_tol
+    repeat_suffix = '' if num_launch_repeats == 1 else f' x{num_launch_repeats}'
+    dist_print(f'  [{name:<32}] diff={max_diff:.4f}{repeat_suffix} '
+               f'(tol={scenario_diff_tol:.2f}) {"OK" if ok else "FAIL"}',
                once_in_node=True)
     if not ok:
         for label, tensor in (('fused', y_fused), ('ref', y_ref)):
@@ -1176,7 +1220,7 @@ def _run_scenario(
                 f'finite={torch.isfinite(tensor_f).all().item()}',
                 once_in_node=True,
             )
-    assert ok, f'{name}: diff={diff} >= tol={diff_tol}'
+    assert ok, f'{name}: diff={max_diff} >= tol={scenario_diff_tol}'
 
     buffer.destroy()
     dist.barrier()
@@ -1299,6 +1343,40 @@ def _layer8_pro_smoke(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
             hidden=7168, intermediate_hidden=3072,
             num_experts=384, num_topk=6,
             activation_clamp=10.0,
+        )),
+    ]
+
+
+def _layer9_swapab_small_batch(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
+    assert num_ranks == 8, 'swapAB small-batch test expects 8 ranks'
+    common = dict(
+        num_max_tokens_per_rank=128,
+        num_topk=6,
+        activation_clamp=10.0,
+        routing_pattern='round_robin',
+        diff_tol=0.05,
+    )
+    flash = dict(common, hidden=4096, intermediate_hidden=2048, num_experts=256)
+    pro = dict(common, hidden=7168, intermediate_hidden=3072, num_experts=384,
+               reference_chunk=16)
+    pro_fast_amax = dict(common, hidden=1024, intermediate_hidden=3072,
+                         num_experts=384, reference_chunk=16)
+
+    return [
+        ('L9.flash_swapab_b1_sfa_poison', dict(
+            flash, num_tokens=1, input_pattern='sfa_poison',
+            num_launch_repeats=5,
+        )),
+        ('L9.flash_swapab_b8', dict(flash, num_tokens=8)),
+        ('L9.flash_swapab_b32', dict(flash, num_tokens=32)),
+        ('L9.pro_swapab_b1_sfa_poison', dict(
+            pro, num_tokens=1, input_pattern='sfa_poison',
+            num_launch_repeats=5,
+        )),
+        ('L9.pro_swapab_b4', dict(pro, num_tokens=4)),
+        ('L9.pro_swapab_b16', dict(pro, num_tokens=16)),
+        ('L9.pro_swapab_b128_fast_amax', dict(
+            pro_fast_amax, num_tokens=128, num_launch_repeats=2,
         )),
     ]
 
@@ -2001,6 +2079,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         layers += _layer7_dsv4_2wg(num_ranks)
     if 8 in args.layers or args.pro_smoke:
         layers += _layer8_pro_smoke(num_ranks)
+    if 9 in args.layers or args.swapab_smoke:
+        layers += _layer9_swapab_small_batch(num_ranks)
 
     if args.filter:
         layers = [(n, c) for n, c in layers if args.filter in n]
@@ -2043,10 +2123,13 @@ if __name__ == '__main__':
     parser.add_argument('--num-processes', type=int, default=8)
     parser.add_argument('--local-rank-idx', type=int, default=None)
     parser.add_argument('--layers', type=int, nargs='+', default=[1, 3, 4],
-                        help='Correctness layers to run (1, 3, 4, 5, 6, 7, 8). '
-                             'Default: 1 3 4. Layer 8 is the Pro smoke shape.')
+                        help='Correctness layers to run (1, 3, 4, 5, 6, 7, 8, 9). '
+                             'Default: 1 3 4. Layer 8 is the Pro smoke shape; '
+                             'layer 9 is the Flash/Pro swapAB small-batch guard.')
     parser.add_argument('--pro-smoke', action='store_true',
                         help='Also run DeepSeek-V4-Pro smoke scenarios')
+    parser.add_argument('--swapab-smoke', action='store_true',
+                        help='Also run Flash/Pro small-batch swapAB correctness guards')
     parser.add_argument('--filter', type=str, default='')
     parser.add_argument('--diff-tol', type=float, default=0.10,
                         help='calc_diff tolerance (default 0.10; FP4 weights '

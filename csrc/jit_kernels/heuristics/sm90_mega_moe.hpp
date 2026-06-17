@@ -211,9 +211,9 @@ static int get_default_num_stages_cap_for_mega_moe_sm90_fp4(
     static constexpr FP4SM90StageCapRule stage_cap_rules[] = {
         {6.0f, 12.0f, true, false, FP4SM90StageShape::Flash, 4},
         {3.0f, 6.0f, false, false, FP4SM90StageShape::Flash, 4},
-        {0.0f, 0.25f, false, false, FP4SM90StageShape::Pro, 4},
-        {0.375f, 0.75f, true, false, FP4SM90StageShape::Pro, 4},
-        {1.5f, 3.0f, true, false, FP4SM90StageShape::Pro, 4},
+        {0.0f, 0.25f, false, false, FP4SM90StageShape::Pro, 5},
+        {0.375f, 0.75f, true, false, FP4SM90StageShape::Pro, 5},
+        {1.5f, 3.0f, true, false, FP4SM90StageShape::Pro, 5},
         {1.0f, 1.5f, true, false, FP4SM90StageShape::Pro, 5},
         {24.0f, 64.0f, true, false, FP4SM90StageShape::Pro, 5},
         {0.375f, 0.75f, true, false, FP4SM90StageShape::Any, 6},
@@ -248,6 +248,7 @@ static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
     int fp4_num_experts_per_wave = 0;
     if (fp4_small_block_n_kernel and fp4_flash_shape) {
         static constexpr FP4SM90WaveRule flash_wave_rules[] = {
+            {0.75f, 1.0f, true, 16, 16},
             {1.5f, 2.0f, true, 16, 16},
             {3.0f, 6.0f, true, 16, 16},
             {6.0f, 12.0f, true, 32, 32},
