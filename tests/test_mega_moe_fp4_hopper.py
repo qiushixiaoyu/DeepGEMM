@@ -697,6 +697,9 @@ import torch.distributed as dist
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
+SGLANG_PYTHON = Path(REPO_ROOT).parent / "sglang" / "python"
+if SGLANG_PYTHON.exists() and str(SGLANG_PYTHON) not in sys.path:
+    sys.path.insert(0, str(SGLANG_PYTHON))
 
 import deep_gemm
 from deep_gemm.utils import per_token_cast_to_fp8, per_token_cast_to_fp4
@@ -900,6 +903,190 @@ def _flush_l2_if_requested(l2_flush_gb: float):
     flush_bytes = min(int(l2_flush_gb * 1e9), int(free_bytes * 0.5))
     if flush_bytes >= 4:
         torch.empty(flush_bytes // 4, dtype=torch.int, device="cuda").zero_()
+
+
+def _all_gather_equal_tensor(
+    tensor: torch.Tensor,
+    num_ranks: int,
+    group: dist.ProcessGroup,
+) -> torch.Tensor:
+    """All-gather a tensor whose leading dimension is equal on all ranks."""
+    tensor = tensor.contiguous()
+    out = torch.empty(
+        (tensor.shape[0] * num_ranks, *tensor.shape[1:]),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    dist.all_gather_into_tensor(out, tensor, group=group)
+    return out
+
+
+def _build_marlin_mxfp4_inputs(
+    l1_fp4: Tuple[torch.Tensor, torch.Tensor],
+    l2_fp4: Tuple[torch.Tensor, torch.Tensor],
+    hidden: int,
+    intermediate_hidden_per_rank: int,
+) -> Dict[str, torch.Tensor]:
+    """Repack TP-sharded MXFP4 expert weights into the SGLang Marlin layout."""
+    from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
+    from sglang.srt.layers.quantization.marlin_utils import (
+        marlin_make_workspace,
+        marlin_permute_scales,
+    )
+    from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+        mxfp4_marlin_process_scales,
+    )
+
+    w13, w13_scales = l1_fp4
+    w2, w2_scales = l2_fp4
+    num_experts = w13.shape[0]
+    device = w13.device
+    perm = torch.empty(0, dtype=torch.int, device=device)
+
+    def _repack(weight: torch.Tensor, size_n: int, size_k: int) -> torch.Tensor:
+        repacked = []
+        for expert_idx in range(num_experts):
+            qweight = weight[expert_idx].view(torch.int32).T.contiguous()
+            repacked.append(
+                gptq_marlin_repack(
+                    b_q_weight=qweight,
+                    perm=perm,
+                    size_k=size_k,
+                    size_n=size_n,
+                    num_bits=4,
+                )
+            )
+        return torch.stack(repacked)
+
+    def _permute_scales(
+        scales: torch.Tensor,
+        size_n: int,
+        size_k: int,
+    ) -> torch.Tensor:
+        scales = scales.to(torch.bfloat16)
+        permuted = []
+        for expert_idx in range(num_experts):
+            scale = scales[expert_idx].T.contiguous()
+            marlin_scales = marlin_permute_scales(
+                s=scale,
+                size_k=size_k,
+                size_n=size_n,
+                group_size=32,
+            )
+            permuted.append(
+                mxfp4_marlin_process_scales(
+                    marlin_scales,
+                    input_dtype=torch.bfloat16,
+                )
+            )
+        return torch.stack(permuted)
+
+    return {
+        "w13": _repack(
+            w13,
+            size_n=2 * intermediate_hidden_per_rank,
+            size_k=hidden,
+        ),
+        "w2": _repack(
+            w2,
+            size_n=hidden,
+            size_k=intermediate_hidden_per_rank,
+        ),
+        "w13_s": _permute_scales(
+            w13_scales,
+            size_n=2 * intermediate_hidden_per_rank,
+            size_k=hidden,
+        ),
+        "w2_s": _permute_scales(
+            w2_scales,
+            size_n=hidden,
+            size_k=intermediate_hidden_per_rank,
+        ),
+        "workspace": marlin_make_workspace(device, 4),
+    }
+
+
+def _run_marlin_mxfp4(
+    x_bf16: torch.Tensor,
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_idx: torch.Tensor,
+    prep: Dict[str, torch.Tensor],
+    activation_clamp: float,
+) -> torch.Tensor:
+    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+        fused_marlin_moe,
+    )
+
+    clamp_limit = activation_clamp if math.isfinite(activation_clamp) else None
+    return fused_marlin_moe(
+        hidden_states=x_bf16.contiguous(),
+        w1=prep["w13"],
+        w2=prep["w2"],
+        w1_scale=prep["w13_s"],
+        w2_scale=prep["w2_s"],
+        gating_output=router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_idx,
+        workspace=prep["workspace"],
+        num_bits=4,
+        is_k_full=True,
+        inplace=False,
+        clamp_limit=clamp_limit,
+    )
+
+
+def _reference_marlin_local(
+    x_bf16: torch.Tensor,
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    l1_w_fp4: torch.Tensor,
+    l1_w_sf: torch.Tensor,
+    l2_w_fp4: torch.Tensor,
+    l2_w_sf: torch.Tensor,
+    hidden: int,
+    intermediate_hidden_per_rank: int,
+    activation_clamp: float,
+) -> torch.Tensor:
+    """Reference for one rank's TP-sharded Marlin experts before TP reduction."""
+    del hidden
+    assert l1_w_fp4.shape[1] == 2 * intermediate_hidden_per_rank
+    assert l2_w_fp4.shape[2] * 2 == intermediate_hidden_per_rank
+    out = torch.zeros(
+        x_bf16.shape[0],
+        x_bf16.shape[1],
+        dtype=torch.float32,
+        device=x_bf16.device,
+    )
+    x_fp32 = x_bf16.float()
+    topk_idx = topk_idx.long()
+    num_topk = topk_idx.shape[1]
+
+    for topk_pos in range(num_topk):
+        expert_ids = topk_idx[:, topk_pos]
+        for expert_id in torch.unique(expert_ids):
+            expert = int(expert_id.item())
+            if expert < 0:
+                continue
+            mask = expert_ids == expert
+            if not mask.any():
+                continue
+            token_ids = mask.nonzero(as_tuple=False).squeeze(-1)
+            x_sel = x_fp32[token_ids]
+            l1_w = _dequant_fp4_per32(
+                l1_w_fp4[expert : expert + 1],
+                l1_w_sf[expert : expert + 1],
+            )[0]
+            l1_y = torch.matmul(x_sel, l1_w.T)
+            act = _swiglu_fp32(l1_y, activation_clamp)
+            l2_w = _dequant_fp4_per32(
+                l2_w_fp4[expert : expert + 1],
+                l2_w_sf[expert : expert + 1],
+            )[0]
+            y = torch.matmul(act, l2_w.T)
+            y = y * topk_weights[token_ids, topk_pos].float().unsqueeze(-1)
+            out[token_ids] += y
+    return out.to(torch.bfloat16)
 
 
 def _bench_cuda_event_sections(
@@ -1400,12 +1587,32 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
         return
 
     num_max_tokens_per_rank = args.num_max_tokens_per_rank
-    num_tokens = args.num_tokens if args.num_tokens else num_max_tokens_per_rank
+    requested_num_tokens = args.num_tokens if args.num_tokens else num_max_tokens_per_rank
+    if args.logical_batch_size:
+        if args.logical_batch_size % num_ranks != 0:
+            raise ValueError(
+                f"--logical-batch-size={args.logical_batch_size} must be divisible "
+                f"by num_ranks={num_ranks}"
+            )
+        logical_batch_size = args.logical_batch_size
+        num_tokens = logical_batch_size // num_ranks
+        num_max_tokens_per_rank = max(num_max_tokens_per_rank, num_tokens)
+    else:
+        num_tokens = requested_num_tokens
+        logical_batch_size = num_tokens * num_ranks
     hidden = args.hidden
     intermediate_hidden = args.intermediate_hidden
     num_experts = args.num_experts
     num_topk = args.num_topk
     num_experts_per_rank = num_experts // num_ranks
+    run_marlin_decode_enabled = args.marlin_baseline in ("decode", "both")
+    run_marlin_local_decode_enabled = args.marlin_baseline == "local_decode"
+    run_marlin_prefill_enabled = args.marlin_baseline in ("prefill", "both")
+    run_marlin_enabled = (
+        run_marlin_decode_enabled
+        or run_marlin_local_decode_enabled
+        or run_marlin_prefill_enabled
+    )
     run_fp4_runtime_enabled = args.fp4_mode == "runtime"
     run_fp4_predecode_enabled = args.fp4_mode == "predecode"
     run_fp4_timing_enabled = run_fp4_runtime_enabled or run_fp4_predecode_enabled
@@ -1432,6 +1639,13 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
     assert hidden % 128 == 0
     assert intermediate_hidden % 128 == 0
     assert intermediate_hidden // 64 <= 64
+    if run_marlin_enabled:
+        assert not args.ncu_profile_only, "Marlin baselines are not supported with --ncu-profile-only"
+        assert intermediate_hidden % num_ranks == 0, (
+            f"Marlin TP baseline requires intermediate_hidden={intermediate_hidden} "
+            f"to be divisible by num_ranks={num_ranks}"
+        )
+    marlin_intermediate_hidden = intermediate_hidden // num_ranks
     x_bf16 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
     l1_bf16 = None
     l2_bf16 = None
@@ -1495,6 +1709,31 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
         del l2_bf16
     torch.cuda.empty_cache()
 
+    marlin_prep = None
+    marlin_l1_fp4 = None
+    marlin_l2_fp4 = None
+    if run_marlin_enabled:
+        marlin_l1_bf16 = torch.randn(
+            (num_experts, marlin_intermediate_hidden * 2, hidden),
+            dtype=torch.bfloat16,
+            device="cuda",
+        ) * args.weight_scale
+        marlin_l2_bf16 = torch.randn(
+            (num_experts, hidden, marlin_intermediate_hidden),
+            dtype=torch.bfloat16,
+            device="cuda",
+        ) * args.weight_scale
+        marlin_l1_fp4 = _quantize_grouped_fp4_per32(marlin_l1_bf16)
+        marlin_l2_fp4 = _quantize_grouped_fp4_per32(marlin_l2_bf16)
+        del marlin_l1_bf16, marlin_l2_bf16
+        torch.cuda.empty_cache()
+        marlin_prep = _build_marlin_mxfp4_inputs(
+            marlin_l1_fp4,
+            marlin_l2_fp4,
+            hidden=hidden,
+            intermediate_hidden_per_rank=marlin_intermediate_hidden,
+        )
+
     predecode_l1_fp8 = None
     predecode_l2_fp8 = None
     if run_fp4_predecode_enabled:
@@ -1544,6 +1783,86 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
     def run_fp4_fused():
         fp4_prepare_inputs()
         return fp4_fused_kernel()
+
+    marlin_full_x = None
+    marlin_full_scores = None
+    marlin_full_topk_idx = None
+    marlin_full_topk_weights = None
+    marlin_prefill_x = None
+    marlin_prefill_rs_out = None
+    marlin_state: Dict[str, torch.Tensor] = {}
+    if run_marlin_decode_enabled or run_marlin_prefill_enabled:
+        assert marlin_prep is not None
+        marlin_full_x = _all_gather_equal_tensor(x_bf16, num_ranks, group)
+        marlin_full_scores = _all_gather_equal_tensor(scores, num_ranks, group)
+        marlin_full_topk_idx = _all_gather_equal_tensor(
+            topk_idx.to(torch.int32), num_ranks, group
+        )
+        marlin_full_topk_weights = _all_gather_equal_tensor(
+            topk_weights.to(torch.float32), num_ranks, group
+        )
+    if run_marlin_prefill_enabled:
+        marlin_prefill_x = torch.empty_like(marlin_full_x)
+        marlin_prefill_rs_out = torch.empty(
+            (num_tokens, hidden),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+
+    def marlin_kernel_on_full_batch(x_full: torch.Tensor) -> torch.Tensor:
+        assert marlin_prep is not None
+        assert marlin_full_scores is not None
+        assert marlin_full_topk_weights is not None
+        assert marlin_full_topk_idx is not None
+        return _run_marlin_mxfp4(
+            x_full,
+            marlin_full_scores,
+            marlin_full_topk_weights,
+            marlin_full_topk_idx,
+            marlin_prep,
+            args.activation_clamp,
+        )
+
+    def run_marlin_decode():
+        y = marlin_kernel_on_full_batch(marlin_full_x)
+        dist.all_reduce(y, group=group)
+        return y
+
+    def run_marlin_local_decode():
+        assert marlin_prep is not None
+        y = _run_marlin_mxfp4(
+            x_bf16,
+            scores,
+            topk_weights,
+            topk_idx,
+            marlin_prep,
+            args.activation_clamp,
+        )
+        dist.all_reduce(y, group=group)
+        return y
+
+    def marlin_prefill_all_gather():
+        assert marlin_prefill_x is not None
+        dist.all_gather_into_tensor(
+            marlin_prefill_x,
+            x_bf16.contiguous(),
+            group=group,
+        )
+
+    def marlin_prefill_kernel():
+        assert marlin_prefill_x is not None
+        marlin_state["prefill_full_y"] = marlin_kernel_on_full_batch(marlin_prefill_x)
+
+    def marlin_prefill_reduce_scatter():
+        assert marlin_prefill_rs_out is not None
+        full_y = marlin_state["prefill_full_y"].contiguous()
+        dist.reduce_scatter_tensor(marlin_prefill_rs_out, full_y, group=group)
+        return marlin_prefill_rs_out
+
+    def run_marlin_prefill():
+        marlin_prefill_all_gather()
+        marlin_prefill_kernel()
+        return marlin_prefill_reduce_scatter()
 
     if args.ncu_profile_only:
         assert run_fp4_runtime_enabled, "--ncu-profile-only requires --fp4-mode runtime"
@@ -1785,6 +2104,18 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
             fused_out = run_fp4_fused()
     if fused_out is not None:
         assert fused_out.shape == (num_tokens, hidden)
+    marlin_decode_out = None
+    marlin_local_decode_out = None
+    marlin_prefill_out = None
+    if run_marlin_decode_enabled:
+        marlin_decode_out = run_marlin_decode()
+        assert marlin_decode_out.shape == (logical_batch_size, hidden)
+    if run_marlin_local_decode_enabled:
+        marlin_local_decode_out = run_marlin_local_decode()
+        assert marlin_local_decode_out.shape == (num_tokens, hidden)
+    if run_marlin_prefill_enabled:
+        marlin_prefill_out = run_marlin_prefill()
+        assert marlin_prefill_out.shape == (num_tokens, hidden)
     if args.bench_check_reference:
         assert fused_out is not None, "--bench-check-reference requires an FP4 mode"
         assert l1_fp4 is not None and l2_fp4 is not None
@@ -1816,6 +2147,120 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
                 flush=True,
             )
         assert ok, f"bench reference diff={diff} >= tol={args.diff_tol}"
+        if run_marlin_enabled:
+            assert marlin_l1_fp4 is not None and marlin_l2_fp4 is not None
+        if run_marlin_decode_enabled or run_marlin_prefill_enabled:
+            assert marlin_full_x is not None
+            assert marlin_full_topk_idx is not None
+            assert marlin_full_topk_weights is not None
+            marlin_ref_full = _reference_marlin_local(
+                marlin_full_x,
+                marlin_full_topk_idx,
+                marlin_full_topk_weights,
+                marlin_l1_fp4[0],
+                marlin_l1_fp4[1],
+                marlin_l2_fp4[0],
+                marlin_l2_fp4[1],
+                hidden,
+                marlin_intermediate_hidden,
+                args.activation_clamp,
+            )
+            if run_marlin_decode_enabled:
+                marlin_decode_ref = marlin_ref_full.clone()
+                dist.all_reduce(marlin_decode_ref, group=group)
+                diff = calc_diff(marlin_decode_out, marlin_decode_ref)
+                ok = diff < args.diff_tol
+                if rank_idx == 0:
+                    print(
+                        "MARLIN_REFERENCE_JSON " + json.dumps(
+                            {
+                                "mode": "decode",
+                                "logical_batch_size": logical_batch_size,
+                                "batch_per_rank": num_tokens,
+                                "hidden": hidden,
+                                "intermediate_hidden_per_rank": marlin_intermediate_hidden,
+                                "num_experts": num_experts,
+                                "num_topk": num_topk,
+                                "diff": round(float(diff), 6),
+                                "diff_tol": args.diff_tol,
+                                "ok": bool(ok),
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                assert ok, f"marlin decode reference diff={diff} >= tol={args.diff_tol}"
+            if run_marlin_prefill_enabled:
+                marlin_prefill_ref = torch.empty(
+                    (num_tokens, hidden),
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                dist.reduce_scatter_tensor(
+                    marlin_prefill_ref,
+                    marlin_ref_full.contiguous(),
+                    group=group,
+                )
+                diff = calc_diff(marlin_prefill_out, marlin_prefill_ref)
+                ok = diff < args.diff_tol
+                if rank_idx == 0:
+                    print(
+                        "MARLIN_REFERENCE_JSON " + json.dumps(
+                            {
+                                "mode": "prefill",
+                                "logical_batch_size": logical_batch_size,
+                                "batch_per_rank": num_tokens,
+                                "hidden": hidden,
+                                "intermediate_hidden_per_rank": marlin_intermediate_hidden,
+                                "num_experts": num_experts,
+                                "num_topk": num_topk,
+                                "diff": round(float(diff), 6),
+                                "diff_tol": args.diff_tol,
+                                "ok": bool(ok),
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                assert ok, f"marlin prefill reference diff={diff} >= tol={args.diff_tol}"
+        if run_marlin_local_decode_enabled:
+            marlin_local_ref = _reference_marlin_local(
+                x_bf16,
+                topk_idx,
+                topk_weights,
+                marlin_l1_fp4[0],
+                marlin_l1_fp4[1],
+                marlin_l2_fp4[0],
+                marlin_l2_fp4[1],
+                hidden,
+                marlin_intermediate_hidden,
+                args.activation_clamp,
+            )
+            dist.all_reduce(marlin_local_ref, group=group)
+            diff = calc_diff(marlin_local_decode_out, marlin_local_ref)
+            ok = diff < args.diff_tol
+            if rank_idx == 0:
+                print(
+                    "MARLIN_REFERENCE_JSON " + json.dumps(
+                        {
+                            "mode": "local_decode",
+                            "logical_batch_size": logical_batch_size,
+                            "batch_per_rank": num_tokens,
+                            "hidden": hidden,
+                            "intermediate_hidden_per_rank": marlin_intermediate_hidden,
+                            "num_experts": num_experts,
+                            "num_topk": num_topk,
+                            "diff": round(float(diff), 6),
+                            "diff_tol": args.diff_tol,
+                            "ok": bool(ok),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            assert ok, (
+                f"marlin local decode reference diff={diff} >= tol={args.diff_tol}"
+            )
     if run_fp8_normal_baseline_enabled:
         normal_out = run_fp8_normal_baseline()
         assert normal_out.shape == (num_tokens, hidden)
@@ -1885,6 +2330,40 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
                 fp8_profile_total,
                 *[fp8_profile[name] for name, _ in fp8_ll_sections],
             ]
+        if run_marlin_decode_enabled:
+            marlin_decode_state: Dict[str, torch.Tensor] = {}
+
+            def marlin_decode_kernel_profile():
+                assert marlin_full_x is not None
+                marlin_decode_state["y"] = marlin_kernel_on_full_batch(marlin_full_x)
+
+            def marlin_decode_all_reduce_profile():
+                y = marlin_decode_state["y"]
+                dist.all_reduce(y, group=group)
+                return y
+
+            marlin_decode_sections = [
+                ("marlin_decode_kernel", marlin_decode_kernel_profile),
+                ("marlin_decode_all_reduce", marlin_decode_all_reduce_profile),
+            ]
+            dist.barrier()
+            marlin_decode_profile, marlin_decode_profile_total = (
+                _bench_cuda_event_sections(
+                    marlin_decode_sections,
+                    num_warmup=args.profile_warmup,
+                    num_repeat=args.profile_repeat,
+                    l2_flush_gb=args.profile_l2_flush_gb,
+                    barrier=dist.barrier,
+                )
+            )
+            profile_names += [
+                "marlin_decode_total",
+                *[name for name, _ in marlin_decode_sections],
+            ]
+            profile_values += [
+                marlin_decode_profile_total,
+                *[marlin_decode_profile[name] for name, _ in marlin_decode_sections],
+            ]
         profile_metrics = _all_rank_metrics(tuple(profile_values))
         profile_count_metrics = _all_rank_metrics(
             (float(num_recv_tokens), float(num_touched_experts))
@@ -1953,6 +2432,9 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
 
     t_ll = float("nan")
     t_normal = float("nan")
+    t_marlin_decode = float("nan")
+    t_marlin_local_decode = float("nan")
+    t_marlin_prefill = float("nan")
     if run_fp8_normal_baseline_enabled:
         dist.barrier()
         t_normal = _bench_cuda_events(
@@ -1968,6 +2450,21 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
         t_ll = bench_low_latency_pipeline(run_fp8_low_latency_baseline)
         dist.barrier()
 
+    if run_marlin_decode_enabled:
+        dist.barrier()
+        t_marlin_decode = bench_low_latency_pipeline(run_marlin_decode)
+        dist.barrier()
+
+    if run_marlin_local_decode_enabled:
+        dist.barrier()
+        t_marlin_local_decode = bench_low_latency_pipeline(run_marlin_local_decode)
+        dist.barrier()
+
+    if run_marlin_prefill_enabled:
+        dist.barrier()
+        t_marlin_prefill = bench_low_latency_pipeline(run_marlin_prefill)
+        dist.barrier()
+
     metrics = _all_rank_metrics(
         (
             t_fused,
@@ -1975,6 +2472,9 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
             t_ll,
             float(num_recv_tokens),
             float(num_touched_experts),
+            t_marlin_decode,
+            t_marlin_prefill,
+            t_marlin_local_decode,
         )
     )
     if rank_idx == 0:
@@ -2001,8 +2501,40 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
             ll_us_mean = float(metrics[:, 2].mean().item() * 1e6)
             if fused_us_max is not None:
                 speedup_vs_fp8_ll_max = round(_safe_div(ll_us_max, fused_us_max), 4)
+        marlin_decode_us_max = None
+        marlin_decode_us_mean = None
+        marlin_decode_vs_megamoe_time_ratio = None
+        if run_marlin_decode_enabled:
+            marlin_decode_us_max = float(metrics[:, 5].max().item() * 1e6)
+            marlin_decode_us_mean = float(metrics[:, 5].mean().item() * 1e6)
+            if fused_us_max is not None:
+                marlin_decode_vs_megamoe_time_ratio = round(
+                    _safe_div(marlin_decode_us_max, fused_us_max), 4
+                )
+        marlin_prefill_us_max = None
+        marlin_prefill_us_mean = None
+        marlin_prefill_vs_megamoe_time_ratio = None
+        if run_marlin_prefill_enabled:
+            marlin_prefill_us_max = float(metrics[:, 6].max().item() * 1e6)
+            marlin_prefill_us_mean = float(metrics[:, 6].mean().item() * 1e6)
+            if fused_us_max is not None:
+                marlin_prefill_vs_megamoe_time_ratio = round(
+                    _safe_div(marlin_prefill_us_max, fused_us_max), 4
+                )
+        marlin_local_decode_us_max = None
+        marlin_local_decode_us_mean = None
+        marlin_local_decode_vs_megamoe_time_ratio = None
+        if run_marlin_local_decode_enabled:
+            marlin_local_decode_us_max = float(metrics[:, 7].max().item() * 1e6)
+            marlin_local_decode_us_mean = float(metrics[:, 7].mean().item() * 1e6)
+            if fused_us_max is not None:
+                marlin_local_decode_vs_megamoe_time_ratio = round(
+                    _safe_div(marlin_local_decode_us_max, fused_us_max), 4
+                )
         result = {
+            "logical_batch_size": logical_batch_size,
             "batch_per_rank": num_tokens,
+            "megamoe_tokens_per_rank": num_tokens,
             "num_ranks": num_ranks,
             "hidden": hidden,
             "intermediate_hidden": intermediate_hidden,
@@ -2026,6 +2558,35 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
             "fp8_ll_baseline_us_max": None if ll_us_max is None else round(ll_us_max, 3),
             "fp8_ll_baseline_us_mean": None if ll_us_mean is None else round(ll_us_mean, 3),
             "speedup_vs_fp8_ll_max": speedup_vs_fp8_ll_max,
+            "marlin_baseline": args.marlin_baseline,
+            "marlin_intermediate_hidden_per_rank": (
+                marlin_intermediate_hidden if run_marlin_enabled else None
+            ),
+            "fp4_marlin_decode_us_max": (
+                None if marlin_decode_us_max is None else round(marlin_decode_us_max, 3)
+            ),
+            "fp4_marlin_decode_us_mean": (
+                None if marlin_decode_us_mean is None else round(marlin_decode_us_mean, 3)
+            ),
+            "fp4_marlin_prefill_us_max": (
+                None if marlin_prefill_us_max is None else round(marlin_prefill_us_max, 3)
+            ),
+            "fp4_marlin_prefill_us_mean": (
+                None if marlin_prefill_us_mean is None else round(marlin_prefill_us_mean, 3)
+            ),
+            "fp4_marlin_local_decode_us_max": (
+                None if marlin_local_decode_us_max is None
+                else round(marlin_local_decode_us_max, 3)
+            ),
+            "fp4_marlin_local_decode_us_mean": (
+                None if marlin_local_decode_us_mean is None
+                else round(marlin_local_decode_us_mean, 3)
+            ),
+            "marlin_decode_vs_megamoe_time_ratio": marlin_decode_vs_megamoe_time_ratio,
+            "marlin_prefill_vs_megamoe_time_ratio": marlin_prefill_vs_megamoe_time_ratio,
+            "marlin_local_decode_vs_megamoe_time_ratio": (
+                marlin_local_decode_vs_megamoe_time_ratio
+            ),
             "num_bench_tests": args.num_bench_tests,
             "num_warmup": args.num_warmup,
             "num_repeat": args.num_repeat,
@@ -2142,6 +2703,12 @@ if __name__ == '__main__':
 
     parser.add_argument('--num-max-tokens-per-rank', type=int, default=1)
     parser.add_argument('--num-tokens', type=int, default=0)
+    parser.add_argument(
+        '--logical-batch-size',
+        type=int,
+        default=0,
+        help='Global logical batch B. When set, MegaMOE uses B/num_processes tokens per rank.',
+    )
     parser.add_argument('--hidden', type=int, default=4096)
     parser.add_argument('--intermediate-hidden', type=int, default=2048)
     parser.add_argument('--num-experts', type=int, default=256)
@@ -2174,6 +2741,14 @@ if __name__ == '__main__':
         choices=('kineto', 'cuda-events'),
         default='kineto',
         help='Timing backend for --fp4-mode runtime',
+    )
+    parser.add_argument(
+        '--marlin-baseline',
+        choices=('none', 'decode', 'local_decode', 'prefill', 'both'),
+        default='none',
+        help='Also measure SGLang Marlin TP baseline: decode=AllGather+Marlin+AllReduce, '
+             'local_decode=Marlin on local tokens+AllReduce, '
+             'prefill=AllGather+Marlin+ReduceScatter.',
     )
     args = parser.parse_args()
 
