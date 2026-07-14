@@ -136,6 +136,14 @@ struct Workspace {
         return math::advance_ptr<int>(base, (kNumMaxGridSyncCounters + 1) * sizeof(uint32_t) + phase * sizeof(int));
     }
 
+    // Inter-node barrier uses an 8-byte-aligned uint64 signal (NVSHMEM signal API
+    // type). Placed at offset 24 in the 32-byte barrier region: 4 grid-sync
+    // counters (16B) + 1 barrier counter (4B) + 4B pad, leaving [24, 32).
+    CUTLASS_DEVICE
+    uint64_t* get_nvl_barrier_signal_u64_ptr() const {
+        return math::advance_ptr<uint64_t>(base, 24);
+    }
+
     CUTLASS_DEVICE
     uint64_t* get_expert_send_count_ptr(const uint32_t& expert_idx = 0) const {
         return math::advance_ptr<uint64_t>(base, kNumBarrierSignalBytes) + expert_idx;
@@ -271,6 +279,12 @@ struct SM90Workspace {
     int* get_nvl_barrier_signal_ptr(const uint32_t& phase) const {
         return math::advance_ptr<int>(
             base, (kNumMaxGridSyncCounters + 1) * sizeof(uint32_t) + phase * sizeof(int));
+    }
+
+    // Inter-node barrier uint64 signal (NVSHMEM signal API), 8B-aligned at offset 24.
+    CUTLASS_DEVICE
+    uint64_t* get_nvl_barrier_signal_u64_ptr() const {
+        return math::advance_ptr<uint64_t>(base, 24);
     }
 
     CUTLASS_DEVICE

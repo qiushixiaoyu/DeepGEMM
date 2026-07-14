@@ -44,6 +44,13 @@ DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLibraryUnload);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuKernelGetFunction);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLaunchKernelEx);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuTensorMapEncodeTiled);
+DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLibraryGetGlobal);
+DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLibraryGetModule);
+
+// NVSHMEM host API to inject device state into a JIT-loaded module. Declared
+// here (instead of pulling in <nvshmemx.h>) and resolved at link time against
+// libnvshmem_host.so — only exercised by cross-node mega-moe kernels.
+extern "C" int nvshmemx_cumodule_init(CUmodule module);
 
 #if CUDART_VERSION >= 12080 and defined(DG_JIT_USE_RUNTIME_API)
 
@@ -152,6 +159,18 @@ static KernelHandle load_kernel(const std::filesystem::path& cubin_path, const s
     CUkernel cu_kernel;
     DG_CUDA_DRIVER_CHECK(lazy_cuLibraryEnumerateKernels(&cu_kernel, 1, library));
     DG_CUDA_DRIVER_CHECK(lazy_cuKernelGetFunction(&kernel, cu_kernel));
+
+    // If this cubin was device-linked with libnvshmem_device (detected via the
+    // presence of nvshmem's device-state global), initialize NVSHMEM device
+    // state on the underlying module. No-op for all non-nvshmem kernels.
+    {
+        CUdeviceptr state_ptr; size_t state_size;
+        if (lazy_cuLibraryGetGlobal(&state_ptr, &state_size, library, "nvshmemi_device_state_d") == CUDA_SUCCESS) {
+            CUmodule nvshmem_module;
+            if (lazy_cuLibraryGetModule(&nvshmem_module, library) == CUDA_SUCCESS)
+                nvshmemx_cumodule_init(nvshmem_module);
+        }
+    }
 #else
     DG_CUDA_DRIVER_CHECK(lazy_cuModuleLoad(&library, cubin_path.c_str()));
     DG_CUDA_DRIVER_CHECK(lazy_cuModuleGetFunction(&kernel, library, func_name.c_str()));

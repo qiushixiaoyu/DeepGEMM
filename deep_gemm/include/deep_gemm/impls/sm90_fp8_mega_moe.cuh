@@ -532,6 +532,14 @@ sm90_fp8_mega_moe_impl(void* y,
             const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1);
             const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
                 expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
+#ifdef DG_MEGA_MOE_INTERNODE
+            // Inter-node peer: IBGDA verbs inline RDMA WRITE(公开 device API 在本集群
+            // 会对一半目标 PE 静默丢写，见 comm/ibgda.cuh 头注)。qp 按槽位分摊防 ring 溢出。
+            if (dst_rank_idx / DG_MEGA_MOE_NVL_PEERS != sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS)
+                comm::ibgda::put_inline<uint32_t>(
+                    dst_ptr, token_topk_idx, static_cast<int>(dst_rank_idx), static_cast<int>(dst_slot_idx));
+            else
+#endif
             *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
         });
 
@@ -546,16 +554,37 @@ sm90_fp8_mega_moe_impl(void* y,
                 const auto dst_rank_idx = i / kNumExpertsPerRank;
                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
                 const auto expert_status = *workspace.get_expert_send_count_ptr(i);
-                *sym_buffer.map(
-                    workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
-                    dst_rank_idx) = expert_status & 0xffffffff;
-                ptx::atomic_add_sys(
-                    sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
-                    expert_status);
+                const auto recv_count_ptr = workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx);
+                const auto recv_count_sum_ptr = workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx);
+#ifdef DG_MEGA_MOE_INTERNODE
+                // 方案c：per-source recv_count 槽写【完整】expert_status(高32位=kNumSMs 到达标记、低32位=token数)，
+                // inter 走 NVSHMEM put、intra 走 NVLink store —— 都是幂等覆盖写，put 有 CQE、被 nvshmem_quiet 追踪。
+                // 跨节点关键路径彻底去掉 NIC atomic：实测 non-fetch AMO 会静默丢(dst 只收到 9/16 个 source 的贡献)，
+                // fetch AMO 又会把 source 卡死在响应等待。recv_count_sum 在跨节点构建下不再写入，消费端
+                // (scheduler.fetch_expert_recv_count 与 dispatch cleanup)改为逐槽等标记 + 本地求和。
+                if (dst_rank_idx / DG_MEGA_MOE_NVL_PEERS != sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS)
+                    comm::ibgda::put_inline<uint64_t>(
+                        recv_count_ptr, expert_status, static_cast<int>(dst_rank_idx),
+                        static_cast<int>(dst_local_expert_idx));
+                else
+                    *sym_buffer.map(recv_count_ptr, dst_rank_idx) = expert_status;
+#else
+                *sym_buffer.map(recv_count_ptr, dst_rank_idx) = expert_status & 0xffffffff;
+                ptx::atomic_add_sys(sym_buffer.map(recv_count_sum_ptr, dst_rank_idx), expert_status);
+#endif
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
+        // NOTE: inter-node metadata puts 的 completion 由 barrier(下方)内部的
+        // per-QP verbs quiet 扫描统一等待，此处无需单独 flush。
+
+        // Make all dispatch metadata pushes (intra-node NVLink stores + inter-node NVSHMEM
+        // puts/atomics) visible system-wide before the cross-rank barrier, so the pull phase
+        // observes up-to-date counts/indices. Without this, a plain NVLink store to a peer's
+        // mapped address may not be visible to the peer at barrier release, causing rank-to-rank
+        // progress skew (some ranks stall in the pull loop while others reach the next barrier).
+        __threadfence_system();
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
@@ -653,9 +682,48 @@ sm90_fp8_mega_moe_impl(void* y,
 
                 const uint32_t pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
 
+#ifdef DG_MEGA_MOE_INTERNODE
+                // Source rank on another node: token/SF/weight travel over IBGDA verbs
+                // (RDMA READ) instead of NVLink P2P. Decided once per pulled token.
+                const bool tok_is_inter =
+                    current_rank_in_expert_idx / DG_MEGA_MOE_NVL_PEERS != sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS;
+                // 每 warp 一个专属 qp，配 quiet 构成阻塞读。SF/weight 是小载荷，先 READ 进
+                // per-warp 暂存行(复用 combine_token_buffer 的 topk0 槽：barrier817 是全局
+                // 屏障，任何 rank 的 combine scatter 都在所有 rank 的 pull 结束之后才发生，
+                // 故 pull 期间该区域空闲)，随后由本 warp 拷入转置布局。
+                const int inter_qp_id = static_cast<int>(sm_idx * kNumDispatchWarps + warp_idx);
+                const auto inter_staging = reinterpret_cast<float*>(
+                    combine_token_buffer.get_rank_buffer(0)
+                        .get_data_buffer(sm_idx * kNumDispatchWarps + warp_idx).get_base_ptr());
+#endif
+
                 // Pull token data. Overlap a remote TMA load with SF copy and
                 // then use TMA store to materialize the local L1 input.
                 if (cute::elect_one_sync()) {
+#ifdef DG_MEGA_MOE_INTERNODE
+                    if (tok_is_inter) {
+                        // Inter-node: RDMA READ token straight into the local L1 pool
+                        // (skipping smem bounce and both TMAs), plus SF & routing weight
+                        // into the per-warp staging row; a single per-QP quiet then gives
+                        // blocking-get semantics for all three.
+                        comm::ibgda::get_thread(
+                            reinterpret_cast<uint64_t>(l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr()),
+                            reinterpret_cast<uint64_t>(input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr()),
+                            pull_buffer.get_num_bytes(),
+                            static_cast<int>(current_rank_in_expert_idx), inter_qp_id);
+                        comm::ibgda::get_thread(
+                            reinterpret_cast<uint64_t>(inter_staging),
+                            reinterpret_cast<uint64_t>(input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>()),
+                            (kHidden / 128) * sizeof(float),
+                            static_cast<int>(current_rank_in_expert_idx), inter_qp_id);
+                        comm::ibgda::get_thread(
+                            reinterpret_cast<uint64_t>(inter_staging + kHidden / 128),
+                            reinterpret_cast<uint64_t>(input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx),
+                            sizeof(float),
+                            static_cast<int>(current_rank_in_expert_idx), inter_qp_id);
+                        comm::ibgda::quiet(static_cast<int>(current_rank_in_expert_idx), inter_qp_id);
+                    } else
+#endif
                     ptx::tma_load_1d(
                         pull_buffer.get_base_ptr(),
                         sym_buffer.map(input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
@@ -667,9 +735,8 @@ sm90_fp8_mega_moe_impl(void* y,
                 // Copy SF: per-128 K floats, written linearly (no UTCCP transpose).
                 constexpr uint32_t kNumSFFloats = kHidden / 128;
                 DG_STATIC_ASSERT(kNumSFFloats > 0 and kHidden % 128 == 0, "Invalid SF");
-                const auto remote_sf_ptr = sym_buffer.map(
-                    input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>(),
-                    current_rank_in_expert_idx);
+                const auto input_sf_local = input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>();
+                const auto remote_sf_ptr = sym_buffer.map(input_sf_local, current_rank_in_expert_idx);
                 const auto local_sf_ptr  = l1_sf_buffer.get_base_ptr<float>();
                 const uint32_t pool_block_idx = expert_pool_block_offset + token_idx_in_expert / BLOCK_M;
                 const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;
@@ -677,34 +744,63 @@ sm90_fp8_mega_moe_impl(void* y,
                 #pragma unroll
                 for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFFloats, 32u); ++ i) {
                     const uint32_t j = i * 32 + lane_idx;
-                    if (j < kNumSFFloats)
+                    if (j < kNumSFFloats) {
+#ifdef DG_MEGA_MOE_INTERNODE
+                        // Inter-node: SF 已由 RDMA READ 落进 per-warp 暂存行；__ldcg 绕过
+                        // L1(暂存行跨 token 复用，防读到上一个 token 的陈旧缓存行)。
+                        const float sf_val = tok_is_inter
+                            ? __ldcg(inter_staging + j)
+                            : remote_sf_ptr[j];
+                        local_sf_ptr[j * kNumPaddedSFPoolTokens + sf_pool_token_idx] = sf_val;
+#else
                         local_sf_ptr[j * kNumPaddedSFPoolTokens + sf_pool_token_idx] = remote_sf_ptr[j];
+#endif
+                    }
                 }
                 __syncwarp();
 
                 if (cute::elect_one_sync()) {
-                    const auto weight = *sym_buffer.map(
-                        input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
-                        current_rank_in_expert_idx);
+                    const auto weight_local_ptr =
+                        input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx;
+#ifdef DG_MEGA_MOE_INTERNODE
+                    // Inter-node: 路由权重已随 SF 一起 READ 进暂存行(紧跟 SF 之后)。
+                    const float weight = tok_is_inter
+                        ? __ldcg(inter_staging + kHidden / 128)
+                        : *sym_buffer.map(weight_local_ptr, current_rank_in_expert_idx);
+#else
+                    const float weight = *sym_buffer.map(weight_local_ptr, current_rank_in_expert_idx);
+#endif
                     *l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>() = weight;
                 }
                 __syncwarp();
 
                 if (cute::elect_one_sync()) {
-                    ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kHidden);
-                    ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
+#ifdef DG_MEGA_MOE_INTERNODE
+                    if (tok_is_inter) {
+                        // Token already delivered into the L1 pool by the blocking get;
+                        // no smem bounce to flush, just publish metadata and arrival.
+                        *workspace.get_token_src_metadata_ptr(pool_token_idx) =
+                            {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
+                        ptx::red_add_rel(
+                            workspace.get_l1_arrival_count_ptr(pool_block_idx), 1);
+                    } else
+#endif
+                    {
+                        ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kHidden);
+                        ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
 
-                    ptx::tma_store_1d(
-                        l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr(),
-                        pull_buffer.get_base_ptr(), pull_buffer.get_num_bytes());
+                        ptx::tma_store_1d(
+                            l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr(),
+                            pull_buffer.get_base_ptr(), pull_buffer.get_num_bytes());
 
-                    *workspace.get_token_src_metadata_ptr(pool_token_idx) =
-                        {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
+                        *workspace.get_token_src_metadata_ptr(pool_token_idx) =
+                            {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
 
-                    cute::tma_store_arrive();
-                    ptx::tma_store_wait<0>();
-                    ptx::red_add_rel(
-                        workspace.get_l1_arrival_count_ptr(pool_block_idx), 1);
+                        cute::tma_store_arrive();
+                        ptx::tma_store_wait<0>();
+                        ptx::red_add_rel(
+                            workspace.get_l1_arrival_count_ptr(pool_block_idx), 1);
+                    }
                 }
                 __syncwarp();
             }
@@ -719,8 +815,16 @@ sm90_fp8_mega_moe_impl(void* y,
                 *workspace.get_expert_send_count_ptr(i) = 0;
         } else {
             for (uint32_t i = sm_idx - 1; i < kNumExpertsPerRank; i += kNumSMs - 1) {
+#ifdef DG_MEGA_MOE_INTERNODE
+                // 方案c：recv_count_sum 跨节点不再写入，token 总数改为对 16 个 per-source 槽本地求和
+                // (低32位=count)。此读在下方 sync_aligned 之前完成，槽的零化在其之后，顺序有 barrier 保护。
+                uint32_t num_recv_tokens = 0;
+                for (uint32_t j = 0; j < kNumRanks; ++ j)
+                    num_recv_tokens += static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, i));
+#else
                 const auto num_recv_tokens = static_cast<uint32_t>(
                     *workspace.get_expert_recv_count_sum_ptr(i));
+#endif
                 const auto num_recv_m_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
 
                 expert_pool_block_offset = scheduler.get_pool_block_offset(i);
@@ -2113,6 +2217,17 @@ sm90_fp8_mega_moe_impl(void* y,
                     auto dst_ptr = math::advance_ptr<ScatterVec>(
                         dst_token.get_base_ptr(),
                         (n_idx + wg_n_offset) * sizeof(nv_bfloat16) + lane_in_row * sizeof(ScatterVec));
+#ifdef DG_MEGA_MOE_INTERNODE
+                    // Inter-node target rank: IBGDA verbs inline RDMA WRITE(源在寄存器)。
+                    // v1 先逐消息 quiet 保证单 QP 在途 WQE 有界(防 ring 溢出)；后续性能版
+                    // 应改为行级暂存 + put_nbi_warp + 批量 quiet。
+                    if (dst_rank_idx / DG_MEGA_MOE_NVL_PEERS != sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS) {
+                        const int scatter_qp_id = static_cast<int>(dst_token_idx + lane_in_row);
+                        comm::ibgda::put_inline<ScatterVec>(
+                            dst_ptr, packed, static_cast<int>(dst_rank_idx), scatter_qp_id);
+                        comm::ibgda::quiet(static_cast<int>(dst_rank_idx), scatter_qp_id);
+                    } else
+#endif
                     *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
                 }
 
@@ -2146,6 +2261,13 @@ sm90_fp8_mega_moe_impl(void* y,
                 process_math_block(block_phase, local_expert_idx, num_k_blocks, m_block_idx, n_block_idx);
             });
         }
+
+        // NOTE: inter-node scatter 已逐消息 quiet；barrier 内部的 per-QP 扫描再兜底一次。
+        // 与 dispatch 的 barrier 前 __threadfence_system 对称：把同节点 peer 的 NVLink map() scatter store
+        // 在 cross-rank barrier 释放前 publish 到系统作用域，否则 peer 越过 barrier 后 gather(TMA load
+        // combine_token_buffer) 会读到尚未可见/未落地的旧值。nvshmem_quiet 只 flush 本 PE 的 NVSHMEM put，
+        // 管不到同节点 NVLink 普通 store；sync_all 内部 fence 只覆盖其单一调用线程。故此处必须显式补一次。
+        __threadfence_system();
 
         // ---------------- COMBINE ----------------
         // NVLink barrier first: signals remote ranks that this rank's GEMM

@@ -7,6 +7,15 @@
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
+// Inter-node (方案c): fetch_expert_recv_count no longer reads recv_count_sum (cross-node
+// NIC atomics proved unreliable). It instead polls the 16 per-source recv_count slots,
+// each written once via a plain idempotent put / NVLink store carrying an arrival marker
+// in the high 32 bits. nvshmem.h is needed for nvshmem_my_pe() in the timeout diagnostics.
+#ifdef DG_MEGA_MOE_INTERNODE
+#include <nvshmem.h>
+#include <nvshmemx.h>
+#endif
+
 namespace deep_gemm::sched {
 
 // Computation phase for the current block
@@ -190,9 +199,50 @@ struct MegaMoEScheduler {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
+#ifdef DG_MEGA_MOE_INTERNODE
+                // 方案c：不再依赖 recv_count_sum(跨节点 NIC atomic 实测会静默丢/把 source 卡死)。改为逐个
+                // 等待 16 个 per-source recv_count 槽的到达标记(高32位==kNumSMs，由普通 put/NVLink store
+                // 幂等覆盖写入，put 有 CQE、被 quiet 追踪)，然后本地求和低32位得到 token 总数。
+                // 单个 8 字节值同时携带标记+数据，无标记/载荷之间的排序问题。
+                // 超时诊断：若某槽 put 长期未到(put 丢失或 rank↔PE/堆偏移错位)，dump 全部槽位后 trap。
+                constexpr int64_t kSlotTimeoutCycles = 120ll * 2000000000ll;  // ~60s @ 2GHz
+                const auto start_clock = clock64();
+                bool timed_out = false;
+                value = 0;
+                for (uint32_t src = 0; src < kNumRanks and not timed_out; ++ src) {
+                    const auto slot_ptr = workspace.get_expert_recv_count_ptr(src, expert_idx);
+                    uint64_t slot_value = ptx::ld_volatile(slot_ptr);
+                    while (static_cast<uint32_t>(slot_value >> 32) != kNumSMs) {
+                        if (clock64() - start_clock >= kSlotTimeoutCycles) { timed_out = true; break; }
+                        slot_value = ptx::ld_volatile(slot_ptr);
+                    }
+                    value += slot_value & 0xffffffffull;
+                }
+                if (timed_out) {
+                    // 判别实验 dump：打印该 expert 全部 per-source 槽现值(0 = 该 source 的 put 未到达)。
+                    // 任何角色 warp(dispatch/GEMM/math)都可能先超时，故不能按 block/warp 门控——
+                    // 复用方案c 下已废弃的 recv_count_sum 槽做 atomicExch 去重，每 expert 恰好一个打印者。
+                    const auto dedupe_ptr = reinterpret_cast<unsigned long long*>(
+                        workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                    if (atomicExch(dedupe_ptr, 1ull) == 0) {
+                        for (uint32_t src = 0; src < kNumRanks; ++ src)
+                            printf("[SLOT_DUMP] pe=%d expert=%u src=%u val=0x%llx\n",
+                                   nvshmem_my_pe(), expert_idx, src,
+                                   static_cast<unsigned long long>(
+                                       ptx::ld_volatile(workspace.get_expert_recv_count_ptr(src, expert_idx))));
+                        printf("[SLOT_DUMP_END] pe=%d expert=%u\n", nvshmem_my_pe(), expert_idx);
+                        __trap();
+                    }
+                    // 非打印者延迟 ~2s 再 trap，给打印者时间把 printf 写完，避免截断
+                    const auto delay_start = clock64();
+                    while (clock64() - delay_start < 4000000000ll);
+                    __trap();
+                }
+#else
                 do {
                     value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
                 } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+#endif
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }

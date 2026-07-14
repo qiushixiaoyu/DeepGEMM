@@ -121,9 +121,12 @@ cccl = f'{cuda_home}/include/cccl'
 if os.path.exists(cccl):
     extra_include_paths.append(cccl)
 
+nvshmem_home = os.path.join(sysconfig.get_path('purelib'), 'nvidia', 'nvshmem')
 extra_ldflags = [
     f'-L{cuda_home}/lib64',
     f'-L{os.path.join(torch_dir, "lib")}',
+    # NVSHMEM host lib — resolves nvshmemx_cumodule_init used by the JIT loader
+    f'-L{os.path.join(nvshmem_home, "lib")}', '-l:libnvshmem_host.so.3',
     '-lcudart', '-lnvrtc', '-lcublasLt', '-lcublas',
     '-ltorch', '-ltorch_cpu', '-lc10', '-lc10_cuda', '-ltorch_cuda',
 ]

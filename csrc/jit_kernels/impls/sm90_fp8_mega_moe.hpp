@@ -71,7 +71,18 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+        // Inter-node build: ranks span more than one NVLink domain (assume 8
+        // NVLink peers per node). Inject macros so barrier.cuh (and later
+        // dispatch/combine) take the NVSHMEM remote path. The `nvshmem` mention
+        // in the comment also makes the JIT compiler device-link libnvshmem_device.
+        constexpr int kNvlPeers = 8;
+        std::string internode_prefix;
+        if (args.num_ranks > kNvlPeers)
+            internode_prefix = fmt::format(
+                "// inter-node mega-moe: uses nvshmem device functions\n"
+                "#define DG_MEGA_MOE_INTERNODE\n"
+                "#define DG_MEGA_MOE_NVL_PEERS {}\n", kNvlPeers);
+        return internode_prefix + fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 
 using namespace deep_gemm;

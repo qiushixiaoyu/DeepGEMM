@@ -218,8 +218,51 @@ public:
         // Compile
         // Avoid cwd files shadowing C++ standard library headers
         const auto compile_dir = make_tmp_dir();
-        const auto command = fmt::format("cd {} && {} {} -cubin -o {} {}",
-            compile_dir.c_str(), nvcc_path.c_str(), code_path.c_str(), cubin_path.c_str(), flags);
+
+        // Kernels that use NVSHMEM (e.g. cross-node mega-moe) must device-link
+        // `libnvshmem_device.a`; all other kernels keep the original single-step
+        // `-cubin`. Trigger: the generated source `#include`s an nvshmem header.
+        const auto nvshmem_home = get_env<std::string>("DG_NVSHMEM_HOME");
+        const bool needs_nvshmem = not nvshmem_home.empty()
+                                   and code.find("nvshmem") != std::string::npos;
+        std::string command;
+        if (needs_nvshmem) {
+            // Step 1: compile to a relocatable device object (with nvshmem headers).
+            // NOTE: `--gpu-architecture=sm_90a` silently degrades the virtual target
+            // to compute_90 under `-rdc=true -dc`, which drops Hopper wgmma/tcgen05
+            // support (ptxas: "Instruction 'wgmma.fence' not supported on sm_90").
+            // Pin the accelerated virtual arch explicitly via -gencode so the
+            // relocatable PTX keeps compute_90a.
+            const auto obj_path = dir_path / "kernel.o";
+            const auto dc_flags = std::regex_replace(flags,
+                std::regex(R"(--gpu-architecture=sm_(\w+))"),
+                "-gencode arch=compute_$1,code=sm_$1");
+            // NOTE: `-rdc=true -dc` also emits a host stub (`*.cudafe1.stub.c`) in
+            // which an infinity float NTTP (e.g. kActivationClamp = inf) is demangled
+            // to the bare token `inf`, breaking host compilation ("'inf' was not
+            // declared"). The stub value is only used for host-side kernel
+            // registration and never affects the device template argument, so define
+            // `inf` on the host compiler to any finite float.
+            const auto dc_command = fmt::format("cd {} && {} {} -rdc=true -dc {} -Xcompiler=-Dinf=__FLT_MAX__ -I{}/include -o {}",
+                compile_dir.c_str(), nvcc_path.c_str(), code_path.c_str(), dc_flags, nvshmem_home, obj_path.c_str());
+            if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
+                printf("Running NVCC -dc command: %s\n", dc_command.c_str());
+            const auto [dc_rc, dc_out] = call_external_command(dc_command);
+            if (dc_rc != 0) {
+                printf("NVCC nvshmem -dc failed: %s\n", dc_out.c_str());
+                DG_HOST_ASSERT(false and "NVCC nvshmem -dc failed");
+            }
+            // Step 2: device-link libnvshmem_device.a into a cubin (-dlink only needs the arch)
+            std::string arch_flag;
+            std::smatch arch_match;
+            if (std::regex_search(flags, arch_match, std::regex(R"(--gpu-architecture=sm_\w+)")))
+                arch_flag = arch_match[0].str();
+            command = fmt::format("cd {} && {} {} -dlink {} -L{}/lib -lnvshmem_device -cubin -o {}",
+                compile_dir.c_str(), nvcc_path.c_str(), obj_path.c_str(), arch_flag, nvshmem_home, cubin_path.c_str());
+        } else {
+            command = fmt::format("cd {} && {} {} -cubin -o {} {}",
+                compile_dir.c_str(), nvcc_path.c_str(), code_path.c_str(), cubin_path.c_str(), flags);
+        }
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
             printf("Running NVCC command: %s\n", command.c_str());
         const auto [return_code, output] = call_external_command(command);
