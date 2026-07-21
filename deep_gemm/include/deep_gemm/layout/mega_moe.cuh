@@ -422,4 +422,23 @@ struct Buffer {
 static constexpr uint32_t kSM90MegaMoEProfileMaxSMs = 256;
 static constexpr uint32_t kSM90MegaMoEProfileSlots = 16;
 
+// Bounded registered source storage for SM90 internode combine.  Each
+// epilogue warp can have at most 16 row tiles in flight while processing one
+// 64-row warpgroup tile.  A per-destination-QP quiet drains those writes before
+// the same slots are reused by the next math block.
+// Keep these as enum constants rather than namespace-scope constexpr objects.
+// Buffer constructors take their dimensions by reference, and NVCC may
+// otherwise emit a device-side reference to a host-only constexpr symbol in
+// the JIT-compiled kernel.
+enum : uint32_t {
+    kSM90MegaMoERowStageMaxSMs = 256,
+    kSM90MegaMoERowStageMaxEpilogueWarps = 16,
+    kSM90MegaMoERowStageSlotsPerWarp = 16,
+    kSM90MegaMoERowStageTileBytes = 256,
+    kSM90MegaMoERowStageSlots =
+        kSM90MegaMoERowStageMaxSMs *
+        kSM90MegaMoERowStageMaxEpilogueWarps *
+        kSM90MegaMoERowStageSlotsPerWarp,
+};
+
 } // namespace deep_gemm::layout

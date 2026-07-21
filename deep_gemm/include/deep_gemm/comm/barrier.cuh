@@ -65,7 +65,9 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
                                    const uint32_t& sm_idx, const uint32_t& thread_idx,
                                    const sync_scope_t& sync_scope,
                                    const bool& sync_prologue = true,
-                                   const bool& sync_epilogue = true) {
+                                   const bool& sync_epilogue = true,
+                                   const uint32_t num_ibgda_qps_to_quiet = ~0u,
+                                   const bool quiet_nvshmem = true) {
     DG_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
 
     // Grid sync before NVLink signaling
@@ -80,15 +82,18 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
         // 的并发约束——调用侧保证此刻没有其他 warp 在用这些 QP)。公开 nvshmem_quiet()
         // 只兜底非 verbs 路径(如 sync_all 内部)。到达语义仍由 NVSHMEM collective
         // sync 承担(单线程 PE 级 barrier)。
-        {
+        if (num_ibgda_qps_to_quiet != 0) {
             const auto n_qps = ibgda::num_qps();
-            for (uint32_t i = thread_idx; i < kNumRanks * n_qps; i += kNumThreads) {
-                const auto pe = i / n_qps;
+            const auto quiet_qps = num_ibgda_qps_to_quiet < n_qps
+                ? num_ibgda_qps_to_quiet : n_qps;
+            for (uint32_t i = thread_idx; i < kNumRanks * quiet_qps; i += kNumThreads) {
+                const auto pe = i / quiet_qps;
                 if (pe / DG_MEGA_MOE_NVL_PEERS != sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS)
-                    ibgda::quiet(static_cast<int>(pe), static_cast<int>(i % n_qps));
+                    ibgda::quiet(static_cast<int>(pe), static_cast<int>(i % quiet_qps));
             }
         }
-        nvshmem_quiet();
+        if (quiet_nvshmem)
+            nvshmem_quiet();
         if (thread_idx == 0)
             nvshmem_sync_all();
         sync_scope();

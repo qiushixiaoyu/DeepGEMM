@@ -259,11 +259,11 @@ sm90_fp8_mega_moe_impl(void* y,
         combine_token_buffer.get_end_ptr());
 
 #ifdef DG_MEGA_MOE_ROW_COMBINE
-    // Each routed pool token owns a full, cache-line-aligned BF16 row.  L2
-    // epilogue lanes first coalesce their register fragments here, then one
-    // warp emits a registered 128/256-byte RDMA WRITE for the row tile.
+    // A bounded set of cache-line-aligned registered row-tile slots.  Each
+    // epilogue warp owns 16 slots while processing a math block and drains all
+    // touched destination QPs before those slots can be reused.
     constexpr auto row_combine_staging_layout = layout::Data(
-        static_cast<uint32_t>(kHidden * sizeof(nv_bfloat16)));
+        layout::kSM90MegaMoERowStageTileBytes);
 #else
     constexpr auto row_combine_staging_layout = layout::Data(0u);
 #endif
@@ -271,7 +271,7 @@ sm90_fp8_mega_moe_impl(void* y,
         reinterpret_cast<uint64_t>(dispatch_staging_buffer.get_end_ptr()),
         static_cast<uint64_t>(128)));
     const auto row_combine_staging_buffer = layout::Buffer(
-        row_combine_staging_layout, 1, kNumMaxPoolTokens,
+        row_combine_staging_layout, 1, layout::kSM90MegaMoERowStageSlots,
         row_combine_staging_base);
 
     constexpr uint32_t kPhaseProfileMaxSMs = 256;
@@ -656,11 +656,18 @@ sm90_fp8_mega_moe_impl(void* y,
             phase_profile[kProfileMetadata] = clock64() - profile_metadata_start;
         const uint64_t profile_dispatch_barrier_start = profile_dispatch_leader ? clock64() : 0;
 #endif
+        // Metadata writes only use QP IDs [0, num_tokens * top-k) for token
+        // slots and [0, local_experts) for recv counts.  Quieting that prefix
+        // covers every modulo-mapped QP they can touch without scanning the
+        // full per-PE QP table at small batches.  These writes use the direct
+        // IBGDA path, so the public NVSHMEM quiet is not needed here.
+        const uint32_t num_metadata_qps = num_tokens * kNumTopk > kNumExpertsPerRank
+            ? num_tokens * kNumTopk : kNumExpertsPerRank;
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            false, true);
+            false, true, num_metadata_qps, false);
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
         if (profile_dispatch_leader)
             phase_profile[kProfileDispatchBarrier] = clock64() - profile_dispatch_barrier_start;
@@ -959,7 +966,7 @@ sm90_fp8_mega_moe_impl(void* y,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            true, false);
+            true, false, 0, false);
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
         if (profile_dispatch_leader)
             phase_profile[kProfileCleanupBarrier] = clock64() - profile_cleanup_barrier_start;
@@ -2319,11 +2326,23 @@ sm90_fp8_mega_moe_impl(void* y,
 #endif
 #if defined(DG_MEGA_MOE_INTERNODE) && defined(DG_MEGA_MOE_ROW_COMBINE)
                 DG_STATIC_ASSERT(kNumRanks <= 32, "Row-combine quiet mask supports at most 32 ranks");
+                DG_STATIC_ASSERT(kNumSMs <= layout::kSM90MegaMoERowStageMaxSMs,
+                                 "Too many SMs for bounded row staging");
+                DG_STATIC_ASSERT(kNumEpilogueWarps <= layout::kSM90MegaMoERowStageMaxEpilogueWarps,
+                                 "Too many epilogue warps for bounded row staging");
+                DG_STATIC_ASSERT(kNumRowsPerWarp * 2 <= layout::kSM90MegaMoERowStageSlotsPerWarp,
+                                 "Insufficient bounded row-staging slots");
+                DG_STATIC_ASSERT(WG_BLOCK_N * sizeof(nv_bfloat16) <=
+                                     layout::kSM90MegaMoERowStageTileBytes,
+                                 "Row tile exceeds bounded staging slot size");
                 // Keep one QP per epilogue warp and destination PE.  All row
                 // tiles in this math block are posted first; lane 0 then quiets
                 // each touched PE exactly once.
                 const int scatter_qp_id = static_cast<int>(
                     sm_idx * kNumEpilogueWarps + epilogue_warp_idx);
+                const uint32_t row_stage_warp_base =
+                    (sm_idx * layout::kSM90MegaMoERowStageMaxEpilogueWarps +
+                     epilogue_warp_idx) * layout::kSM90MegaMoERowStageSlotsPerWarp;
                 uint32_t pending_scatter_pe_mask = 0;
                 #pragma unroll
                 for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
@@ -2357,12 +2376,13 @@ sm90_fp8_mega_moe_impl(void* y,
                             (n_idx + wg_n_offset) * sizeof(nv_bfloat16) +
                                 lane_in_row * sizeof(ScatterVec));
                         if (row_is_inter) {
+                            const uint32_t row_stage_slot =
+                                row_stage_warp_base + j * 2 + row_in_warp_block;
                             const auto staging_row = row_combine_staging_buffer
-                                .get_data_buffer(m_idx + m_idx_in_block);
+                                .get_data_buffer(row_stage_slot);
                             auto staging_ptr = math::advance_ptr<ScatterVec>(
                                 staging_row.get_base_ptr(),
-                                (n_idx + wg_n_offset) * sizeof(nv_bfloat16) +
-                                    lane_in_row * sizeof(ScatterVec));
+                                lane_in_row * sizeof(ScatterVec));
                             *staging_ptr = packed;
                             // Every source fragment must be visible to the RNIC
                             // before lane 0 rings the QP doorbell below.
@@ -2382,16 +2402,16 @@ sm90_fp8_mega_moe_impl(void* y,
                         const bool group_valid = __shfl_sync(0xffffffff, row_valid, src_lane);
                         const bool group_is_inter = __shfl_sync(0xffffffff, row_is_inter, src_lane);
                         if (group_valid and group_is_inter) {
-                            const uint32_t group_pool_token_idx = __shfl_sync(
-                                0xffffffff, m_idx + m_idx_in_block, src_lane);
                             const uint32_t group_dst_rank_idx = __shfl_sync(
                                 0xffffffff, dst_rank_idx, src_lane);
                             const uint32_t group_dst_token_idx = __shfl_sync(
                                 0xffffffff, dst_token_idx, src_lane);
                             const uint32_t group_dst_topk_idx = __shfl_sync(
                                 0xffffffff, dst_topk_idx, src_lane);
+                            const uint32_t group_stage_slot =
+                                row_stage_warp_base + j * 2 + row_group;
                             const auto group_staging_row = row_combine_staging_buffer
-                                .get_data_buffer(group_pool_token_idx);
+                                .get_data_buffer(group_stage_slot);
                             const auto group_dst_row = combine_token_buffer
                                 .get_rank_buffer(group_dst_topk_idx)
                                 .get_data_buffer(group_dst_token_idx);
@@ -2399,7 +2419,7 @@ sm90_fp8_mega_moe_impl(void* y,
                                 n_idx + wg_n_offset) * sizeof(nv_bfloat16);
                             comm::ibgda::put_nbi_warp(
                                 reinterpret_cast<uint64_t>(group_dst_row.get_base_ptr()) + byte_offset,
-                                reinterpret_cast<uint64_t>(group_staging_row.get_base_ptr()) + byte_offset,
+                                reinterpret_cast<uint64_t>(group_staging_row.get_base_ptr()),
                                 WG_BLOCK_N * sizeof(nv_bfloat16),
                                 static_cast<int>(group_dst_rank_idx), scatter_qp_id,
                                 static_cast<int>(lane_idx));
@@ -2522,8 +2542,9 @@ sm90_fp8_mega_moe_impl(void* y,
 #endif
 
         // NOTE: baseline scatter uses per-message quiet; row-combine batches one
-        // quiet per touched (epilogue warp, destination PE) QP. The barrier's
-        // per-QP scan remains a final completion backstop for both paths.
+        // quiet per touched (epilogue warp, destination PE) QP.  Consequently
+        // every internode write is already complete before this barrier and it
+        // can perform arrival synchronization without rescanning all QPs.
         // 与 dispatch 的 barrier 前 __threadfence_system 对称：把同节点 peer 的 NVLink map() scatter store
         // 在 cross-rank barrier 释放前 publish 到系统作用域，否则 peer 越过 barrier 后 gather(TMA load
         // combine_token_buffer) 会读到尚未可见/未落地的旧值。nvshmem_quiet 只 flush 本 PE 的 NVSHMEM put，
@@ -2539,7 +2560,8 @@ sm90_fp8_mega_moe_impl(void* y,
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
                              kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
             workspace, sym_buffer, sm_idx, epilogue_thread_idx,
-            [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
+            [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); },
+            true, true, 0, false
         );
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
         if (profile_math_leader)

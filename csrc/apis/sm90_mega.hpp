@@ -229,7 +229,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
         math::align(static_cast<uint32_t>(hidden / 32 + sizeof(float)), 128u));
     const bool use_row_combine = get_env<int>("DG_MEGA_MOE_ROW_COMBINE", 0) != 0;
     const auto row_combine_staging_layout = layout::Data(
-        use_row_combine ? math::align(static_cast<uint32_t>(hidden * 2), 128u) : 0u);
+        use_row_combine ? layout::kSM90MegaMoERowStageTileBytes : 0u);
 
     const auto input_token_buffer = layout::Buffer(
         fp8_token_layout, 1, num_max_tokens_per_rank,
@@ -280,7 +280,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
         reinterpret_cast<uint64_t>(dispatch_staging_buffer.get_end_ptr()),
         static_cast<uint64_t>(128)));
     const auto row_combine_staging_buffer = layout::Buffer(
-        row_combine_staging_layout, 1, num_max_pool_tokens,
+        row_combine_staging_layout, 1, layout::kSM90MegaMoERowStageSlots,
         row_combine_staging_base);
     const auto phase_profile_buffer = layout::Buffer(
         layout::Data(layout::kSM90MegaMoEProfileSlots * sizeof(uint64_t), false),
