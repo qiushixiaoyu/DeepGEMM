@@ -7,6 +7,7 @@ weight construction/quantization and process-group startup at every point.
 
 import argparse
 import math
+import os
 import random
 
 import torch
@@ -36,6 +37,13 @@ def _print_rank0(rank: int, message: str) -> None:
 
 
 def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None:
+    if args.row_combine:
+        os.environ["DG_MEGA_MOE_ROW_COMBINE"] = "1"
+    if args.phase_profile:
+        if args.path != "fused":
+            raise RuntimeError("--phase-profile requires --path fused")
+        os.environ["DG_MEGA_MOE_PHASE_PROFILE"] = "1"
+
     rank, world_size, group = base.init_dist(local_rank, num_local_ranks)
     torch.manual_seed(20260721 + rank)
     random.seed(20260721 + rank)
@@ -68,6 +76,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         f"[CONFIG] model={args.model_name} mode={args.mode} path={args.path} world_size={world_size} "
         f"hidden={hidden} intermediate={intermediate} experts={num_experts} "
         f"topk={topk} local_experts={local_experts} batches={','.join(map(str, batches))} "
+        f"row_combine={int(args.row_combine)} "
         f"warmup={args.num_warmup} repeat={args.num_repeat} "
         f"fused_tests={args.num_bench_tests} l2_flush_gb={args.l2_flush_gb}",
     )
@@ -185,6 +194,20 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
                 fast_math=bool(args.fast_math),
             )
             return fused_out
+
+        if args.phase_profile:
+            # The first launch can include per-rank JIT and CUDA context skew,
+            # which is observed by the kernel's global dispatch barrier.  Warm
+            # every rank first, then profile a synchronized steady-state launch.
+            run_fused()
+            torch.cuda.synchronize()
+            dist.barrier()
+            _print_rank0(rank, f"[PROFILE_WARMUP_DONE] model={args.model_name} batch={batch}")
+            run_fused()
+            torch.cuda.synchronize()
+            dist.barrier()
+            _print_rank0(rank, f"[PROFILE_POINT] model={args.model_name} batch={batch}")
+            continue
 
         if args.mode == "normal" and need_deep_ep:
             def run_deep_ep():
@@ -346,6 +369,16 @@ if __name__ == "__main__":
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--mode", choices=("low_latency", "normal"), required=True)
     parser.add_argument("--path", choices=("both", "fused", "deep_ep"), default="both")
+    parser.add_argument(
+        "--phase-profile",
+        action="store_true",
+        help="run each fused point once with device-side phase cycle profiling",
+    )
+    parser.add_argument(
+        "--row-combine",
+        action="store_true",
+        help="use symmetric row staging and warp-cooperative internode combine writes",
+    )
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument("--intermediate-hidden", type=int, required=True)
     parser.add_argument("--num-experts", type=int, required=True)
