@@ -222,6 +222,11 @@ get_symm_buffer_size_for_sm90_mega_moe(
     const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
     const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
     const auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
+    // Inter-node dispatch pulls SF and routing weight into one cache-line-isolated
+    // row per pool token.  Keeping this storage separate from the combine buffer
+    // prevents RNIC writes from aliasing cache lines later consumed by combine.
+    const auto dispatch_staging_layout = layout::Data(
+        math::align(static_cast<uint32_t>(hidden / 32 + sizeof(float)), 128u));
 
     const auto input_token_buffer = layout::Buffer(
         fp8_token_layout, 1, num_max_tokens_per_rank,
@@ -265,6 +270,9 @@ get_symm_buffer_size_for_sm90_mega_moe(
     const auto combine_token_buffer = layout::Buffer(
         bf16_token_layout, num_topk, num_max_tokens_per_rank,
         l2_sf_buffer.get_end_ptr());
+    const auto dispatch_staging_buffer = layout::Buffer(
+        dispatch_staging_layout, 1, num_max_pool_tokens,
+        combine_token_buffer.get_end_ptr());
 
     DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
 
@@ -305,7 +313,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
             torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
         return std::make_tuple(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
     };
-    return {reinterpret_cast<int64_t>(combine_token_buffer.get_end_ptr()), slice_input_buffers};
+    return {reinterpret_cast<int64_t>(dispatch_staging_buffer.get_end_ptr()), slice_input_buffers};
 }
 
 static void fp8_mega_moe(

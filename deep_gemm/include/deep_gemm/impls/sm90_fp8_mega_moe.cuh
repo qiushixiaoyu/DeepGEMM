@@ -231,6 +231,8 @@ sm90_fp8_mega_moe_impl(void* y,
     constexpr auto input_topk_idx_layout         = layout::Data(kNumTopk * sizeof(int64_t), false);
     constexpr auto input_topk_weights_layout     = layout::Data(kNumTopk * sizeof(float), false);
     constexpr auto l1_topk_weights_layout        = layout::Data(sizeof(float), false);
+    constexpr auto dispatch_staging_layout       = layout::Data(
+        math::constexpr_align<uint32_t>(kHidden / 32 + sizeof(float), 128u));
 
     // Registered input area
     const auto input_token_buffer        = layout::Buffer(fp8_token_layout, 1, kNumMaxTokensPerRank, workspace.get_end_ptr());
@@ -249,6 +251,12 @@ sm90_fp8_mega_moe_impl(void* y,
 
     // Combine input area
     const auto combine_token_buffer = layout::Buffer(bf16_token_layout, kNumTopk, kNumMaxTokensPerRank, l2_sf_buffer.get_end_ptr());
+
+    // Inter-node SF/weight staging area. Each pool token owns a separate,
+    // cache-line-aligned row; it never aliases the later combine destination.
+    const auto dispatch_staging_buffer = layout::Buffer(
+        dispatch_staging_layout, 1, kNumMaxPoolTokens,
+        combine_token_buffer.get_end_ptr());
 
     // =====================================================================
     // GEMM data types and shape constants
@@ -687,14 +695,12 @@ sm90_fp8_mega_moe_impl(void* y,
                 // (RDMA READ) instead of NVLink P2P. Decided once per pulled token.
                 const bool tok_is_inter =
                     current_rank_in_expert_idx / DG_MEGA_MOE_NVL_PEERS != sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS;
-                // 每 warp 一个专属 qp，配 quiet 构成阻塞读。SF/weight 是小载荷，先 READ 进
-                // per-warp 暂存行(复用 combine_token_buffer 的 topk0 槽：barrier817 是全局
-                // 屏障，任何 rank 的 combine scatter 都在所有 rank 的 pull 结束之后才发生，
-                // 故 pull 期间该区域空闲)，随后由本 warp 拷入转置布局。
+                // 每 warp 一个专属 QP，配 quiet 构成阻塞读。SF/weight 先 READ 进
+                // pool-token 专属的 cache-line 对齐暂存行，再由本 warp 拷入转置布局。
+                // 暂存区独立于 combine，避免 RNIC scatter 与 GPU L2 cache line 混用。
                 const int inter_qp_id = static_cast<int>(sm_idx * kNumDispatchWarps + warp_idx);
-                const auto inter_staging = reinterpret_cast<float*>(
-                    combine_token_buffer.get_rank_buffer(0)
-                        .get_data_buffer(sm_idx * kNumDispatchWarps + warp_idx).get_base_ptr());
+                const auto inter_staging = dispatch_staging_buffer
+                    .get_data_buffer(pool_token_idx).get_base_ptr<float>();
 #endif
 
                 // Pull token data. Overlap a remote TMA load with SF copy and
@@ -746,10 +752,13 @@ sm90_fp8_mega_moe_impl(void* y,
                     const uint32_t j = i * 32 + lane_idx;
                     if (j < kNumSFFloats) {
 #ifdef DG_MEGA_MOE_INTERNODE
-                        // Inter-node: SF 已由 RDMA READ 落进 per-warp 暂存行；__ldcg 绕过
-                        // L1(暂存行跨 token 复用，防读到上一个 token 的陈旧缓存行)。
+                        // Inter-node: SF 已由 RDMA READ 落进 pool-token 专属暂存行。
+                        // SymmBuffer allocation zeroes the entire buffer before launch, so
+                        // the cache line may already reside in L2 when the RNIC overwrites
+                        // it. `ld.global.cv` invalidates the matching L2 line and refetches
+                        // the system-memory value written before the per-QP quiet completed.
                         const float sf_val = tok_is_inter
-                            ? __ldcg(inter_staging + j)
+                            ? __ldcv(inter_staging + j)
                             : remote_sf_ptr[j];
                         local_sf_ptr[j * kNumPaddedSFPoolTokens + sf_pool_token_idx] = sf_val;
 #else
@@ -765,7 +774,7 @@ sm90_fp8_mega_moe_impl(void* y,
 #ifdef DG_MEGA_MOE_INTERNODE
                     // Inter-node: 路由权重已随 SF 一起 READ 进暂存行(紧跟 SF 之后)。
                     const float weight = tok_is_inter
-                        ? __ldcg(inter_staging + kHidden / 128)
+                        ? __ldcv(inter_staging + kHidden / 128)
                         : *sym_buffer.map(weight_local_ptr, current_rank_in_expert_idx);
 #else
                     const float weight = *sym_buffer.map(weight_local_ptr, current_rank_in_expert_idx);

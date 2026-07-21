@@ -691,11 +691,13 @@ class _DeepEPHandle:
 class _DeepEPBufferCompat:
     """Compatibility shim for newer DeepEP versions that expose Buffer, not ElasticBuffer."""
 
-    def __init__(self, deep_ep, group, num_nvl_bytes: int):
+    def __init__(
+        self, deep_ep, group, num_nvl_bytes: int, num_rdma_bytes: int = 0
+    ):
         self.buffer = deep_ep.Buffer(
             group,
             num_nvl_bytes=num_nvl_bytes,
-            num_rdma_bytes=0,
+            num_rdma_bytes=num_rdma_bytes,
             explicitly_destroy=True,
         )
 
@@ -750,9 +752,31 @@ def _make_deep_ep_buffer(deep_ep, group, num_max_tokens_per_rank, hidden, num_to
             explicitly_destroy=True,
             allow_multiple_reduction=False,
         )
-    nvl_alignment = 2 * 1024 * 1024
-    num_nvl_bytes = ((int(sym_buffer_bytes) + nvl_alignment - 1) // nvl_alignment) * nvl_alignment
-    return _DeepEPBufferCompat(deep_ep, group, num_nvl_bytes=num_nvl_bytes)
+    # Match sglang's DeepEPBuffer sizing.  Reusing the fused SymmBuffer byte
+    # count is over-conservative and can exceed DeepEP's signed-32-bit NVLink
+    # buffer limit for large token capacities (for example max_tokens=8192).
+    # The dispatch payload is FP8, but combine sends BF16 expert outputs.  The
+    # buffer hint must cover the larger of the two payloads, matching sglang's
+    # use of the model parameter dtype size for normal DeepEP mode.
+    hidden_bytes = hidden * 2
+    configs = (
+        deep_ep.Buffer.get_dispatch_config(group.size()),
+        deep_ep.Buffer.get_combine_config(group.size()),
+    )
+    num_nvl_bytes = max(
+        config.get_nvl_buffer_size_hint(hidden_bytes, group.size())
+        for config in configs
+    )
+    num_rdma_bytes = max(
+        config.get_rdma_buffer_size_hint(hidden_bytes, group.size())
+        for config in configs
+    )
+    return _DeepEPBufferCompat(
+        deep_ep,
+        group,
+        num_nvl_bytes=num_nvl_bytes,
+        num_rdma_bytes=num_rdma_bytes,
+    )
 
 
 def _make_deep_ep_low_latency_buffer(
