@@ -136,14 +136,6 @@ struct Workspace {
         return math::advance_ptr<int>(base, (kNumMaxGridSyncCounters + 1) * sizeof(uint32_t) + phase * sizeof(int));
     }
 
-    // Inter-node barrier uses an 8-byte-aligned uint64 signal (NVSHMEM signal API
-    // type). Placed at offset 24 in the 32-byte barrier region: 4 grid-sync
-    // counters (16B) + 1 barrier counter (4B) + 4B pad, leaving [24, 32).
-    CUTLASS_DEVICE
-    uint64_t* get_nvl_barrier_signal_u64_ptr() const {
-        return math::advance_ptr<uint64_t>(base, 24);
-    }
-
     CUTLASS_DEVICE
     uint64_t* get_expert_send_count_ptr(const uint32_t& expert_idx = 0) const {
         return math::advance_ptr<uint64_t>(base, kNumBarrierSignalBytes) + expert_idx;
@@ -281,12 +273,6 @@ struct SM90Workspace {
             base, (kNumMaxGridSyncCounters + 1) * sizeof(uint32_t) + phase * sizeof(int));
     }
 
-    // Inter-node barrier uint64 signal (NVSHMEM signal API), 8B-aligned at offset 24.
-    CUTLASS_DEVICE
-    uint64_t* get_nvl_barrier_signal_u64_ptr() const {
-        return math::advance_ptr<uint64_t>(base, 24);
-    }
-
     CUTLASS_DEVICE
     uint64_t* get_expert_send_count_ptr(const uint32_t& expert_idx = 0) const {
         return math::advance_ptr<uint64_t>(base, kNumBarrierSignalBytes) + expert_idx;
@@ -414,31 +400,6 @@ struct Buffer {
             math::advance_ptr(base, data_layout.get_num_bytes<uint64_t>() * token_idx)
         );
     }
-};
-
-// Optional SM90 phase-profiler storage.  The allocation is always present so
-// toggling the JIT-only profiler does not change any public API or tensor
-// slicing.  Production kernels never touch these bytes.
-static constexpr uint32_t kSM90MegaMoEProfileMaxSMs = 256;
-static constexpr uint32_t kSM90MegaMoEProfileSlots = 16;
-
-// Bounded registered source storage for SM90 internode combine.  Each
-// epilogue warp can have at most 16 row tiles in flight while processing one
-// 64-row warpgroup tile.  A per-destination-QP quiet drains those writes before
-// the same slots are reused by the next math block.
-// Keep these as enum constants rather than namespace-scope constexpr objects.
-// Buffer constructors take their dimensions by reference, and NVCC may
-// otherwise emit a device-side reference to a host-only constexpr symbol in
-// the JIT-compiled kernel.
-enum : uint32_t {
-    kSM90MegaMoERowStageMaxSMs = 256,
-    kSM90MegaMoERowStageMaxEpilogueWarps = 16,
-    kSM90MegaMoERowStageSlotsPerWarp = 16,
-    kSM90MegaMoERowStageTileBytes = 256,
-    kSM90MegaMoERowStageSlots =
-        kSM90MegaMoERowStageMaxSMs *
-        kSM90MegaMoERowStageMaxEpilogueWarps *
-        kSM90MegaMoERowStageSlotsPerWarp,
 };
 
 } // namespace deep_gemm::layout

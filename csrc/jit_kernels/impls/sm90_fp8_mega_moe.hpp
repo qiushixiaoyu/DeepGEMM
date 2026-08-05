@@ -82,10 +82,6 @@ public:
                 "// inter-node mega-moe: uses nvshmem device functions\n"
                 "#define DG_MEGA_MOE_INTERNODE\n"
                 "#define DG_MEGA_MOE_NVL_PEERS {}\n", kNvlPeers);
-        if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE", 0) != 0)
-            internode_prefix += "#define DG_MEGA_MOE_PHASE_PROFILE 1\n";
-        if (get_env<int>("DG_MEGA_MOE_ROW_COMBINE", 0) != 0)
-            internode_prefix += "#define DG_MEGA_MOE_ROW_COMBINE 1\n";
         return internode_prefix + fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 

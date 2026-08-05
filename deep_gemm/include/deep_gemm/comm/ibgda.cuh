@@ -20,7 +20,7 @@
 //   - 仅用于跨节点 PE(同节点走 NVLink P2P store，不经此文件)；
 //   - qp_id 任意 int，内部对 num_rc_per_pe*num_devices 取模；调用方应让并发流量
 //     分摊到不同 qp_id 上，保证两次 quiet 之间单 QP 在途 WQE < NVSHMEM_QP_DEPTH
-//     (部署要求 NVSHMEM_QP_DEPTH=1024，与 DeepEP 相同——本实现不检查 ring 溢出)；
+//     (压力场景使用 NVSHMEM_QP_DEPTH=4096；本实现不检查 ring 溢出)；
 //   - 阻塞式读 = get_thread + quiet(同一 pe/qp)。
 
 #pragma once
@@ -28,8 +28,6 @@
 #include <nvshmem.h>
 #include <device_host_transport/nvshmem_common_ibgda.h>
 #include <non_abi/device/threadgroup/nvshmemi_common_device_defines.cuh>
-
-#include <cuda/std/limits>
 
 namespace deep_gemm::comm::ibgda {
 
@@ -123,12 +121,6 @@ __device__ static __forceinline__ void st_na_release(const uint64_t* ptr, uint64
 
 typedef struct mlx5_wqe_ctrl_seg __attribute__((__aligned__(8))) ibgda_ctrl_seg_t;
 
-typedef struct {
-    uint32_t add_data;
-    uint32_t field_boundary;
-    uint64_t reserved;
-} __attribute__((__packed__)) ibgda_atomic_32_masked_fa_seg_t;
-
 __device__ static __forceinline__ nvshmemi_ibgda_device_state_t* ibgda_get_state() {
     return &nvshmemi_ibgda_device_state_d;
 }
@@ -194,11 +186,9 @@ __device__ static __forceinline__ void ibgda_post_send(nvshmemi_ibgda_device_qp_
     ibgda_lock_release(&mvars->post_send_lock);
 }
 
-template <bool kAlwaysDoPostSend>
 __device__ static __forceinline__ void ibgda_submit_requests(nvshmemi_ibgda_device_qp_t* qp,
                                                              uint64_t base_wqe_idx,
-                                                             uint32_t num_wqes,
-                                                             int message_idx = 0) {
+                                                             uint32_t num_wqes) {
     auto state = ibgda_get_state();
     nvshmemi_ibgda_device_qp_management_t* mvars = &qp->mvars;
     uint64_t new_wqe_idx = base_wqe_idx + num_wqes;
@@ -213,11 +203,8 @@ __device__ static __forceinline__ void ibgda_submit_requests(nvshmemi_ibgda_devi
     while (atomicCAS(ready_idx, base_wqe_idx, new_wqe_idx) != base_wqe_idx)
         ;
 
-    if (!state->use_async_postsend) {
-        constexpr int kNumRequestInBatch = 4;
-        if (kAlwaysDoPostSend or (message_idx + 1) % kNumRequestInBatch == 0)
-            ibgda_post_send(qp, new_wqe_idx);
-    }
+    if (!state->use_async_postsend)
+        ibgda_post_send(qp, new_wqe_idx);
 }
 
 // ---------------------------------------------------------------------------
@@ -319,41 +306,6 @@ __device__ static __forceinline__ void ibgda_write_rdma_write_inl_wqe(
         st_na_relaxed(wqe_data_ptr + i, val[i]);
 }
 
-// 普通(带 lkey 的)RDMA WRITE WQE (DeepEP 原样)
-__device__ static __forceinline__ void ibgda_write_rdma_write_wqe(nvshmemi_ibgda_device_qp_t* qp,
-                                                                  uint64_t laddr,
-                                                                  __be32 lkey,
-                                                                  uint64_t raddr,
-                                                                  __be32 rkey,
-                                                                  uint32_t bytes,
-                                                                  uint16_t wqe_idx,
-                                                                  void** out_wqes) {
-    ibgda_ctrl_seg_t ctrl_seg;
-    struct mlx5_wqe_raddr_seg raddr_seg;
-    struct mlx5_wqe_data_seg data_seg;
-
-    auto* ctrl_seg_ptr = reinterpret_cast<ibgda_ctrl_seg_t*>(out_wqes[0]);
-    auto* raddr_seg_ptr = reinterpret_cast<mlx5_wqe_raddr_seg*>(reinterpret_cast<uintptr_t>(ctrl_seg_ptr) + sizeof(*ctrl_seg_ptr));
-    auto* data_seg_ptr = reinterpret_cast<mlx5_wqe_data_seg*>(reinterpret_cast<uintptr_t>(raddr_seg_ptr) + sizeof(*raddr_seg_ptr));
-
-    raddr_seg.raddr = HtoBE64(raddr);
-    raddr_seg.rkey = rkey;
-    raddr_seg.reserved = 0;
-
-    data_seg.byte_count = HtoBE32(bytes);
-    data_seg.lkey = lkey;
-    data_seg.addr = HtoBE64(laddr);
-
-    ctrl_seg = {0};
-    ctrl_seg.qpn_ds = HtoBE32((qp->qpn << 8) | 3);
-    ctrl_seg.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
-    ctrl_seg.opmod_idx_opcode = HtoBE32((wqe_idx << 8) | MLX5_OPCODE_RDMA_WRITE);
-
-    st_na_relaxed(reinterpret_cast<int4*>(ctrl_seg_ptr), *reinterpret_cast<const int4*>(&ctrl_seg));
-    st_na_relaxed(reinterpret_cast<int4*>(raddr_seg_ptr), *reinterpret_cast<const int4*>(&raddr_seg));
-    st_na_relaxed(reinterpret_cast<int4*>(data_seg_ptr), *reinterpret_cast<const int4*>(&data_seg));
-}
-
 // RDMA READ WQE：与 WRITE 同构，opcode 换 RDMA_READ；raddr = 远端【源】，data seg = 本地【目的】。
 __device__ static __forceinline__ void ibgda_write_rdma_read_wqe(nvshmemi_ibgda_device_qp_t* qp,
                                                                  uint64_t laddr,
@@ -408,50 +360,7 @@ __device__ static __forceinline__ void put_inline(T* rptr, const T& value, int d
     ibgda_write_rdma_write_inl_wqe<sizeof(T)>(
         qp, reinterpret_cast<const uint32_t*>(&value), raddr, rkey, static_cast<uint16_t>(base_wqe_idx), &wqe_ptrs);
 
-    ibgda_submit_requests<true>(qp, base_wqe_idx, 1);
-}
-
-// warp 协作 buffer RDMA WRITE (DeepEP 原样)：req_lptr 必须位于对称堆内(需 lkey)。
-template <bool kAlwaysDoPostSend = true>
-__device__ static __forceinline__ void put_nbi_warp(
-    uint64_t req_rptr, uint64_t req_lptr, size_t bytes, int dst_pe, int qp_id, int lane_id, int message_idx = 0) {
-    uint32_t num_wqes = 0;
-    __be32 my_lkey = 0;
-    uint64_t my_laddr = 0;
-    __be32 my_rkey = 0;
-    uint64_t my_raddr = 0;
-    uint64_t my_chunk_size = 0;
-
-    auto qp = ibgda_get_rc(dst_pe, qp_id);
-
-    auto remaining_bytes = bytes;
-    while (remaining_bytes > 0) {
-        if (lane_id == static_cast<int>(num_wqes)) {
-            my_chunk_size = min(remaining_bytes,
-                                ibgda_get_lkey_and_rkey(my_laddr = req_lptr, &my_lkey, req_rptr, dst_pe, &my_raddr, &my_rkey, qp->dev_idx));
-        }
-        auto chunk_size = __shfl_sync(0xffffffff, my_chunk_size, static_cast<int>(num_wqes));
-        remaining_bytes -= chunk_size;
-        req_lptr += chunk_size;
-        req_rptr += chunk_size;
-        ++ num_wqes;
-    }
-
-    uint64_t base_wqe_idx = 0;
-    if (lane_id == 0)
-        base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes);
-    base_wqe_idx = __shfl_sync(0xffffffff, base_wqe_idx, 0);
-    if (lane_id < static_cast<int>(num_wqes)) {
-        auto wqe_idx = base_wqe_idx + lane_id;
-        auto wqe_ptr = ibgda_get_wqe_ptr(qp, wqe_idx);
-        ibgda_write_rdma_write_wqe(qp, my_laddr, my_lkey, my_raddr, my_rkey, my_chunk_size,
-                                   static_cast<uint16_t>(wqe_idx), &wqe_ptr);
-    }
-    __syncwarp();
-
-    if (lane_id == 0)
-        ibgda_submit_requests<kAlwaysDoPostSend>(qp, base_wqe_idx, num_wqes, message_idx);
-    __syncwarp();
+    ibgda_submit_requests(qp, base_wqe_idx, 1);
 }
 
 // 单线程 RDMA READ(非阻塞发起)：laddr 本地目的(须在对称堆内)，raddr 本地对称地址
@@ -470,68 +379,12 @@ __device__ static __forceinline__ void get_thread(uint64_t laddr, uint64_t raddr
         void* wqe_ptr = ibgda_get_wqe_ptr(qp, wqe_idx);
         ibgda_write_rdma_read_wqe(qp, laddr, lkey, real_raddr, rkey, static_cast<uint32_t>(chunk),
                                   static_cast<uint16_t>(wqe_idx), &wqe_ptr);
-        ibgda_submit_requests<true>(qp, wqe_idx, 1);
+        ibgda_submit_requests(qp, wqe_idx, 1);
 
         laddr += chunk;
         raddr += chunk;
         bytes -= chunk;
     }
-}
-
-// NIC 32-bit 原子加 (DeepEP 原样；同一地址不得与 GPU 原生 atomic 混用)
-__device__ static __forceinline__ void amo_nonfetch_add(void* rptr, const int& value, int pe, int qp_id) {
-    nvshmemi_ibgda_device_qp_t* qp = ibgda_get_rc(pe, qp_id);
-
-    __be32 rkey;
-    uint64_t raddr;
-    ibgda_get_rkey(reinterpret_cast<uint64_t>(rptr), pe, &raddr, &rkey, qp->dev_idx);
-
-    uint64_t my_wqe_idx = ibgda_reserve_wqe_slots(qp, 1);
-    void* wqe_ptrs = ibgda_get_wqe_ptr(qp, my_wqe_idx);
-
-    ibgda_ctrl_seg_t ctrl_seg = {0};
-    struct mlx5_wqe_raddr_seg raddr_seg;
-    struct mlx5_wqe_atomic_seg atomic_seg_1;
-    struct mlx5_wqe_data_seg data_seg;
-
-    auto ctrl_seg_ptr = reinterpret_cast<ibgda_ctrl_seg_t*>(wqe_ptrs);
-    auto raddr_seg_ptr = reinterpret_cast<mlx5_wqe_raddr_seg*>(reinterpret_cast<uintptr_t>(ctrl_seg_ptr) + sizeof(*ctrl_seg_ptr));
-    auto atomic_seg_ptr = reinterpret_cast<mlx5_wqe_atomic_seg*>(reinterpret_cast<uintptr_t>(raddr_seg_ptr) + sizeof(*raddr_seg_ptr));
-    auto data_seg_ptr = reinterpret_cast<mlx5_wqe_data_seg*>(reinterpret_cast<uintptr_t>(atomic_seg_ptr) + sizeof(*atomic_seg_ptr));
-
-    raddr_seg.raddr = HtoBE64(raddr);
-    raddr_seg.rkey = rkey;
-    raddr_seg.reserved = 0;
-
-    // `0x08000000` = IBGDA_4_BYTE_EXT_AMO_OPMOD
-    ctrl_seg.opmod_idx_opcode = HtoBE32(MLX5_OPCODE_ATOMIC_MASKED_FA | (static_cast<uint16_t>(my_wqe_idx) << 8) | 0x08000000);
-    auto atomic_32_masked_fa_seg = reinterpret_cast<ibgda_atomic_32_masked_fa_seg_t*>(&atomic_seg_1);
-    atomic_32_masked_fa_seg->add_data = HtoBE32(value);
-    atomic_32_masked_fa_seg->field_boundary = 0;
-
-    ctrl_seg.qpn_ds = HtoBE32((qp->qpn << 8) | 4);
-    ctrl_seg.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
-
-    data_seg.byte_count = HtoBE32(sizeof(int));
-    data_seg.lkey = qp->ibuf.lkey;
-    data_seg.addr = HtoBE64(reinterpret_cast<uint64_t>(qp->ibuf.buf));
-
-    st_na_relaxed(reinterpret_cast<int4*>(ctrl_seg_ptr), *reinterpret_cast<int4*>(&ctrl_seg));
-    st_na_relaxed(reinterpret_cast<int4*>(raddr_seg_ptr), *reinterpret_cast<int4*>(&raddr_seg));
-    st_na_relaxed(reinterpret_cast<int4*>(atomic_seg_ptr), *reinterpret_cast<int4*>(&atomic_seg_1));
-    st_na_relaxed(reinterpret_cast<int4*>(data_seg_ptr), *reinterpret_cast<int4*>(&data_seg));
-
-    ibgda_submit_requests<true>(qp, my_wqe_idx, 1);
-}
-
-// P2P 直通地址(同节点 NVLink peer 返回可解引用 VA，跨节点返回 0)
-__device__ static __forceinline__ uint64_t get_p2p_ptr(const uint64_t& ptr, const int& rank, const int& dst_rank) {
-    if (rank == dst_rank)
-        return ptr;
-    auto peer_base = __ldg(reinterpret_cast<uint64_t*>(nvshmemi_device_state_d.peer_heap_base_p2p) + dst_rank);
-    if (peer_base == 0)
-        return 0;
-    return peer_base + (ptr - reinterpret_cast<uint64_t>(nvshmemi_device_state_d.heap_base));
 }
 
 // CQ poll (相对 DeepEP：cons_idx 用 atomicMax 更新，允许多 warp 并发 quiet 同一 QP。
