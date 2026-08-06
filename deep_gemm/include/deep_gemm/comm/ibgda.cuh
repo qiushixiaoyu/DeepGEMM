@@ -446,6 +446,29 @@ __device__ static __forceinline__ void put_inline(T* rptr, const T& value, int d
     ibgda_submit_requests(qp, base_wqe_idx, 1);
 }
 
+// Credit-aware inline WRITE for completion notifications sharing a busy data
+// QP.  The notification must be reserved after all earlier data WQEs and must
+// not overwrite an in-flight ring slot when a long expert fan-in wraps the QP.
+template <typename T>
+__device__ static __forceinline__ void put_inline_with_credit(
+    T* rptr, const T& value, int dst_pe, int qp_id) {
+    static_assert(sizeof(T) == 4 or sizeof(T) == 8 or sizeof(T) == 16,
+                  "Unsupported inline size");
+    __be32 rkey;
+    uint64_t raddr;
+    auto qp = ibgda_get_rc(dst_pe, qp_id);
+    ibgda_get_rkey(
+        reinterpret_cast<uint64_t>(rptr), dst_pe, &raddr, &rkey, qp->dev_idx);
+
+    const uint64_t base_wqe_idx = ibgda_reserve_wqe_slots_with_credit(qp, 1);
+    void* wqe_ptr = ibgda_get_wqe_ptr(qp, base_wqe_idx);
+    ibgda_write_rdma_write_inl_wqe<sizeof(T)>(
+        qp, reinterpret_cast<const uint32_t*>(&value), raddr, rkey,
+        static_cast<uint16_t>(base_wqe_idx), &wqe_ptr);
+
+    ibgda_submit_requests(qp, base_wqe_idx, 1);
+}
+
 // Warp-cooperative registered HBM WRITE.  A row that crosses registration
 // chunks may use several WQEs, but they are reserved contiguously and posted by
 // one doorbell only after every lane-owned WQE is ready.

@@ -144,6 +144,7 @@ template <
     bool kL2EpilogueRequiresFullSync,
     bool kSplitPhaseHotPath,
     bool kCombineFullRow,
+    bool kCombineExpertReady,
     bool kFP8SwapAB = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -189,6 +190,10 @@ sm90_fp8_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(BLOCK_N == 128 or BLOCK_N == 256 or BLOCK_N == 512,
                      "SM90 MegaMoE supports CTA BLOCK_N=128/256/512");
     DG_STATIC_ASSERT(BLOCK_K == 128, "BLOCK_K is fixed to 128 (per-128 SF)");
+    DG_STATIC_ASSERT(not kCombineExpertReady or kCombineFullRow,
+                     "Per-expert ready requires full-row combine staging");
+    DG_STATIC_ASSERT(not kCombineExpertReady or kNumRanks <= 64,
+                     "Per-expert destination mask supports at most 64 ranks");
 
     // =====================================================================
     // Thread / warp identification
@@ -308,7 +313,7 @@ sm90_fp8_mega_moe_impl(void* y,
         kProfileL2BlockCount = 14,
         kProfileScatterWriteCount = 15,
         kProfileStartClock = 16,
-        kProfileReserved = 17,
+        kProfileCombineReadyWait = 17,
     };
     auto phase_profile = phase_profile_buffer.get_data_buffer(sm_idx)
         .get_base_ptr<unsigned long long>();
@@ -461,6 +466,13 @@ sm90_fp8_mega_moe_impl(void* y,
     if (thread_idx == 0)
         phase_profile[kProfileStartClock] = clock64();
 #endif
+    if constexpr (kCombineExpertReady) {
+        // Collective calls advance in lock-step across ranks.  The persistent
+        // 64-bit epoch lets receivers distinguish this launch from stale ready
+        // notifications without clearing the ready array between invocations.
+        if (sm_idx == 0 and thread_idx == 0)
+            ptx::atomic_add_sys(workspace.get_combine_launch_epoch_ptr(), 1ull);
+    }
     if (warp_idx == 0) {
         // Clean expert-count shared memory
         #pragma unroll
@@ -951,6 +963,13 @@ sm90_fp8_mega_moe_impl(void* y,
                 expert_pool_block_offset = scheduler.get_pool_block_offset(i);
 
                 ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+
+                if constexpr (kCombineExpertReady) {
+                    if (thread_idx == 0) {
+                        *workspace.get_combine_posted_block_count_ptr(i) = 0;
+                        *workspace.get_combine_dst_rank_mask_ptr(i) = 0;
+                    }
+                }
 
                 DG_STATIC_ASSERT(kNumDispatchWarps >= 2, "Not enough dispatch warps");
                 if (warp_idx == 0) {
@@ -2268,9 +2287,10 @@ sm90_fp8_mega_moe_impl(void* y,
                 const uint32_t cols_per_lane = WG_BLOCK_N / 16;
 
                 if constexpr (kCombineFullRow) {
-                    // Dispatch no longer uses these two shared words after its
+                    // Dispatch no longer uses these shared words after its
                     // pre-pull rendezvous.  Reuse them as CTA-local flags so
-                    // local-only pool blocks can bypass the arrival/send path.
+                    // legacy full-row mode can bypass the arrival/send path
+                    // for local-only pool blocks.
                     if (epilogue_thread_idx == 0) {
                         smem_expert_count[0] = 0;  // contains a remote row
                         smem_expert_count[1] = 0;  // this CTA is last producer
@@ -2417,7 +2437,8 @@ sm90_fp8_mega_moe_impl(void* y,
                     // completed its HBM fragments.  The system-scope acq_rel
                     // RMW makes the final CTA acquire all earlier producers.
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                    if (epilogue_thread_idx == 0 and smem_expert_count[0] != 0) {
+                    if (epilogue_thread_idx == 0 and
+                        (smem_expert_count[0] != 0 or kCombineExpertReady)) {
                         const auto arrival_ptr = combine_full_row_arrival_buffer
                             .get_data_buffer(pool_block_idx)
                             .get_base_ptr<uint32_t>();
@@ -2461,6 +2482,71 @@ sm90_fp8_mega_moe_impl(void* y,
                         }
                     }
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+
+                    if constexpr (kCombineExpertReady) {
+                        // Every M block, including a local-only block, reaches
+                        // this point after all of its N blocks have published.
+                        // Aggregate the source ranks touched by the expert and
+                        // let the last M block emit one ready notification per
+                        // destination rank.
+                        if (epilogue_thread_idx == 0 and smem_expert_count[1] != 0) {
+                            uint64_t block_dst_rank_mask = 0;
+                            for (uint32_t row = 0; row < valid_m; ++ row) {
+                                const auto src_metadata =
+                                    *workspace.get_token_src_metadata_ptr(m_idx + row);
+                                block_dst_rank_mask |= 1ull << src_metadata.rank_idx;
+                            }
+
+                            const auto dst_rank_mask_ptr =
+                                workspace.get_combine_dst_rank_mask_ptr(local_expert_idx);
+                            ptx::red_or_rel_gpu(dst_rank_mask_ptr, block_dst_rank_mask);
+                            __threadfence();
+
+                            const auto posted_block_count_ptr =
+                                workspace.get_combine_posted_block_count_ptr(local_expert_idx);
+                            const auto old_posted_block_count =
+                                ptx::atomic_add_acq_rel_sys(posted_block_count_ptr, 1);
+                            if (old_posted_block_count + 1 ==
+                                scheduler.get_current_num_m_blocks()) {
+                                const uint64_t dst_rank_mask =
+                                    ptx::ld_acq_gpu(dst_rank_mask_ptr);
+                                const uint64_t launch_epoch = ptx::ld_acq_sys(
+                                    workspace.get_combine_launch_epoch_ptr());
+                                const uint32_t global_expert_idx =
+                                    sym_buffer.rank_idx * kNumExpertsPerRank +
+                                    local_expert_idx;
+                                DG_TRAP_ONLY_DEVICE_ASSERT(launch_epoch != 0);
+
+                                // Acquire chains through the per-block and
+                                // per-expert counters.  Publish all same-node
+                                // stores before the local ready store; RC-QP
+                                // ordering provides the corresponding order
+                                // for inter-node data WQEs and the ready WQE.
+                                __threadfence_system();
+                                for (uint32_t dst_rank_idx = 0;
+                                     dst_rank_idx < kNumRanks; ++ dst_rank_idx) {
+                                    if ((dst_rank_mask & (1ull << dst_rank_idx)) == 0)
+                                        continue;
+                                    const auto ready_ptr =
+                                        workspace.get_combine_ready_epoch_ptr(
+                                            global_expert_idx);
+                                    if (dst_rank_idx / DG_MEGA_MOE_NVL_PEERS !=
+                                        sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS) {
+                                        comm::ibgda::put_inline_with_credit<uint64_t>(
+                                            ready_ptr, launch_epoch,
+                                            static_cast<int>(dst_rank_idx),
+                                            static_cast<int>(local_expert_idx));
+                                    } else {
+                                        ptx::st_relaxed_sys(
+                                            sym_buffer.map(ready_ptr, dst_rank_idx),
+                                            launch_epoch);
+                                    }
+                                }
+                            }
+                        }
+                        ptx::sync_aligned(
+                            kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    }
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
                     if (profile_math_leader)
                         profile_scatter_publish_block_cycles =
@@ -2573,25 +2659,37 @@ sm90_fp8_mega_moe_impl(void* y,
         }
 #endif
 
-        // NOTE: inter-node scatter 已逐消息 quiet；barrier 内部的 per-QP 扫描再兜底一次。
-        // 与 dispatch 的 barrier 前 __threadfence_system 对称：把同节点 peer 的 NVLink map() scatter store
-        // 在 cross-rank barrier 释放前 publish 到系统作用域，否则 peer 越过 barrier 后 gather(TMA load
-        // combine_token_buffer) 会读到尚未可见/未落地的旧值。nvshmem_quiet 只 flush 本 PE 的 NVSHMEM put，
-        // 管不到同节点 NVLink 普通 store；sync_all 内部 fence 只覆盖其单一调用线程。故此处必须显式补一次。
+        // Publish same-node NVLink stores at system scope.  In expert-ready
+        // mode, final per-expert producers also issue an ordered ready store;
+        // legacy mode still relies on the global barrier below.
         __threadfence_system();
 
         // ---------------- COMBINE ----------------
-        // NVLink barrier first: signals remote ranks that this rank's GEMM
-        // outputs (NVLink scatter targets) are fully written.
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
         const uint64_t profile_combine_barrier_start =
             profile_math_leader ? clock64() : 0;
 #endif
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
-                             kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
-            workspace, sym_buffer, sm_idx, epilogue_thread_idx,
-            [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
-        );
+        if constexpr (kCombineExpertReady) {
+            // All local L2 producers and ready notifications must be submitted
+            // before dispatch cleanup reuses their counters.  Remote completion
+            // is observed below per dependency, so no all-QP quiet or cross-rank
+            // collective is needed on the combine hot path.
+            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+                workspace, sm_idx, epilogue_thread_idx,
+                [&]() {
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                });
+        } else {
+            // Legacy protocol: all ranks wait until every scatter is complete.
+            comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
+                                 kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
+                workspace, sym_buffer, sm_idx, epilogue_thread_idx,
+                [&]() {
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                });
+        }
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
         if (profile_math_leader)
             phase_profile[kProfileCombineBarrier] =
@@ -2646,12 +2744,43 @@ sm90_fp8_mega_moe_impl(void* y,
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
         const uint64_t profile_combine_reduce_start =
             lane_idx == 0 ? clock64() : 0;
+        uint64_t profile_combine_ready_wait_cycles = 0;
 #endif
         for (uint32_t token_idx = sm_idx * kNumCombineWarps + epilogue_warp_idx;
              token_idx < num_tokens;
              token_idx += kNumSMs * kNumCombineWarps) {
             const int stored_topk_slot_idx = lane_idx < kNumTopk ?
                 static_cast<int>(__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_idx * kNumTopk + lane_idx)) : -1;
+
+            if constexpr (kCombineExpertReady) {
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                const uint64_t profile_ready_wait_start =
+                    lane_idx == 0 ? clock64() : 0;
+#endif
+                // The ready WRITE follows all output rows for this expert on
+                // the same RC QP.  An acquire-system load that observes this
+                // launch's epoch can therefore safely precede the TMA gather.
+                if (stored_topk_slot_idx >= 0) {
+                    DG_TRAP_ONLY_DEVICE_ASSERT(
+                        stored_topk_slot_idx < static_cast<int>(kNumExperts));
+                    const auto ready_ptr = workspace.get_combine_ready_epoch_ptr(
+                        static_cast<uint32_t>(stored_topk_slot_idx));
+                    const uint64_t launch_epoch = ptx::ld_acq_sys(
+                        workspace.get_combine_launch_epoch_ptr());
+                    constexpr uint64_t kReadyTimeoutCycles =
+                        60ull * 2000000000ull;
+                    const auto ready_wait_start = clock64();
+                    while (ptx::ld_acq_sys(ready_ptr) != launch_epoch)
+                        DG_TRAP_ONLY_DEVICE_ASSERT(
+                            clock64() - ready_wait_start < kReadyTimeoutCycles);
+                }
+                __syncwarp();
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                if (lane_idx == 0)
+                    profile_combine_ready_wait_cycles +=
+                        clock64() - profile_ready_wait_start;
+#endif
+            }
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 
             for (uint32_t chunk = 0; chunk < kNumChunks; ++ chunk) {
@@ -2722,10 +2851,14 @@ sm90_fp8_mega_moe_impl(void* y,
             }
         }
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
-        if (lane_idx == 0)
+        if (lane_idx == 0) {
             atomicMax(phase_profile + kProfileCombineReduce,
                       static_cast<unsigned long long>(
                           clock64() - profile_combine_reduce_start));
+            atomicMax(phase_profile + kProfileCombineReadyWait,
+                      static_cast<unsigned long long>(
+                          profile_combine_ready_wait_cycles));
+        }
         if (profile_math_leader)
             phase_profile[kProfileTotal] =
                 clock64() - phase_profile[kProfileStartClock];
@@ -2745,6 +2878,7 @@ sm90_fp8_mega_moe_impl(void* y,
             unsigned long long l1_block_count = 0;
             unsigned long long l2_block_count = 0;
             unsigned long long scatter_write_count = 0;
+            unsigned long long combine_ready_wait_cycles = 0;
             for (uint32_t sm = 0; sm < kNumSMs; ++ sm) {
                 const auto row = phase_profile_buffer.get_data_buffer(sm)
                     .get_base_ptr<unsigned long long>();
@@ -2756,13 +2890,17 @@ sm90_fp8_mega_moe_impl(void* y,
                 l1_block_count += row[kProfileL1BlockCount];
                 l2_block_count += row[kProfileL2BlockCount];
                 scatter_write_count += row[kProfileScatterWriteCount];
+                combine_ready_wait_cycles =
+                    combine_ready_wait_cycles > row[kProfileCombineReadyWait] ?
+                    combine_ready_wait_cycles : row[kProfileCombineReadyWait];
             }
             printf(
                 "MEGA_MOE_PHASE_PROFILE rank=%u tokens=%u block_m=%u block_n=%u wg_n=%u "
                 "metadata_cycles=%llu dispatch_barrier_cycles=%llu dispatch_pull_cycles=%llu "
                 "remote_read_cycles=%llu cleanup_barrier_cycles=%llu l1_cycles=%llu "
                 "l2_cycles=%llu scatter_cycles=%llu scatter_publish_cycles=%llu "
-                "combine_barrier_cycles=%llu combine_reduce_cycles=%llu total_cycles=%llu "
+                "combine_barrier_cycles=%llu combine_ready_wait_cycles=%llu "
+                "combine_reduce_cycles=%llu total_cycles=%llu "
                 "remote_reads=%llu l1_blocks=%llu l2_blocks=%llu scatter_writes=%llu\n",
                 sym_buffer.rank_idx, num_tokens, BLOCK_M, BLOCK_N, WG_BLOCK_N,
                 max_cycles[kProfileMetadata], max_cycles[kProfileDispatchBarrier],
@@ -2771,7 +2909,8 @@ sm90_fp8_mega_moe_impl(void* y,
                 max_cycles[kProfileL2], max_cycles[kProfileScatter],
                 max_cycles[kProfileScatterPublish],
                 max_cycles[kProfileCombineBarrier],
-                max_cycles[kProfileCombineReduce], max_cycles[kProfileTotal],
+                combine_ready_wait_cycles, max_cycles[kProfileCombineReduce],
+                max_cycles[kProfileTotal],
                 remote_read_count, l1_block_count, l2_block_count,
                 scatter_write_count);
         }

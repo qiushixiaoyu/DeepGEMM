@@ -21,6 +21,7 @@ namespace deep_gemm::mega {
 enum class SM90MegaMoECombineImpl {
     Legacy,
     FullRowSync,
+    ExpertReady,
 };
 
 // Cache the mode on first use so a live SymmBuffer cannot be resized behind
@@ -29,11 +30,19 @@ static SM90MegaMoECombineImpl get_sm90_mega_moe_combine_impl() {
     static const auto impl = []() {
         const auto value = get_env<std::string>(
             "DG_MEGA_MOE_COMBINE_IMPL", std::string("legacy"));
-        DG_HOST_ASSERT(value == "legacy" or value == "full_row_sync");
+        DG_HOST_ASSERT(
+            value == "legacy" or value == "full_row_sync" or
+            value == "expert_ready");
+        if (value == "expert_ready")
+            return SM90MegaMoECombineImpl::ExpertReady;
         return value == "full_row_sync" ?
             SM90MegaMoECombineImpl::FullRowSync : SM90MegaMoECombineImpl::Legacy;
     }();
     return impl;
+}
+
+static bool sm90_mega_moe_combine_uses_full_row() {
+    return get_sm90_mega_moe_combine_impl() != SM90MegaMoECombineImpl::Legacy;
 }
 
 static int get_token_alignment_for_sm90_mega_moe() {
@@ -293,7 +302,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
         combine_token_buffer.get_end_ptr());
 
     void* symm_buffer_end = dispatch_staging_buffer.get_end_ptr();
-    if (get_sm90_mega_moe_combine_impl() == SM90MegaMoECombineImpl::FullRowSync) {
+    if (sm90_mega_moe_combine_uses_full_row()) {
         const auto combine_full_row_arrival_buffer = layout::Buffer(
             layout::Data(sizeof(uint32_t), false), 1,
             workspace.num_max_pool_blocks, symm_buffer_end);
@@ -410,7 +419,7 @@ static void fp8_mega_moe(
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
     const auto combine_impl = get_sm90_mega_moe_combine_impl();
-    if (combine_impl == SM90MegaMoECombineImpl::FullRowSync and num_ranks > 8) {
+    if (combine_impl != SM90MegaMoECombineImpl::Legacy and num_ranks > 8) {
         const auto num_rc_per_pe = get_env<int>("NVSHMEM_IBGDA_NUM_RC_PER_PE", 0);
         DG_HOST_ASSERT(num_rc_per_pe >= num_experts_per_rank);
     }
@@ -436,7 +445,8 @@ static void fp8_mega_moe(
                      num_tokens, num_topk,
                      hidden, intermediate_hidden,
                      activation_clamp, fast_math,
-                     combine_impl == SM90MegaMoECombineImpl::FullRowSync and num_ranks > 8);
+                     combine_impl != SM90MegaMoECombineImpl::Legacy and num_ranks > 8,
+                     combine_impl == SM90MegaMoECombineImpl::ExpertReady and num_ranks > 8);
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();

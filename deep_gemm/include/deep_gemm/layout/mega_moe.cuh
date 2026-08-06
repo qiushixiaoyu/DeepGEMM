@@ -239,6 +239,16 @@ struct SM90Workspace {
     uint64_t get_num_bytes() const {
         uint64_t num_bytes = 0;
         num_bytes += kNumBarrierSignalBytes;
+
+        // Per-expert combine completion protocol.  The launch epoch is local
+        // to each rank and advances once per collective invocation.  Ready
+        // epochs are indexed by global expert, while publication counters and
+        // destination masks are owned by this rank's local experts.
+        num_bytes += sizeof(uint64_t);
+        num_bytes += num_experts * sizeof(uint64_t);
+        num_bytes += math::align(num_experts_per_rank, 2u) * sizeof(uint32_t);
+        num_bytes += num_experts_per_rank * sizeof(uint64_t);
+
         num_bytes += num_experts * sizeof(uint64_t) * 2;
         num_bytes += num_experts_per_rank * sizeof(uint64_t);
         num_bytes += math::align(num_max_pool_blocks, 2u) * sizeof(uint32_t);
@@ -274,8 +284,31 @@ struct SM90Workspace {
     }
 
     CUTLASS_DEVICE
+    uint64_t* get_combine_launch_epoch_ptr() const {
+        return math::advance_ptr<uint64_t>(base, kNumBarrierSignalBytes);
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_combine_ready_epoch_ptr(const uint32_t& global_expert_idx = 0) const {
+        return get_combine_launch_epoch_ptr() + 1 + global_expert_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_combine_posted_block_count_ptr(const uint32_t& local_expert_idx = 0) const {
+        const auto base = get_combine_ready_epoch_ptr(num_experts);
+        return reinterpret_cast<uint32_t*>(base) + local_expert_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_combine_dst_rank_mask_ptr(const uint32_t& local_expert_idx = 0) const {
+        const auto base = get_combine_posted_block_count_ptr(
+            math::align(num_experts_per_rank, 2u));
+        return reinterpret_cast<uint64_t*>(base) + local_expert_idx;
+    }
+
+    CUTLASS_DEVICE
     uint64_t* get_expert_send_count_ptr(const uint32_t& expert_idx = 0) const {
-        return math::advance_ptr<uint64_t>(base, kNumBarrierSignalBytes) + expert_idx;
+        return get_combine_dst_rank_mask_ptr(num_experts_per_rank) + expert_idx;
     }
 
     CUTLASS_DEVICE
