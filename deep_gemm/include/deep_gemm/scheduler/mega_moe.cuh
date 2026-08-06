@@ -43,6 +43,7 @@ struct MegaMoEScheduler {
 
     // Arrival counts
     const WorkspaceT& workspace;
+    const uint64_t* dispatch_launch_epoch_ptr;
 
     // Scheduler state
     BlockPhase next_phase = BlockPhase::Linear1;
@@ -59,7 +60,9 @@ struct MegaMoEScheduler {
     // Layout: `stored_num_tokens_per_expert[i]` holds expert (i * 32 + lane_idx)'s count
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
 
-    CUTLASS_DEVICE explicit MegaMoEScheduler(const WorkspaceT& workspace): workspace(workspace) {
+    CUTLASS_DEVICE explicit MegaMoEScheduler(
+        const WorkspaceT& workspace, const uint64_t* dispatch_launch_epoch_ptr = nullptr):
+        workspace(workspace), dispatch_launch_epoch_ptr(dispatch_launch_epoch_ptr) {
         block_idx = blockIdx.x;
     }
 
@@ -191,20 +194,33 @@ struct MegaMoEScheduler {
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
 #ifdef DG_MEGA_MOE_INTERNODE
-                // 方案c：不再依赖 recv_count_sum(跨节点 NIC atomic 实测会静默丢/把 source 卡死)。改为逐个
-                // 等待 16 个 per-source recv_count 槽的到达标记(高32位==kNumSMs，由普通 put/NVLink store
-                // 幂等覆盖写入，put 有 CQE、被 quiet 追踪)，然后本地求和低32位得到 token 总数。
-                // 单个 8 字节值同时携带标记+数据，无标记/载荷之间的排序问题。
+                // Legacy slots use kNumSMs as the high-32 arrival marker.  The
+                // barrier-free dispatch path instead uses this launch's epoch.
+                // Route entries and the final epoch/count WRITE share one RC
+                // QP, so observing the ready value also orders all route slots.
                 // Keep a bounded wait so a missing RDMA write fails instead of hanging forever.
                 constexpr int64_t kSlotTimeoutCycles = 60ll * 2000000000ll;
                 const auto start_clock = clock64();
+                uint32_t expected_marker = kNumSMs;
+                if (dispatch_launch_epoch_ptr != nullptr) {
+                    expected_marker = static_cast<uint32_t>(
+                        ptx::ld_acq_sys(dispatch_launch_epoch_ptr));
+                    while (expected_marker == 0) {
+                        DG_TRAP_ONLY_DEVICE_ASSERT(clock64() - start_clock < kSlotTimeoutCycles);
+                        expected_marker = static_cast<uint32_t>(
+                            ptx::ld_acq_sys(dispatch_launch_epoch_ptr));
+                    }
+                }
                 value = 0;
                 for (uint32_t src = 0; src < kNumRanks; ++ src) {
                     const auto slot_ptr = workspace.get_expert_recv_count_ptr(src, expert_idx);
-                    uint64_t slot_value = ptx::ld_volatile(slot_ptr);
-                    while (static_cast<uint32_t>(slot_value >> 32) != kNumSMs) {
+                    uint64_t slot_value = ptx::ld_acq_sys(slot_ptr);
+                    while (static_cast<uint32_t>(slot_value >> 32) != expected_marker) {
                         DG_TRAP_ONLY_DEVICE_ASSERT(clock64() - start_clock < kSlotTimeoutCycles);
-                        slot_value = ptx::ld_volatile(slot_ptr);
+                        if (dispatch_launch_epoch_ptr != nullptr)
+                            expected_marker = static_cast<uint32_t>(
+                                ptx::ld_acq_sys(dispatch_launch_epoch_ptr));
+                        slot_value = ptx::ld_acq_sys(slot_ptr);
                     }
                     value += slot_value & 0xffffffffull;
                 }

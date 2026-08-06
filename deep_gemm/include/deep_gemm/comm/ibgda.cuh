@@ -546,6 +546,73 @@ __device__ static __forceinline__ void get_thread(uint64_t laddr, uint64_t raddr
     }
 }
 
+struct GetRequest {
+    uint64_t laddr;
+    uint64_t raddr;
+    size_t bytes;
+};
+
+// Reserve all READ WQEs for a small request group at once and publish them
+// with one doorbell.  The returned producer index identifies exactly this
+// group's last WQE, so a caller sharing the QP need not quiet later requests.
+// Registration-boundary splits are included in the same reservation.
+template <uint32_t kNumRequests>
+__device__ static __forceinline__ uint64_t get_batch_thread(
+    const GetRequest (&requests)[kNumRequests], int src_pe, int qp_id) {
+    auto qp = ibgda_get_rc(src_pe, qp_id);
+
+    uint32_t num_wqes = 0;
+    #pragma unroll
+    for (uint32_t request_idx = 0; request_idx < kNumRequests; ++ request_idx) {
+        uint64_t laddr = requests[request_idx].laddr;
+        uint64_t raddr = requests[request_idx].raddr;
+        size_t bytes = requests[request_idx].bytes;
+        while (bytes > 0) {
+            __be32 lkey, rkey;
+            uint64_t real_raddr;
+            const auto chunk = min(
+                static_cast<uint64_t>(bytes),
+                ibgda_get_lkey_and_rkey(
+                    laddr, &lkey, raddr, src_pe, &real_raddr, &rkey, qp->dev_idx));
+            DG_DEVICE_ASSERT(chunk > 0);
+            ++ num_wqes;
+            laddr += chunk;
+            raddr += chunk;
+            bytes -= chunk;
+        }
+    }
+
+    const uint64_t base_wqe_idx =
+        ibgda_reserve_wqe_slots_with_credit(qp, num_wqes);
+    uint32_t wqe_offset = 0;
+    #pragma unroll
+    for (uint32_t request_idx = 0; request_idx < kNumRequests; ++ request_idx) {
+        uint64_t laddr = requests[request_idx].laddr;
+        uint64_t raddr = requests[request_idx].raddr;
+        size_t bytes = requests[request_idx].bytes;
+        while (bytes > 0) {
+            __be32 lkey, rkey;
+            uint64_t real_raddr;
+            const auto chunk = min(
+                static_cast<uint64_t>(bytes),
+                ibgda_get_lkey_and_rkey(
+                    laddr, &lkey, raddr, src_pe, &real_raddr, &rkey, qp->dev_idx));
+            const uint64_t wqe_idx = base_wqe_idx + wqe_offset;
+            void* wqe_ptr = ibgda_get_wqe_ptr(qp, wqe_idx);
+            ibgda_write_rdma_read_wqe(
+                qp, laddr, lkey, real_raddr, rkey,
+                static_cast<uint32_t>(chunk), static_cast<uint16_t>(wqe_idx), &wqe_ptr);
+            ++ wqe_offset;
+            laddr += chunk;
+            raddr += chunk;
+            bytes -= chunk;
+        }
+    }
+    DG_DEVICE_ASSERT(wqe_offset == num_wqes);
+    ibgda_submit_requests(qp, base_wqe_idx, num_wqes);
+    return base_wqe_idx + num_wqes;
+}
+
 // CQ poll (相对 DeepEP：cons_idx 用 atomicMax 更新，允许多 warp 并发 quiet 同一 QP。
 // 并发时每个等待者都等到自己快照的 prod_idx 完成为止，可能多等别人的 WQE，正确性不受影响)
 __device__ static __forceinline__ void ibgda_poll_cq(nvshmemi_ibgda_device_cq_t* cq, uint64_t idx) {
@@ -560,6 +627,13 @@ __device__ static __forceinline__ void ibgda_poll_cq(nvshmemi_ibgda_device_cq_t*
     } while ((static_cast<uint16_t>(static_cast<uint16_t>(idx) - wqe_counter - static_cast<uint16_t>(2)) < ncqes));
     atomicMax(reinterpret_cast<unsigned long long*>(cq->cons_idx), static_cast<unsigned long long>(idx));
     memory_fence_cta();
+}
+
+// Wait for a previously returned producer index, rather than snapshotting the
+// QP head and accidentally waiting for unrelated later work on a shared QP.
+__device__ static __forceinline__ void wait_until(int peer, int qp_id, uint64_t completion_idx) {
+    auto qp = ibgda_get_rc(peer, qp_id);
+    ibgda_poll_cq(qp->tx_wq.cq, completion_idx);
 }
 
 // 等待 (dst_pe, qp_id) 上当前已提交的所有 WQE 完成

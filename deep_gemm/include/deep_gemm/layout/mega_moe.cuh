@@ -240,6 +240,10 @@ struct SM90Workspace {
         uint64_t num_bytes = 0;
         num_bytes += kNumBarrierSignalBytes;
 
+        // Dispatch completion protocol.  Per-source expert slots pack the
+        // low 32-bit token count with the low 32 bits of this launch epoch.
+        num_bytes += sizeof(uint64_t);
+
         // Per-expert combine completion protocol.  The launch epoch is local
         // to each rank and advances once per collective invocation.  Ready
         // epochs are indexed by global expert, while publication counters and
@@ -284,8 +288,13 @@ struct SM90Workspace {
     }
 
     CUTLASS_DEVICE
-    uint64_t* get_combine_launch_epoch_ptr() const {
+    uint64_t* get_dispatch_launch_epoch_ptr() const {
         return math::advance_ptr<uint64_t>(base, kNumBarrierSignalBytes);
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_combine_launch_epoch_ptr() const {
+        return get_dispatch_launch_epoch_ptr() + 1;
     }
 
     CUTLASS_DEVICE

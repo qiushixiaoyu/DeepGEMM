@@ -143,6 +143,7 @@ template <
     bool kL2ArrivalCounter,
     bool kL2EpilogueRequiresFullSync,
     bool kSplitPhaseHotPath,
+    bool kDispatchExpertReady,
     bool kCombineFullRow,
     bool kCombineExpertReady,
     bool kFP8SwapAB = false,
@@ -466,6 +467,12 @@ sm90_fp8_mega_moe_impl(void* y,
     if (thread_idx == 0)
         phase_profile[kProfileStartClock] = clock64();
 #endif
+    if constexpr (kDispatchExpertReady) {
+        // The ready slot packs this epoch in its high 32 bits and the token
+        // count in its low 32 bits.  Tag 3 still clears slots after each call.
+        if (sm_idx == 0 and thread_idx == 0)
+            ptx::atomic_add_sys(workspace.get_dispatch_launch_epoch_ptr(), 1ull);
+    }
     if constexpr (kCombineExpertReady) {
         // Collective calls advance in lock-step across ranks.  The persistent
         // 64-bit epoch lets receivers distinguish this launch from stale ready
@@ -519,7 +526,9 @@ sm90_fp8_mega_moe_impl(void* y,
         kNumSMs, kNumRanks,
         kNumExpertsPerLane, kNumL1BlockNs, kNumL2BlockNs,
         kNumL1BlockKs, kNumL2BlockKs,
-        layout::SM90Workspace>(workspace);
+        layout::SM90Workspace>(
+            workspace,
+            kDispatchExpertReady ? workspace.get_dispatch_launch_epoch_ptr() : nullptr);
 
     // Pipeline state shared by TMA loaders and math warpgroups
     uint32_t stage_idx = 0, phase = 0;
@@ -625,19 +634,30 @@ sm90_fp8_mega_moe_impl(void* y,
         // Write source token-topk indices to remote ranks
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
             const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
+            const auto dst_local_expert_idx = expert_idx % kNumExpertsPerRank;
             const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1);
             const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
-                expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
+                dst_local_expert_idx, sym_buffer.rank_idx, dst_slot_idx);
 #ifdef DG_MEGA_MOE_INTERNODE
-            // Inter-node peer: IBGDA verbs inline RDMA WRITE(公开 device API 在本集群
-            // 会对一半目标 PE 静默丢写，见 comm/ibgda.cuh 头注)。qp 按槽位分摊防 ring 溢出。
-            if (dst_rank_idx / DG_MEGA_MOE_NVL_PEERS != sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS)
-                comm::ibgda::put_inline<uint32_t>(
-                    dst_ptr, token_topk_idx, static_cast<int>(dst_rank_idx), static_cast<int>(dst_slot_idx));
-            else
+            if (dst_rank_idx / DG_MEGA_MOE_NVL_PEERS != sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS) {
+                if constexpr (kDispatchExpertReady)
+                    comm::ibgda::put_inline_with_credit<uint32_t>(
+                        dst_ptr, token_topk_idx, static_cast<int>(dst_rank_idx),
+                        static_cast<int>(dst_local_expert_idx));
+                else
+                    comm::ibgda::put_inline<uint32_t>(
+                        dst_ptr, token_topk_idx, static_cast<int>(dst_rank_idx),
+                        static_cast<int>(dst_slot_idx));
+            } else
 #endif
             *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
         });
+
+        // Every writer makes its same-node route stores visible before the
+        // grid-wide handoff to SM 0.  Inter-node WQE ordering is provided by
+        // the per-expert RC QP itself.
+        if constexpr (kDispatchExpertReady)
+            __threadfence_system();
 
         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
             workspace, sm_idx, thread_idx,
@@ -653,17 +673,29 @@ sm90_fp8_mega_moe_impl(void* y,
                 const auto recv_count_ptr = workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx);
                 const auto recv_count_sum_ptr = workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx);
 #ifdef DG_MEGA_MOE_INTERNODE
-                // 方案c：per-source recv_count 槽写【完整】expert_status(高32位=kNumSMs 到达标记、低32位=token数)，
-                // inter 走 NVSHMEM put、intra 走 NVLink store —— 都是幂等覆盖写，put 有 CQE、被 nvshmem_quiet 追踪。
-                // 跨节点关键路径彻底去掉 NIC atomic：实测 non-fetch AMO 会静默丢(dst 只收到 9/16 个 source 的贡献)，
-                // fetch AMO 又会把 source 卡死在响应等待。recv_count_sum 在跨节点构建下不再写入，消费端
-                // (scheduler.fetch_expert_recv_count 与 dispatch cleanup)改为逐槽等标记 + 本地求和。
-                if (dst_rank_idx / DG_MEGA_MOE_NVL_PEERS != sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS)
-                    comm::ibgda::put_inline<uint64_t>(
-                        recv_count_ptr, expert_status, static_cast<int>(dst_rank_idx),
-                        static_cast<int>(dst_local_expert_idx));
-                else
-                    *sym_buffer.map(recv_count_ptr, dst_rank_idx) = expert_status;
+                uint64_t ready_status = expert_status;
+                if constexpr (kDispatchExpertReady) {
+                    const auto dispatch_epoch = static_cast<uint32_t>(
+                        ptx::ld_acq_sys(workspace.get_dispatch_launch_epoch_ptr()));
+                    ready_status =
+                        (static_cast<uint64_t>(dispatch_epoch) << 32) |
+                        static_cast<uint32_t>(expert_status);
+                }
+                if (dst_rank_idx / DG_MEGA_MOE_NVL_PEERS != sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS) {
+                    if constexpr (kDispatchExpertReady)
+                        comm::ibgda::put_inline_with_credit<uint64_t>(
+                            recv_count_ptr, ready_status, static_cast<int>(dst_rank_idx),
+                            static_cast<int>(dst_local_expert_idx));
+                    else
+                        comm::ibgda::put_inline<uint64_t>(
+                            recv_count_ptr, ready_status, static_cast<int>(dst_rank_idx),
+                            static_cast<int>(dst_local_expert_idx));
+                } else if constexpr (kDispatchExpertReady) {
+                    ptx::st_relaxed_sys(
+                        sym_buffer.map(recv_count_ptr, dst_rank_idx), ready_status);
+                } else {
+                    *sym_buffer.map(recv_count_ptr, dst_rank_idx) = ready_status;
+                }
 #else
                 *sym_buffer.map(recv_count_ptr, dst_rank_idx) = expert_status & 0xffffffff;
                 ptx::atomic_add_sys(sym_buffer.map(recv_count_sum_ptr, dst_rank_idx), expert_status);
@@ -672,8 +704,10 @@ sm90_fp8_mega_moe_impl(void* y,
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-        // NOTE: inter-node metadata puts 的 completion 由 barrier(下方)内部的
-        // per-QP verbs quiet 扫描统一等待，此处无需单独 flush。
+        // In expert-ready mode, route entries and the final epoch/count marker
+        // use the same per-expert RC QP.  The QP's in-order execution makes the
+        // marker the completion boundary, so no tag-1 barrier/quiet is needed.
+        // The legacy path still relies on the global barrier below.
 
         // Make all dispatch metadata pushes (intra-node NVLink stores + inter-node NVSHMEM
         // puts/atomics) visible system-wide before the cross-rank barrier, so the pull phase
@@ -687,11 +721,15 @@ sm90_fp8_mega_moe_impl(void* y,
         const uint64_t profile_dispatch_barrier_start =
             profile_dispatch_leader ? clock64() : 0;
 #endif
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
-                             kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
-            workspace, sym_buffer, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            false, true);
+        if constexpr (kDispatchExpertReady) {
+            scheduler.fetch_expert_recv_count();
+        } else {
+            comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                                 kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
+                workspace, sym_buffer, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+                false, true);
+        }
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
         if (profile_dispatch_leader)
             phase_profile[kProfileDispatchBarrier] =
@@ -712,7 +750,8 @@ sm90_fp8_mega_moe_impl(void* y,
         uint32_t profile_remote_read_count = 0;
 #endif
 
-        scheduler.fetch_expert_recv_count();
+        if constexpr (not kDispatchExpertReady)
+            scheduler.fetch_expert_recv_count();
 
         constexpr uint32_t kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32u);
         int      current_expert_idx = -1;
@@ -800,10 +839,11 @@ sm90_fp8_mega_moe_impl(void* y,
                 // (RDMA READ) instead of NVLink P2P. Decided once per pulled token.
                 const bool tok_is_inter =
                     current_rank_in_expert_idx / DG_MEGA_MOE_NVL_PEERS != sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS;
-                // 每 warp 一个专属 QP，配 quiet 构成阻塞读。SF/weight 先 READ 进
-                // pool-token 专属的 cache-line 对齐暂存行，再由本 warp 拷入转置布局。
-                // 暂存区独立于 combine，避免 RNIC scatter 与 GPU L2 cache line 混用。
-                const int inter_qp_id = static_cast<int>(sm_idx * kNumDispatchWarps + warp_idx);
+                // The optimized path shares QP(src_rank, local_expert) across
+                // dispatch warps; completion waits target only the caller's
+                // reserved batch.  Legacy keeps its per-warp QP for A/B.
+                const int inter_qp_id = kDispatchExpertReady ?
+                    current_expert_idx : static_cast<int>(sm_idx * kNumDispatchWarps + warp_idx);
                 const auto inter_staging = dispatch_staging_buffer
                     .get_data_buffer(pool_token_idx).get_base_ptr<float>();
 #endif
@@ -815,27 +855,53 @@ sm90_fp8_mega_moe_impl(void* y,
                     if (tok_is_inter) {
                         // Inter-node: RDMA READ token straight into the local L1 pool
                         // (skipping smem bounce and both TMAs), plus SF & routing weight
-                        // into the per-warp staging row; a single per-QP quiet then gives
-                        // blocking-get semantics for all three.
+                        // into the per-warp staging row.  The optimized path reserves the
+                        // three READs together, rings one doorbell, and waits for that
+                        // batch's completion index; legacy uses three posts plus quiet.
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
                         const uint64_t profile_remote_read_start = clock64();
 #endif
-                        comm::ibgda::get_thread(
-                            reinterpret_cast<uint64_t>(l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr()),
-                            reinterpret_cast<uint64_t>(input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr()),
-                            pull_buffer.get_num_bytes(),
-                            static_cast<int>(current_rank_in_expert_idx), inter_qp_id);
-                        comm::ibgda::get_thread(
-                            reinterpret_cast<uint64_t>(inter_staging),
-                            reinterpret_cast<uint64_t>(input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>()),
-                            (kHidden / 128) * sizeof(float),
-                            static_cast<int>(current_rank_in_expert_idx), inter_qp_id);
-                        comm::ibgda::get_thread(
-                            reinterpret_cast<uint64_t>(inter_staging + kHidden / 128),
-                            reinterpret_cast<uint64_t>(input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx),
-                            sizeof(float),
-                            static_cast<int>(current_rank_in_expert_idx), inter_qp_id);
-                        comm::ibgda::quiet(static_cast<int>(current_rank_in_expert_idx), inter_qp_id);
+                        if constexpr (kDispatchExpertReady) {
+                            const comm::ibgda::GetRequest read_requests[3] = {
+                                {
+                                    reinterpret_cast<uint64_t>(l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr()),
+                                    reinterpret_cast<uint64_t>(input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr()),
+                                    pull_buffer.get_num_bytes()
+                                },
+                                {
+                                    reinterpret_cast<uint64_t>(inter_staging),
+                                    reinterpret_cast<uint64_t>(input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>()),
+                                    (kHidden / 128) * sizeof(float)
+                                },
+                                {
+                                    reinterpret_cast<uint64_t>(inter_staging + kHidden / 128),
+                                    reinterpret_cast<uint64_t>(input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx),
+                                    sizeof(float)
+                                }
+                            };
+                            const auto completion_idx = comm::ibgda::get_batch_thread(
+                                read_requests, static_cast<int>(current_rank_in_expert_idx), inter_qp_id);
+                            comm::ibgda::wait_until(
+                                static_cast<int>(current_rank_in_expert_idx), inter_qp_id, completion_idx);
+                        } else {
+                            comm::ibgda::get_thread(
+                                reinterpret_cast<uint64_t>(l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr()),
+                                reinterpret_cast<uint64_t>(input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr()),
+                                pull_buffer.get_num_bytes(),
+                                static_cast<int>(current_rank_in_expert_idx), inter_qp_id);
+                            comm::ibgda::get_thread(
+                                reinterpret_cast<uint64_t>(inter_staging),
+                                reinterpret_cast<uint64_t>(input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>()),
+                                (kHidden / 128) * sizeof(float),
+                                static_cast<int>(current_rank_in_expert_idx), inter_qp_id);
+                            comm::ibgda::get_thread(
+                                reinterpret_cast<uint64_t>(inter_staging + kHidden / 128),
+                                reinterpret_cast<uint64_t>(input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx),
+                                sizeof(float),
+                                static_cast<int>(current_rank_in_expert_idx), inter_qp_id);
+                            comm::ibgda::quiet(
+                                static_cast<int>(current_rank_in_expert_idx), inter_qp_id);
+                        }
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
                         profile_remote_read_cycles +=
                             clock64() - profile_remote_read_start;

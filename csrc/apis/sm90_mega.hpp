@@ -24,6 +24,24 @@ enum class SM90MegaMoECombineImpl {
     ExpertReady,
 };
 
+enum class SM90MegaMoEDispatchImpl {
+    Legacy,
+    ExpertReady,
+};
+
+// Keep the legacy path available for A/B and cache the selection for the
+// lifetime of a SymmBuffer, matching the combine selector's behavior.
+static SM90MegaMoEDispatchImpl get_sm90_mega_moe_dispatch_impl() {
+    static const auto impl = []() {
+        const auto value = get_env<std::string>(
+            "DG_MEGA_MOE_DISPATCH_IMPL", std::string("legacy"));
+        DG_HOST_ASSERT(value == "legacy" or value == "expert_ready");
+        return value == "expert_ready" ?
+            SM90MegaMoEDispatchImpl::ExpertReady : SM90MegaMoEDispatchImpl::Legacy;
+    }();
+    return impl;
+}
+
 // Cache the mode on first use so a live SymmBuffer cannot be resized behind
 // the kernel by changing the environment between calls.
 static SM90MegaMoECombineImpl get_sm90_mega_moe_combine_impl() {
@@ -419,7 +437,9 @@ static void fp8_mega_moe(
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
     const auto combine_impl = get_sm90_mega_moe_combine_impl();
-    if (combine_impl != SM90MegaMoECombineImpl::Legacy and num_ranks > 8) {
+    const auto dispatch_impl = get_sm90_mega_moe_dispatch_impl();
+    if ((combine_impl != SM90MegaMoECombineImpl::Legacy or
+         dispatch_impl != SM90MegaMoEDispatchImpl::Legacy) and num_ranks > 8) {
         const auto num_rc_per_pe = get_env<int>("NVSHMEM_IBGDA_NUM_RC_PER_PE", 0);
         DG_HOST_ASSERT(num_rc_per_pe >= num_experts_per_rank);
     }
@@ -445,6 +465,7 @@ static void fp8_mega_moe(
                      num_tokens, num_topk,
                      hidden, intermediate_hidden,
                      activation_clamp, fast_math,
+                     dispatch_impl == SM90MegaMoEDispatchImpl::ExpertReady and num_ranks > 8,
                      combine_impl != SM90MegaMoECombineImpl::Legacy and num_ranks > 8,
                      combine_impl == SM90MegaMoECombineImpl::ExpertReady and num_ranks > 8);
 
