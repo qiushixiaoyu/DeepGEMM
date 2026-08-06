@@ -305,6 +305,10 @@ get_symm_buffer_size_for_sm90_mega_moe(
             combine_full_row_staging_base);
         symm_buffer_end = combine_full_row_staging_buffer.get_end_ptr();
     }
+    const auto phase_profile_buffer = layout::Buffer(
+        layout::Data(layout::kSM90MegaMoEProfileSlots * sizeof(uint64_t), false),
+        1, layout::kSM90MegaMoEProfileMaxSMs, symm_buffer_end);
+    symm_buffer_end = phase_profile_buffer.get_end_ptr();
 
     DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
 

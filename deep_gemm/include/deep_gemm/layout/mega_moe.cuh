@@ -402,4 +402,10 @@ struct Buffer {
     }
 };
 
+// Optional SM90 phase-profiler storage. The allocation is always present on
+// the diagnostic branch, so toggling the JIT-only profiler does not change the
+// public API or any tensor slice.
+static constexpr uint32_t kSM90MegaMoEProfileMaxSMs = 256;
+static constexpr uint32_t kSM90MegaMoEProfileSlots = 18;
+
 } // namespace deep_gemm::layout
