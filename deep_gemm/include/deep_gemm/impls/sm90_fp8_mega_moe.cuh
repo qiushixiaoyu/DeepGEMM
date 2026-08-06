@@ -143,6 +143,7 @@ template <
     bool kL2ArrivalCounter,
     bool kL2EpilogueRequiresFullSync,
     bool kSplitPhaseHotPath,
+    bool kCombineFullRow,
     bool kFP8SwapAB = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -257,6 +258,35 @@ sm90_fp8_mega_moe_impl(void* y,
     const auto dispatch_staging_buffer = layout::Buffer(
         dispatch_staging_layout, 1, kNumMaxPoolTokens,
         combine_token_buffer.get_end_ptr());
+
+    // Full-row combine keeps one registered BF16 row per pool token.  A
+    // separate per-pool-block arrival counter lets the last L2 N-block CTA
+    // publish the complete row with one large RDMA WRITE.
+    constexpr uint32_t kNumMaxPoolBlocks =
+        kNumMaxPoolTokens / layout::kMinCandidateBlockM;
+    constexpr auto combine_full_row_arrival_layout = layout::Data(
+        kCombineFullRow ? sizeof(uint32_t) : 0u, false);
+    const auto combine_full_row_arrival_buffer = layout::Buffer(
+        combine_full_row_arrival_layout, 1, kNumMaxPoolBlocks,
+        dispatch_staging_buffer.get_end_ptr());
+    const auto combine_full_row_staging_base = reinterpret_cast<void*>(
+        kCombineFullRow ? math::align(
+            reinterpret_cast<uint64_t>(combine_full_row_arrival_buffer.get_end_ptr()),
+            static_cast<uint64_t>(128)) :
+            reinterpret_cast<uint64_t>(dispatch_staging_buffer.get_end_ptr()));
+    constexpr auto combine_full_row_staging_layout = layout::Data(
+        kCombineFullRow ? kHidden * sizeof(nv_bfloat16) : 0u);
+    const auto combine_full_row_staging_buffer = layout::Buffer(
+        combine_full_row_staging_layout, 1, kNumMaxPoolTokens,
+        combine_full_row_staging_base);
+
+#ifdef DG_MEGA_MOE_INTERNODE
+    if constexpr (kCombineFullRow) {
+        if (sm_idx == 0 and thread_idx == 0)
+            DG_DEVICE_ASSERT(
+                comm::ibgda::ibgda_get_state()->num_rc_per_pe >= kNumExpertsPerRank);
+    }
+#endif
 
     // =====================================================================
     // GEMM data types and shape constants
@@ -856,6 +886,10 @@ sm90_fp8_mega_moe_impl(void* y,
                 for (uint32_t j = thread_idx; j < num_recv_m_blocks; j += kNumDispatchThreads) {
                     *workspace.get_l1_arrival_count_ptr(expert_pool_block_offset + j) = 0;
                     *workspace.get_l2_arrival_mask_ptr(expert_pool_block_offset + j) = 0;
+                    if constexpr (kCombineFullRow)
+                        *combine_full_row_arrival_buffer
+                             .get_data_buffer(expert_pool_block_offset + j)
+                             .get_base_ptr<uint32_t>() = 0;
                 }
                 __syncwarp();
             }
@@ -1723,7 +1757,8 @@ sm90_fp8_mega_moe_impl(void* y,
             }
 
             // Skip epilogue when block is past valid M (still must release via empty)
-            if (row_base >= valid_m) {
+            if (row_base >= valid_m and
+                (block_phase == sched::BlockPhase::Linear1 or not kCombineFullRow)) {
                 if (block_phase == sched::BlockPhase::Linear1) {
                     if constexpr (not kL2ArrivalCounter)
                         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
@@ -2123,6 +2158,17 @@ sm90_fp8_mega_moe_impl(void* y,
                 const uint32_t lane_in_row = lane_idx % 16;
                 const uint32_t cols_per_lane = WG_BLOCK_N / 16;
 
+                if constexpr (kCombineFullRow) {
+                    // Dispatch no longer uses these two shared words after its
+                    // pre-pull rendezvous.  Reuse them as CTA-local flags so
+                    // local-only pool blocks can bypass the arrival/send path.
+                    if (epilogue_thread_idx == 0) {
+                        smem_expert_count[0] = 0;  // contains a remote row
+                        smem_expert_count[1] = 0;  // this CTA is last producer
+                    }
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                }
+
                 if constexpr (kSwapABActive) {
                     auto store_bf16 = [&](const uint32_t& token, const uint32_t& col, float value) {
                         smem_cd_l2[smem_cd_l2_wg_offset + token * WG_BLOCK_N + col] =
@@ -2188,10 +2234,12 @@ sm90_fp8_mega_moe_impl(void* y,
                     }
                 }
 
-                // In the normal layout each warp writes and then scatters its
-                // own 16-row slice. swapAB writes by output-column ownership
-                // instead, so a token row is produced by the whole warpgroup.
-                if constexpr (kSwapABActive)
+                // In full-row mode all warpgroups must converge: inactive
+                // split-M warpgroups also participate so the CTA-wide staging
+                // and last-producer protocol cannot deadlock.
+                if constexpr (kCombineFullRow)
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                else if constexpr (kSwapABActive)
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
                 else
                     __syncwarp();
@@ -2204,6 +2252,97 @@ sm90_fp8_mega_moe_impl(void* y,
                 using ScatterVec = std::conditional_t<(WG_BLOCK_N <= 64), uint2, uint4>;
                 DG_STATIC_ASSERT(cols_per_lane * sizeof(nv_bfloat16) == sizeof(ScatterVec),
                                  "Scatter vector width must match cols_per_lane");
+#if defined(DG_MEGA_MOE_INTERNODE)
+                if constexpr (kCombineFullRow) {
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
+                        const uint32_t row_in_wg =
+                            warp_idx_in_wg * 16 + j * 2 + row_in_warp_block;
+                        const uint32_t m_idx_in_block = row_base + row_in_wg;
+                        if (m_idx_in_block >= valid_m)
+                            break;
+
+                        auto smem_ptr = smem_cd_l2
+                            + smem_cd_l2_wg_offset
+                            + row_in_wg * WG_BLOCK_N
+                            + lane_in_row * cols_per_lane;
+                        const auto packed = *reinterpret_cast<ScatterVec*>(smem_ptr);
+
+                        const auto src_metadata =
+                            *workspace.get_token_src_metadata_ptr(m_idx + m_idx_in_block);
+                        const uint32_t dst_rank_idx = src_metadata.rank_idx;
+                        const uint32_t dst_token_idx = src_metadata.token_idx;
+                        const uint32_t dst_topk_idx = src_metadata.topk_idx;
+                        const auto dst_token = combine_token_buffer
+                            .get_rank_buffer(dst_topk_idx)
+                            .get_data_buffer(dst_token_idx);
+                        auto dst_ptr = math::advance_ptr<ScatterVec>(
+                            dst_token.get_base_ptr(),
+                            (n_idx + wg_n_offset) * sizeof(nv_bfloat16) +
+                                lane_in_row * sizeof(ScatterVec));
+                        const bool row_is_inter =
+                            dst_rank_idx / DG_MEGA_MOE_NVL_PEERS !=
+                            sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS;
+
+                        if (row_is_inter) {
+                            const auto staging_row = combine_full_row_staging_buffer
+                                .get_data_buffer(m_idx + m_idx_in_block);
+                            auto staging_ptr = math::advance_ptr<ScatterVec>(
+                                staging_row.get_base_ptr(),
+                                (n_idx + wg_n_offset) * sizeof(nv_bfloat16) +
+                                    lane_in_row * sizeof(ScatterVec));
+                            *staging_ptr = packed;
+                            if (lane_in_row == 0)
+                                atomicExch(smem_expert_count, 1u);
+                        } else {
+                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        }
+                    }
+                    __syncwarp();
+
+                    // Publish this N-block only after every warpgroup has
+                    // completed its HBM fragments.  The system-scope acq_rel
+                    // RMW makes the final CTA acquire all earlier producers.
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    if (epilogue_thread_idx == 0 and smem_expert_count[0] != 0) {
+                        const auto arrival_ptr = combine_full_row_arrival_buffer
+                            .get_data_buffer(pool_block_idx)
+                            .get_base_ptr<uint32_t>();
+                        const auto old = ptx::atomic_add_acq_rel_sys(arrival_ptr, 1);
+                        smem_expert_count[1] = old + 1 == kNumL2BlockNs;
+                    }
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+
+                    // The last N-block CTA owns publication.  Its epilogue
+                    // warps divide the rows; all lanes in a warp cooperate on
+                    // the registered WRITE.  qp_id is the sender local expert.
+                    if (smem_expert_count[1] != 0) {
+                        for (uint32_t row = epilogue_warp_idx;
+                             row < valid_m; row += kNumEpilogueWarps) {
+                            const auto src_metadata =
+                                *workspace.get_token_src_metadata_ptr(m_idx + row);
+                            const uint32_t dst_rank_idx = src_metadata.rank_idx;
+                            if (dst_rank_idx / DG_MEGA_MOE_NVL_PEERS !=
+                                sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS) {
+                                const auto staging_row = combine_full_row_staging_buffer
+                                    .get_data_buffer(m_idx + row);
+                                const auto dst_row = combine_token_buffer
+                                    .get_rank_buffer(src_metadata.topk_idx)
+                                    .get_data_buffer(src_metadata.token_idx);
+                                comm::ibgda::put_nbi_warp(
+                                    reinterpret_cast<uint64_t>(dst_row.get_base_ptr()),
+                                    reinterpret_cast<uint64_t>(staging_row.get_base_ptr()),
+                                    kHidden * sizeof(nv_bfloat16),
+                                    static_cast<int>(dst_rank_idx),
+                                    static_cast<int>(local_expert_idx),
+                                    static_cast<int>(lane_idx));
+                            }
+                        }
+                    }
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                } else
+#endif
+                {
                 #pragma unroll
                 for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
                     const uint32_t row_in_wg = warp_idx_in_wg * 16 + j * 2 + row_in_warp_block;
@@ -2238,8 +2377,13 @@ sm90_fp8_mega_moe_impl(void* y,
 #endif
                     *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
                 }
+                }
 
+#ifdef DG_MEGA_MOE_INTERNODE
+                if constexpr (not kCombineFullRow and kL2EpilogueRequiresFullSync)
+#else
                 if constexpr (kL2EpilogueRequiresFullSync)
+#endif
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             }
         };

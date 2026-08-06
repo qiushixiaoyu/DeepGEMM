@@ -44,6 +44,7 @@ public:
         bool l2_arrival_counter;
         bool l2_epilogue_requires_full_sync;
         bool split_phase_hot_path;
+        bool combine_full_row;
         bool use_swap_ab;
         MegaMoESM90Config config;
 
@@ -106,6 +107,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -127,6 +129,7 @@ static void __instantiate_kernel() {{
     args.l2_arrival_counter ? "true" : "false",
     args.l2_epilogue_requires_full_sync ? "true" : "false",
     args.split_phase_hot_path ? "true" : "false",
+    args.combine_full_row ? "true" : "false",
     args.use_swap_ab ? "true" : "false");
     }
 
@@ -162,7 +165,8 @@ static void sm90_fp8_mega_moe(
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& combine_full_row
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -297,6 +301,7 @@ static void sm90_fp8_mega_moe(
         .l2_arrival_counter = l2_arrival_counter,
         .l2_epilogue_requires_full_sync = l2_epilogue_requires_full_sync,
         .split_phase_hot_path = split_phase_hot_path,
+        .combine_full_row = combine_full_row,
         .use_swap_ab = use_swap_ab,
         .config = config,
         .y = y.data_ptr(),

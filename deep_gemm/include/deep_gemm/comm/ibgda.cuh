@@ -15,12 +15,14 @@
 //   2. get_thread：RDMA READ(DeepEP 纯 push 无此需求；mega 的 dispatch 是 pull 语义)；
 //   3. poll_cq 的 cons_idx 更新改为 atomicMax，允许多 warp 并发 quiet 同一 QP
 //      (mega 的 pull 由多 warp 并发发起，DeepEP 原实现假设单线程独占 QP)。
+//   4. put_nbi_warp：从 registered symmetric HBM 发出普通 RDMA WRITE，供
+//      full-row combine 使用；每条消息完成全部 WQE 后只敲一次 doorbell。
 //
 // 使用约束(调用方负责)：
 //   - 仅用于跨节点 PE(同节点走 NVLink P2P store，不经此文件)；
 //   - qp_id 任意 int，内部对 num_rc_per_pe*num_devices 取模；调用方应让并发流量
 //     分摊到不同 qp_id 上，保证两次 quiet 之间单 QP 在途 WQE < NVSHMEM_QP_DEPTH
-//     (压力场景使用 NVSHMEM_QP_DEPTH=4096；本实现不检查 ring 溢出)；
+//     (压力场景使用 NVSHMEM_QP_DEPTH=4096；full-row WRITE 在 reserve 时检查 credit)；
 //   - 阻塞式读 = get_thread + quiet(同一 pe/qp)。
 
 #pragma once
@@ -264,6 +266,49 @@ __device__ static __forceinline__ void* ibgda_get_wqe_ptr(nvshmemi_ibgda_device_
     return reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(qp->tx_wq.wqe) + (idx << MLX5_SEND_WQE_SHIFT));
 }
 
+// Defined below the public request helpers.  The declaration is needed by the
+// credit-aware full-row reservation path.
+__device__ static __forceinline__ void ibgda_poll_cq(
+    nvshmemi_ibgda_device_cq_t* cq, uint64_t idx);
+
+// Serialize only reservation/credit maintenance, not WQE construction.  If a
+// QP is about to wrap, wait until all earlier reservations become ready, post
+// their contiguous prefix and reclaim it before handing out new slots.
+__device__ static __forceinline__ uint64_t ibgda_reserve_wqe_slots_with_credit(
+    nvshmemi_ibgda_device_qp_t* qp, uint32_t num_wqes) {
+    auto state = ibgda_get_state();
+    auto mvars = &qp->mvars;
+    DG_DEVICE_ASSERT(num_wqes > 0 and num_wqes < qp->tx_wq.nwqes);
+
+    ibgda_lock_acquire(&mvars->post_send_lock);
+    uint64_t base_wqe_idx = ld_na_relaxed(&mvars->tx_wq.resv_head);
+    uint64_t cq_cons_idx = ld_na_relaxed(reinterpret_cast<uint64_t*>(qp->tx_wq.cq->cons_idx));
+    if (base_wqe_idx + num_wqes - cq_cons_idx >= qp->tx_wq.nwqes) {
+        uint64_t* ready_idx = state->use_async_postsend ?
+            qp->tx_wq.prod_idx : &mvars->tx_wq.ready_head;
+        constexpr uint64_t kCreditTimeoutCycles = 120ull * 2000000000ull;
+        const auto start_clock = clock64();
+        while (ld_na_relaxed(ready_idx) < base_wqe_idx)
+            DG_TRAP_ONLY_DEVICE_ASSERT(clock64() - start_clock < kCreditTimeoutCycles);
+
+        const uint64_t ready_head = ld_na_relaxed(ready_idx);
+        if (not state->use_async_postsend) {
+            const auto old_prod_idx = atomicMax(
+                reinterpret_cast<unsigned long long int*>(qp->tx_wq.prod_idx),
+                static_cast<unsigned long long int>(ready_head));
+            if (ready_head > old_prod_idx) {
+                ibgda_update_dbr(qp, ready_head);
+                ibgda_ring_db(qp, ready_head);
+            }
+        }
+        ibgda_poll_cq(qp->tx_wq.cq, ready_head);
+    }
+
+    base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes);
+    ibgda_lock_release(&mvars->post_send_lock);
+    return base_wqe_idx;
+}
+
 // ---------------------------------------------------------------------------
 // WQE 构造
 // ---------------------------------------------------------------------------
@@ -304,6 +349,44 @@ __device__ static __forceinline__ void ibgda_write_rdma_write_inl_wqe(
     #pragma unroll
     for (uint32_t i = 0; i < kBytes / 4; ++ i)
         st_na_relaxed(wqe_data_ptr + i, val[i]);
+}
+
+// Registered-buffer RDMA WRITE WQE.  Unlike put_inline, the source payload
+// remains in symmetric HBM and is described by an lkey-bearing data segment.
+__device__ static __forceinline__ void ibgda_write_rdma_write_wqe(
+    nvshmemi_ibgda_device_qp_t* qp,
+    uint64_t laddr, __be32 lkey,
+    uint64_t raddr, __be32 rkey,
+    uint32_t bytes, uint16_t wqe_idx, void** out_wqes) {
+    ibgda_ctrl_seg_t ctrl_seg;
+    struct mlx5_wqe_raddr_seg raddr_seg;
+    struct mlx5_wqe_data_seg data_seg;
+
+    auto* ctrl_seg_ptr = reinterpret_cast<ibgda_ctrl_seg_t*>(out_wqes[0]);
+    auto* raddr_seg_ptr = reinterpret_cast<mlx5_wqe_raddr_seg*>(
+        reinterpret_cast<uintptr_t>(ctrl_seg_ptr) + sizeof(*ctrl_seg_ptr));
+    auto* data_seg_ptr = reinterpret_cast<mlx5_wqe_data_seg*>(
+        reinterpret_cast<uintptr_t>(raddr_seg_ptr) + sizeof(*raddr_seg_ptr));
+
+    raddr_seg.raddr = HtoBE64(raddr);
+    raddr_seg.rkey = rkey;
+    raddr_seg.reserved = 0;
+
+    data_seg.byte_count = HtoBE32(bytes);
+    data_seg.lkey = lkey;
+    data_seg.addr = HtoBE64(laddr);
+
+    ctrl_seg = {0};
+    ctrl_seg.qpn_ds = HtoBE32((qp->qpn << 8) | 3);
+    ctrl_seg.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
+    ctrl_seg.opmod_idx_opcode = HtoBE32((wqe_idx << 8) | MLX5_OPCODE_RDMA_WRITE);
+
+    st_na_relaxed(reinterpret_cast<int4*>(ctrl_seg_ptr),
+                  *reinterpret_cast<const int4*>(&ctrl_seg));
+    st_na_relaxed(reinterpret_cast<int4*>(raddr_seg_ptr),
+                  *reinterpret_cast<const int4*>(&raddr_seg));
+    st_na_relaxed(reinterpret_cast<int4*>(data_seg_ptr),
+                  *reinterpret_cast<const int4*>(&data_seg));
 }
 
 // RDMA READ WQE：与 WRITE 同构，opcode 换 RDMA_READ；raddr = 远端【源】，data seg = 本地【目的】。
@@ -361,6 +444,59 @@ __device__ static __forceinline__ void put_inline(T* rptr, const T& value, int d
         qp, reinterpret_cast<const uint32_t*>(&value), raddr, rkey, static_cast<uint16_t>(base_wqe_idx), &wqe_ptrs);
 
     ibgda_submit_requests(qp, base_wqe_idx, 1);
+}
+
+// Warp-cooperative registered HBM WRITE.  A row that crosses registration
+// chunks may use several WQEs, but they are reserved contiguously and posted by
+// one doorbell only after every lane-owned WQE is ready.
+__device__ static __forceinline__ void put_nbi_warp(
+    uint64_t req_rptr, uint64_t req_lptr, size_t bytes,
+    int dst_pe, int qp_id, int lane_id) {
+    uint32_t num_wqes = 0;
+    __be32 my_lkey = 0;
+    uint64_t my_laddr = 0;
+    __be32 my_rkey = 0;
+    uint64_t my_raddr = 0;
+    uint64_t my_chunk_size = 0;
+
+    auto qp = ibgda_get_rc(dst_pe, qp_id);
+    auto remaining_bytes = bytes;
+    while (remaining_bytes > 0) {
+        DG_DEVICE_ASSERT(num_wqes < 32);
+        if (lane_id == static_cast<int>(num_wqes)) {
+            my_chunk_size = min(
+                remaining_bytes,
+                ibgda_get_lkey_and_rkey(
+                    my_laddr = req_lptr, &my_lkey,
+                    req_rptr, dst_pe, &my_raddr, &my_rkey, qp->dev_idx));
+        }
+        const auto chunk_size = __shfl_sync(
+            0xffffffff, my_chunk_size, static_cast<int>(num_wqes));
+        DG_DEVICE_ASSERT(chunk_size > 0);
+        remaining_bytes -= chunk_size;
+        req_lptr += chunk_size;
+        req_rptr += chunk_size;
+        ++ num_wqes;
+    }
+
+    uint64_t base_wqe_idx = 0;
+    if (lane_id == 0)
+        base_wqe_idx = ibgda_reserve_wqe_slots_with_credit(qp, num_wqes);
+    base_wqe_idx = __shfl_sync(0xffffffff, base_wqe_idx, 0);
+
+    if (lane_id < static_cast<int>(num_wqes)) {
+        const auto wqe_idx = base_wqe_idx + lane_id;
+        auto wqe_ptr = ibgda_get_wqe_ptr(qp, wqe_idx);
+        ibgda_write_rdma_write_wqe(
+            qp, my_laddr, my_lkey, my_raddr, my_rkey,
+            static_cast<uint32_t>(my_chunk_size),
+            static_cast<uint16_t>(wqe_idx), &wqe_ptr);
+    }
+    __syncwarp();
+
+    if (lane_id == 0)
+        ibgda_submit_requests(qp, base_wqe_idx, num_wqes);
+    __syncwarp();
 }
 
 // 单线程 RDMA READ(非阻塞发起)：laddr 本地目的(须在对称堆内)，raddr 本地对称地址

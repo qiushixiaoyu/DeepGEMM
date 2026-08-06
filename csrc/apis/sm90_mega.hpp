@@ -18,6 +18,24 @@
 
 namespace deep_gemm::mega {
 
+enum class SM90MegaMoECombineImpl {
+    Legacy,
+    FullRowSync,
+};
+
+// Cache the mode on first use so a live SymmBuffer cannot be resized behind
+// the kernel by changing the environment between calls.
+static SM90MegaMoECombineImpl get_sm90_mega_moe_combine_impl() {
+    static const auto impl = []() {
+        const auto value = get_env<std::string>(
+            "DG_MEGA_MOE_COMBINE_IMPL", std::string("legacy"));
+        DG_HOST_ASSERT(value == "legacy" or value == "full_row_sync");
+        return value == "full_row_sync" ?
+            SM90MegaMoECombineImpl::FullRowSync : SM90MegaMoECombineImpl::Legacy;
+    }();
+    return impl;
+}
+
 static int get_token_alignment_for_sm90_mega_moe() {
     return layout::kLCMCandidateBlockM;
 }
@@ -274,6 +292,20 @@ get_symm_buffer_size_for_sm90_mega_moe(
         dispatch_staging_layout, 1, num_max_pool_tokens,
         combine_token_buffer.get_end_ptr());
 
+    void* symm_buffer_end = dispatch_staging_buffer.get_end_ptr();
+    if (get_sm90_mega_moe_combine_impl() == SM90MegaMoECombineImpl::FullRowSync) {
+        const auto combine_full_row_arrival_buffer = layout::Buffer(
+            layout::Data(sizeof(uint32_t), false), 1,
+            workspace.num_max_pool_blocks, symm_buffer_end);
+        const auto combine_full_row_staging_base = reinterpret_cast<void*>(math::align(
+            reinterpret_cast<uint64_t>(combine_full_row_arrival_buffer.get_end_ptr()),
+            static_cast<uint64_t>(128)));
+        const auto combine_full_row_staging_buffer = layout::Buffer(
+            bf16_token_layout, 1, num_max_pool_tokens,
+            combine_full_row_staging_base);
+        symm_buffer_end = combine_full_row_staging_buffer.get_end_ptr();
+    }
+
     DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
 
     auto slice_input_buffers = [=](const torch::Tensor& buffer) {
@@ -313,7 +345,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
             torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
         return std::make_tuple(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
     };
-    return {reinterpret_cast<int64_t>(dispatch_staging_buffer.get_end_ptr()), slice_input_buffers};
+    return {reinterpret_cast<int64_t>(symm_buffer_end), slice_input_buffers};
 }
 
 static void fp8_mega_moe(
@@ -373,6 +405,11 @@ static void fp8_mega_moe(
 
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
+    const auto combine_impl = get_sm90_mega_moe_combine_impl();
+    if (combine_impl == SM90MegaMoECombineImpl::FullRowSync and num_ranks > 8) {
+        const auto num_rc_per_pe = get_env<int>("NVSHMEM_IBGDA_NUM_RC_PER_PE", 0);
+        DG_HOST_ASSERT(num_rc_per_pe >= num_experts_per_rank);
+    }
     const auto [num_required_bytes, slice] = get_symm_buffer_size_for_sm90_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
@@ -394,7 +431,8 @@ static void fp8_mega_moe(
                      num_experts_per_rank,
                      num_tokens, num_topk,
                      hidden, intermediate_hidden,
-                     activation_clamp, fast_math);
+                     activation_clamp, fast_math,
+                     combine_impl == SM90MegaMoECombineImpl::FullRowSync and num_ranks > 8);
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
