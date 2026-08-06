@@ -280,13 +280,15 @@ sm90_fp8_mega_moe_impl(void* y,
         combine_full_row_staging_layout, 1, kNumMaxPoolTokens,
         combine_full_row_staging_base);
 
+    constexpr uint32_t kPhaseProfileMaxSMs = 256;
+    constexpr uint32_t kPhaseProfileSlots = 18;
     const auto phase_profile_buffer = layout::Buffer(
-        layout::Data(layout::kSM90MegaMoEProfileSlots * sizeof(uint64_t), false),
-        1, layout::kSM90MegaMoEProfileMaxSMs,
+        layout::Data(kPhaseProfileSlots * sizeof(uint64_t), false),
+        1, kPhaseProfileMaxSMs,
         combine_full_row_staging_buffer.get_end_ptr());
 
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
-    DG_STATIC_ASSERT(kNumSMs <= layout::kSM90MegaMoEProfileMaxSMs,
+    DG_STATIC_ASSERT(kNumSMs <= kPhaseProfileMaxSMs,
                      "Too many SMs for phase profiler");
     enum ProfileSlot : uint32_t {
         kProfileMetadata = 0,
@@ -454,7 +456,7 @@ sm90_fp8_mega_moe_impl(void* y,
     // Initialization
     // =====================================================================
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
-    if (thread_idx < layout::kSM90MegaMoEProfileSlots)
+    if (thread_idx < kPhaseProfileSlots)
         phase_profile[thread_idx] = 0;
     if (thread_idx == 0)
         phase_profile[kProfileStartClock] = clock64();
