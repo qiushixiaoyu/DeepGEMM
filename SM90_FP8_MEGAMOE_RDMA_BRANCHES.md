@@ -7,7 +7,7 @@
 本节覆盖下文 2026-08-05 的“当前”描述；下文继续保留，作为简化基线和历史优化分支的查阅记录。
 
 - 当前开发分支：`experiment/mega-moe-combine-expert-ready`。
-- 当前代码提交：`2a127b975`，源码树与 single-producer lazy 实现 `278fc30c7` 完全一致；该提交只回退了性能不理想的 sharded-producer 实验。
+- 当前 HEAD：`ab4804e0c`。运行时功能仍以 `2a127b975` 为基础；后续 `b04d9299e`、`ab4804e0c` 只扩展 phase profiler，将 scatter 拆成四段并保证四段来自同一个 critical SM。
 - dispatch 与 combine 均已采用 per-expert ready 协议；dispatch QP/metadata、三条 READ 的 reserve/doorbell，以及 combine full-pool staging 等后续改造已经落在本分支历史中。
 - scheduler 新增 `DG_MEGA_MOE_SCHEDULER_COUNT_IMPL=eager|lazy`。公开 Python/C++ 接口不变，默认值仍为 `eager`，只有显式设置 `lazy` 才启用本轮实验路径。
 - lazy 路径由一个全局 producer warp 按 expert 聚合各 source rank 的 count，并以 `(launch_epoch << 32) | count` 发布到 internode 路径下闲置的 `recv_count_sum`；consumer scheduler 按 expert 等待共享结果。没有新增 SymmBuffer 空间。
@@ -26,6 +26,14 @@
 性能方面，single-producer lazy 相对 eager 在 DeepSeekV4Flash、DeepSeekV4Pro、GLM5.2 的 batch 1/64/256 共 9 个点中，仅 Flash/b64 快 3.4%，其余 8 点慢 1.4%～4.4%。phase profile 表明全量 count wait 已从 dispatch barrier 中消失，但逐 expert cache wait、固定前缀扫描和 producer/consumer 调度成本抵消了提前 pull 的收益。因此当前只保留 lazy 实验入口，不切换默认路径。
 
 详细命令、精度、性能及 phase 数据见 `../test_logs/20260807_lazy_shared_count/RESULTS.md` 和 `../test_logs/20260807_lazy_shared_count/COMMANDS.md`。
+
+### Scatter publish 四段 profiling
+
+`b04d9299e` 新增 `staging`、`arrival`、`WQE+doorbell`、`expert ready` 四段；`ab4804e0c` 先选 scatter 最慢的 SM，再读取该 SM 的四段，避免各字段独立取 max 后不能相加。profile buffer 每 rank 增加 8 KiB，公开接口不变。
+
+COMM5/COMM6 上开启 profiler 的 full-remote t64 精度通过，最大归一化 diff 约 `0.0006`。三模型 b64/b256 的五次 critical-SM 中位样本显示：staging 仅占 scatter 4.2%～6.0%，arrival 占 2.9%～4.0%；b64 的 expert-ready 占 66.2%～73.1%，而 Flash/GLM b256 的逐行 WQE+doorbell 增长到 43%～44%。下一步优先拆解/优化 ready 协议，并在高 batch A/B 验证同一 `(dst_rank, expert)` 的多行 WQE 批量 doorbell。
+
+详细表格、命令和原始日志见 `../test_logs/20260807_scatter_split_profile/RESULTS.md` 和 `../test_logs/20260807_scatter_split_profile/COMMANDS.md`。
 
 ## 当前决策
 
