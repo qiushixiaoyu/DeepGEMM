@@ -745,6 +745,14 @@ sm90_fp8_mega_moe_impl(void* y,
         // Sync with epilogue warps before pulling tokens.
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
+        // In lazy mode, one global producer warp turns the per-source ready
+        // slots into an epoch-tagged per-expert cache.  Other warps proceed
+        // independently and wait only for the expert prefix they need.
+        if constexpr (kLazyExpertCount) {
+            if (sm_idx == 0 and warp_idx == 0)
+                scheduler.publish_expert_recv_counts();
+        }
+
         // Token / SF pull loop
         uint32_t pull_mbarrier_phase = 0;
         const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
@@ -1045,7 +1053,12 @@ sm90_fp8_mega_moe_impl(void* y,
 
                 DG_STATIC_ASSERT(kNumDispatchWarps >= 2, "Not enough dispatch warps");
                 if (warp_idx == 0) {
-                    *workspace.get_expert_recv_count_sum_ptr(i) = 0;
+                    // Lazy cache entries carry a launch epoch and remain valid
+                    // until the producer overwrites them on the next launch.
+                    // Do not clear them while a slower SM may still consume
+                    // this launch's count.
+                    if constexpr (not kLazyExpertCount)
+                        *workspace.get_expert_recv_count_sum_ptr(i) = 0;
                 } else if (warp_idx == 1) {
                     if (cute::elect_one_sync() and cumulative_local_expert_recv_stats != nullptr)
                         ptx::red_add(cumulative_local_expert_recv_stats + i, static_cast<int>(num_recv_tokens));

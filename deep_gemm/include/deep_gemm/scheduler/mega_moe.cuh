@@ -115,9 +115,74 @@ struct MegaMoEScheduler {
         return static_cast<uint32_t>(value);
     }
 
-    // Warp-collective lazy fill.  Only the lane owning `expert_idx` polls the
-    // count slots; the other lanes wait at the warp boundary and consume the
-    // cached value through a shuffle.
+    // A single producer warp aggregates one expert at a time and publishes it
+    // into the otherwise-unused inter-node recv-count-sum slots.  Lanes split
+    // source ranks, so an expert's source slots are polled in parallel instead
+    // of being serialized by one owner lane.  The epoch is the cache lifetime:
+    // consumers ignore stale entries from previous launches.
+    CUTLASS_DEVICE void publish_expert_recv_counts() const {
+#ifdef DG_MEGA_MOE_INTERNODE
+        constexpr int64_t kSlotTimeoutCycles = 60ll * 2000000000ll;
+        const auto start_clock = clock64();
+        uint32_t expected_marker = static_cast<uint32_t>(
+            ptx::ld_acq_sys(dispatch_launch_epoch_ptr));
+        while (expected_marker == 0) {
+            DG_TRAP_ONLY_DEVICE_ASSERT(clock64() - start_clock < kSlotTimeoutCycles);
+            expected_marker = static_cast<uint32_t>(
+                ptx::ld_acq_sys(dispatch_launch_epoch_ptr));
+        }
+
+        const auto lane_idx = ptx::get_lane_idx();
+        for (uint32_t expert_idx = 0; expert_idx < kNumExpertsPerRank; ++ expert_idx) {
+            uint32_t lane_count = 0;
+            for (uint32_t src = lane_idx; src < kNumRanks; src += 32) {
+                const auto slot_ptr = workspace.get_expert_recv_count_ptr(src, expert_idx);
+                uint64_t slot_value = ptx::ld_acq_sys(slot_ptr);
+                while (static_cast<uint32_t>(slot_value >> 32) != expected_marker) {
+                    DG_TRAP_ONLY_DEVICE_ASSERT(clock64() - start_clock < kSlotTimeoutCycles);
+                    slot_value = ptx::ld_acq_sys(slot_ptr);
+                }
+                lane_count += static_cast<uint32_t>(slot_value);
+            }
+            const auto expert_count = __reduce_add_sync(0xffffffff, lane_count);
+            if (lane_idx == 0) {
+                const auto published_value =
+                    (static_cast<uint64_t>(expected_marker) << 32) | expert_count;
+                ptx::st_release_sys(
+                    workspace.get_expert_recv_count_sum_ptr(expert_idx), published_value);
+            }
+            __syncwarp();
+        }
+#endif
+    }
+
+    CUTLASS_DEVICE uint32_t wait_published_expert_recv_count(
+        const uint32_t& expert_idx) const {
+#ifdef DG_MEGA_MOE_INTERNODE
+        constexpr int64_t kSlotTimeoutCycles = 60ll * 2000000000ll;
+        const auto start_clock = clock64();
+        uint32_t expected_marker = static_cast<uint32_t>(
+            ptx::ld_acq_sys(dispatch_launch_epoch_ptr));
+        while (expected_marker == 0) {
+            DG_TRAP_ONLY_DEVICE_ASSERT(clock64() - start_clock < kSlotTimeoutCycles);
+            expected_marker = static_cast<uint32_t>(
+                ptx::ld_acq_sys(dispatch_launch_epoch_ptr));
+        }
+        const auto published_ptr = workspace.get_expert_recv_count_sum_ptr(expert_idx);
+        uint64_t value = ptx::ld_acq_sys(published_ptr);
+        while (static_cast<uint32_t>(value >> 32) != expected_marker) {
+            DG_TRAP_ONLY_DEVICE_ASSERT(clock64() - start_clock < kSlotTimeoutCycles);
+            value = ptx::ld_acq_sys(published_ptr);
+        }
+        return static_cast<uint32_t>(value);
+#else
+        return wait_expert_recv_count(expert_idx);
+#endif
+    }
+
+    // Warp-collective lazy fill.  Only the lane owning `expert_idx` waits for
+    // the producer's published cache entry; the other lanes wait at the warp
+    // boundary and consume the value through a shuffle.
     CUTLASS_DEVICE void ensure_expert_recv_count(const uint32_t& expert_idx) {
         DG_STATIC_ASSERT(kNumExpertsPerLane > 0, "Invalid number of experts per lane");
         const auto owner_lane = expert_idx % 32;
@@ -128,7 +193,8 @@ struct MegaMoEScheduler {
         valid = ptx::exchange(valid, owner_lane);
         if (valid == 0) {
             if (ptx::get_lane_idx() == owner_lane) {
-                stored_num_tokens_per_expert[owner_slot] = wait_expert_recv_count(expert_idx);
+                stored_num_tokens_per_expert[owner_slot] =
+                    wait_published_expert_recv_count(expert_idx);
                 stored_num_tokens_per_expert_valid[owner_slot] = 1;
             }
             __syncwarp();
