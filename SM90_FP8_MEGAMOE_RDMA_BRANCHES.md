@@ -1,6 +1,31 @@
 # SM90 FP8 MegaMOE RDMA 分支与优化记录
 
-更新时间：2026-08-05
+更新时间：2026-08-07
+
+## 2026-08-07 当前状态补充
+
+本节覆盖下文 2026-08-05 的“当前”描述；下文继续保留，作为简化基线和历史优化分支的查阅记录。
+
+- 当前开发分支：`experiment/mega-moe-combine-expert-ready`。
+- 当前代码提交：`2a127b975`，源码树与 single-producer lazy 实现 `278fc30c7` 完全一致；该提交只回退了性能不理想的 sharded-producer 实验。
+- dispatch 与 combine 均已采用 per-expert ready 协议；dispatch QP/metadata、三条 READ 的 reserve/doorbell，以及 combine full-pool staging 等后续改造已经落在本分支历史中。
+- scheduler 新增 `DG_MEGA_MOE_SCHEDULER_COUNT_IMPL=eager|lazy`。公开 Python/C++ 接口不变，默认值仍为 `eager`，只有显式设置 `lazy` 才启用本轮实验路径。
+- lazy 路径由一个全局 producer warp 按 expert 聚合各 source rank 的 count，并以 `(launch_epoch << 32) | count` 发布到 internode 路径下闲置的 `recv_count_sum`；consumer scheduler 按 expert 等待共享结果。没有新增 SymmBuffer 空间。
+
+本轮提交演进：
+
+| 提交 | 内容 | 决策 |
+|---|---|---|
+| `225c87404` | scheduler-local lazy cache，每个 scheduler 重复轮询 source count | 精度通过；性能回退 6%～19% |
+| `278fc30c7` | single global producer，lane 并行聚合 source，epoch-tagged shared cache | 精度通过；最终保留的 lazy 实验实现 |
+| `4d06101ba` | 多个 dispatch warp 按 expert 分片发布 | 精度通过；低 batch 退化，拒绝 |
+| `2a127b975` | 回退 sharded producer，恢复 single producer | 当前代码状态 |
+
+最终 single-producer tree 已在 COMM5、COMM6 的 `mega_moe_rdma` 容器中完成双机 16 卡验证：full-remote t64、同一 SymmBuffer t256 A/B 交替 100 次、7 种极端路由，以及 `NVSHMEM_QP_DEPTH=4096` 下 full-remote t8192 全部通过；最大归一化 diff 约 `0.0006`，无 NaN/nonfinite。
+
+性能方面，single-producer lazy 相对 eager 在 DeepSeekV4Flash、DeepSeekV4Pro、GLM5.2 的 batch 1/64/256 共 9 个点中，仅 Flash/b64 快 3.4%，其余 8 点慢 1.4%～4.4%。phase profile 表明全量 count wait 已从 dispatch barrier 中消失，但逐 expert cache wait、固定前缀扫描和 producer/consumer 调度成本抵消了提前 pull 的收益。因此当前只保留 lazy 实验入口，不切换默认路径。
+
+详细命令、精度、性能及 phase 数据见 `../test_logs/20260807_lazy_shared_count/RESULTS.md` 和 `../test_logs/20260807_lazy_shared_count/COMMANDS.md`。
 
 ## 当前决策
 
