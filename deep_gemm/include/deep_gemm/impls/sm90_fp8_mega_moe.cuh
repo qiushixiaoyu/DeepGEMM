@@ -745,12 +745,12 @@ sm90_fp8_mega_moe_impl(void* y,
         // Sync with epilogue warps before pulling tokens.
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
-        // In lazy mode, the dispatch warps on SM 0 turn the per-source ready
-        // slots into an epoch-tagged per-expert cache.  Other SMs proceed
+        // In lazy mode, one global producer warp turns the per-source ready
+        // slots into an epoch-tagged per-expert cache.  Other warps proceed
         // independently and wait only for the expert prefix they need.
         if constexpr (kLazyExpertCount) {
-            if (sm_idx == 0)
-                scheduler.publish_expert_recv_counts(warp_idx, kNumDispatchWarps);
+            if (sm_idx == 0 and warp_idx == 0)
+                scheduler.publish_expert_recv_counts();
         }
 
         // Token / SF pull loop

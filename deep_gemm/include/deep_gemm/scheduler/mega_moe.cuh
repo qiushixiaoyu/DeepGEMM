@@ -115,12 +115,12 @@ struct MegaMoEScheduler {
         return static_cast<uint32_t>(value);
     }
 
-    // A small producer-warp group aggregates experts into the otherwise-unused
-    // inter-node recv-count-sum slots.  Warps shard experts while lanes shard
-    // source ranks, so both dimensions are polled in parallel.  The epoch is
-    // the cache lifetime: consumers ignore stale entries from previous launches.
-    CUTLASS_DEVICE void publish_expert_recv_counts(
-        const uint32_t& producer_idx, const uint32_t& num_producers) const {
+    // A single producer warp aggregates one expert at a time and publishes it
+    // into the otherwise-unused inter-node recv-count-sum slots.  Lanes split
+    // source ranks, so an expert's source slots are polled in parallel instead
+    // of being serialized by one owner lane.  The epoch is the cache lifetime:
+    // consumers ignore stale entries from previous launches.
+    CUTLASS_DEVICE void publish_expert_recv_counts() const {
 #ifdef DG_MEGA_MOE_INTERNODE
         constexpr int64_t kSlotTimeoutCycles = 60ll * 2000000000ll;
         const auto start_clock = clock64();
@@ -133,9 +133,7 @@ struct MegaMoEScheduler {
         }
 
         const auto lane_idx = ptx::get_lane_idx();
-        for (uint32_t expert_idx = producer_idx;
-             expert_idx < kNumExpertsPerRank;
-             expert_idx += num_producers) {
+        for (uint32_t expert_idx = 0; expert_idx < kNumExpertsPerRank; ++ expert_idx) {
             uint32_t lane_count = 0;
             for (uint32_t src = lane_idx; src < kNumRanks; src += 32) {
                 const auto slot_ptr = workspace.get_expert_recv_count_ptr(src, expert_idx);
