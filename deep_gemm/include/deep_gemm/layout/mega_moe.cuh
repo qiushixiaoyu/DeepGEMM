@@ -448,6 +448,6 @@ struct Buffer {
 // the diagnostic branch, so toggling the JIT-only profiler does not change the
 // public API or any tensor slice.
 static constexpr uint32_t kSM90MegaMoEProfileMaxSMs = 256;
-static constexpr uint32_t kSM90MegaMoEProfileSlots = 22;
+static constexpr uint32_t kSM90MegaMoEProfileSlots = 27;
 
 } // namespace deep_gemm::layout

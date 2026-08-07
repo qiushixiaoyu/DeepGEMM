@@ -522,6 +522,82 @@ __device__ static __forceinline__ void put_nbi_warp(
     __syncwarp();
 }
 
+// Batch one row request per active lane onto a shared (dst_pe, qp_id).  Each
+// lane constructs all registration-boundary fragments for its row, while lane
+// 0 reserves the combined WQE range and rings one doorbell for the full batch.
+__device__ static __forceinline__ void put_nbi_warp_batch_rows(
+    uint64_t req_rptr, uint64_t req_lptr, size_t bytes, bool active,
+    int dst_pe, int qp_id, int lane_id) {
+    auto qp = ibgda_get_rc(dst_pe, qp_id);
+
+    uint32_t lane_num_wqes = 0;
+    uint64_t remaining_bytes = active ? bytes : 0;
+    uint64_t laddr = req_lptr;
+    uint64_t raddr = req_rptr;
+    while (remaining_bytes > 0) {
+        __be32 lkey, rkey;
+        uint64_t real_raddr;
+        const uint64_t chunk = min(
+            remaining_bytes,
+            ibgda_get_lkey_and_rkey(
+                laddr, &lkey, raddr, dst_pe, &real_raddr, &rkey,
+                qp->dev_idx));
+        DG_DEVICE_ASSERT(chunk > 0);
+        ++ lane_num_wqes;
+        laddr += chunk;
+        raddr += chunk;
+        remaining_bytes -= chunk;
+    }
+
+    uint32_t inclusive_wqes = lane_num_wqes;
+    #pragma unroll
+    for (uint32_t offset = 1; offset < 32; offset <<= 1) {
+        const uint32_t other = __shfl_up_sync(
+            0xffffffff, inclusive_wqes, offset);
+        if (lane_id >= static_cast<int>(offset))
+            inclusive_wqes += other;
+    }
+    const uint32_t lane_wqe_offset = inclusive_wqes - lane_num_wqes;
+    const uint32_t total_wqes = __shfl_sync(
+        0xffffffff, inclusive_wqes, 31);
+
+    uint64_t base_wqe_idx = 0;
+    if (lane_id == 0 and total_wqes != 0)
+        base_wqe_idx = ibgda_reserve_wqe_slots_with_credit(qp, total_wqes);
+    base_wqe_idx = __shfl_sync(0xffffffff, base_wqe_idx, 0);
+
+    remaining_bytes = active ? bytes : 0;
+    laddr = req_lptr;
+    raddr = req_rptr;
+    uint32_t local_wqe_idx = 0;
+    while (remaining_bytes > 0) {
+        __be32 lkey, rkey;
+        uint64_t real_raddr;
+        const uint64_t chunk = min(
+            remaining_bytes,
+            ibgda_get_lkey_and_rkey(
+                laddr, &lkey, raddr, dst_pe, &real_raddr, &rkey,
+                qp->dev_idx));
+        const uint64_t wqe_idx =
+            base_wqe_idx + lane_wqe_offset + local_wqe_idx;
+        auto wqe_ptr = ibgda_get_wqe_ptr(qp, wqe_idx);
+        ibgda_write_rdma_write_wqe(
+            qp, laddr, lkey, real_raddr, rkey,
+            static_cast<uint32_t>(chunk), static_cast<uint16_t>(wqe_idx),
+            &wqe_ptr);
+        ++ local_wqe_idx;
+        laddr += chunk;
+        raddr += chunk;
+        remaining_bytes -= chunk;
+    }
+    DG_DEVICE_ASSERT(local_wqe_idx == lane_num_wqes);
+    __syncwarp();
+
+    if (lane_id == 0 and total_wqes != 0)
+        ibgda_submit_requests(qp, base_wqe_idx, total_wqes);
+    __syncwarp();
+}
+
 // 单线程 RDMA READ(非阻塞发起)：laddr 本地目的(须在对称堆内)，raddr 本地对称地址
 // (翻译到 src_pe 的远端源)。阻塞语义 = get_thread(...) 后跟 quiet(src_pe, qp_id)。
 __device__ static __forceinline__ void get_thread(uint64_t laddr, uint64_t raddr, size_t bytes, int src_pe, int qp_id) {

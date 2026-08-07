@@ -292,7 +292,7 @@ sm90_fp8_mega_moe_impl(void* y,
         combine_full_row_staging_base);
 
     constexpr uint32_t kPhaseProfileMaxSMs = 256;
-    constexpr uint32_t kPhaseProfileSlots = 22;
+    constexpr uint32_t kPhaseProfileSlots = 27;
     const auto phase_profile_buffer = layout::Buffer(
         layout::Data(kPhaseProfileSlots * sizeof(uint64_t), false),
         1, kPhaseProfileMaxSMs,
@@ -324,6 +324,11 @@ sm90_fp8_mega_moe_impl(void* y,
         kProfileScatterArrival = 19,
         kProfileScatterWQE = 20,
         kProfileScatterReady = 21,
+        kProfileScatterReadyMask = 22,
+        kProfileScatterReadyAtomic = 23,
+        kProfileScatterReadyFence = 24,
+        kProfileScatterReadyNotify = 25,
+        kProfileScatterReadySync = 26,
     };
     auto phase_profile = phase_profile_buffer.get_data_buffer(sm_idx)
         .get_base_ptr<unsigned long long>();
@@ -1277,6 +1282,11 @@ sm90_fp8_mega_moe_impl(void* y,
         uint64_t profile_scatter_arrival_cycles = 0;
         uint64_t profile_scatter_wqe_cycles = 0;
         uint64_t profile_scatter_ready_cycles = 0;
+        uint64_t profile_scatter_ready_mask_cycles = 0;
+        uint64_t profile_scatter_ready_atomic_cycles = 0;
+        uint64_t profile_scatter_ready_fence_cycles = 0;
+        uint64_t profile_scatter_ready_notify_cycles = 0;
+        uint64_t profile_scatter_ready_sync_cycles = 0;
         uint32_t profile_l1_block_count = 0;
         uint32_t profile_l2_block_count = 0;
 #endif
@@ -1312,6 +1322,11 @@ sm90_fp8_mega_moe_impl(void* y,
             uint64_t profile_scatter_arrival_block_cycles = 0;
             uint64_t profile_scatter_wqe_block_cycles = 0;
             uint64_t profile_scatter_ready_block_cycles = 0;
+            uint64_t profile_scatter_ready_mask_block_cycles = 0;
+            uint64_t profile_scatter_ready_atomic_block_cycles = 0;
+            uint64_t profile_scatter_ready_fence_block_cycles = 0;
+            uint64_t profile_scatter_ready_notify_block_cycles = 0;
+            uint64_t profile_scatter_ready_sync_block_cycles = 0;
 #endif
             const uint32_t valid_m = scheduler.template get_valid_m<false>();
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
@@ -2569,6 +2584,65 @@ sm90_fp8_mega_moe_impl(void* y,
                     }
 #endif
                     if (smem_expert_count[1] != 0) {
+#ifdef DG_MEGA_MOE_COMBINE_BATCH_DOORBELL
+                        // Assign each destination rank to exactly one
+                        // epilogue warp.  Active lanes then contribute one row
+                        // each to a shared QP reservation and one doorbell.
+                        for (uint32_t dst_rank_idx = epilogue_warp_idx;
+                             dst_rank_idx < kNumRanks;
+                             dst_rank_idx += kNumEpilogueWarps) {
+                            if (dst_rank_idx / DG_MEGA_MOE_NVL_PEERS ==
+                                sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS)
+                                continue;
+
+                            for (uint32_t row_base = 0; row_base < valid_m;
+                                 row_base += 32) {
+                                const uint32_t row = row_base + lane_idx;
+                                uint32_t row_dst_rank_idx = 0;
+                                uint32_t row_dst_token_idx = 0;
+                                uint32_t row_dst_topk_idx = 0;
+                                if (row < valid_m) {
+                                    const auto src_metadata =
+                                        *workspace.get_token_src_metadata_ptr(m_idx + row);
+                                    row_dst_rank_idx = src_metadata.rank_idx;
+                                    row_dst_token_idx = src_metadata.token_idx;
+                                    row_dst_topk_idx = src_metadata.topk_idx;
+                                }
+
+                                const bool active = row < valid_m and
+                                    row_dst_rank_idx == dst_rank_idx;
+                                uint64_t src_ptr = 0;
+                                uint64_t dst_ptr = 0;
+                                if (active) {
+                                    const auto staging_row =
+                                        combine_full_row_staging_buffer
+                                            .get_data_buffer(m_idx + row);
+                                    const auto dst_row = combine_token_buffer
+                                        .get_rank_buffer(row_dst_topk_idx)
+                                        .get_data_buffer(row_dst_token_idx);
+                                    src_ptr = reinterpret_cast<uint64_t>(
+                                        staging_row.get_base_ptr());
+                                    dst_ptr = reinterpret_cast<uint64_t>(
+                                        dst_row.get_base_ptr());
+                                }
+                                const uint32_t active_mask = __ballot_sync(
+                                    0xffffffff, active);
+                                comm::ibgda::put_nbi_warp_batch_rows(
+                                    dst_ptr, src_ptr,
+                                    kHidden * sizeof(nv_bfloat16), active,
+                                    static_cast<int>(dst_rank_idx),
+                                    static_cast<int>(local_expert_idx),
+                                    static_cast<int>(lane_idx));
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                                if (lane_idx == 0)
+                                    atomicAdd(
+                                        phase_profile + kProfileScatterWriteCount,
+                                        static_cast<unsigned long long>(
+                                            __popc(active_mask)));
+#endif
+                            }
+                        }
+#else
                         for (uint32_t row = epilogue_warp_idx;
                              row < valid_m; row += kNumEpilogueWarps) {
                             const auto src_metadata =
@@ -2594,6 +2668,7 @@ sm90_fp8_mega_moe_impl(void* y,
 #endif
                             }
                         }
+#endif
                     }
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
 
@@ -2614,12 +2689,20 @@ sm90_fp8_mega_moe_impl(void* y,
                         // let the last M block emit one ready notification per
                         // destination rank.
                         if (epilogue_thread_idx == 0 and smem_expert_count[1] != 0) {
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                            uint64_t profile_ready_subphase_start = clock64();
+#endif
                             uint64_t block_dst_rank_mask = 0;
                             for (uint32_t row = 0; row < valid_m; ++ row) {
                                 const auto src_metadata =
                                     *workspace.get_token_src_metadata_ptr(m_idx + row);
                                 block_dst_rank_mask |= 1ull << src_metadata.rank_idx;
                             }
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                            profile_scatter_ready_mask_block_cycles =
+                                clock64() - profile_ready_subphase_start;
+                            profile_ready_subphase_start = clock64();
+#endif
 
                             const auto dst_rank_mask_ptr =
                                 workspace.get_combine_dst_rank_mask_ptr(local_expert_idx);
@@ -2630,6 +2713,11 @@ sm90_fp8_mega_moe_impl(void* y,
                                 workspace.get_combine_posted_block_count_ptr(local_expert_idx);
                             const auto old_posted_block_count =
                                 ptx::atomic_add_acq_rel_sys(posted_block_count_ptr, 1);
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                            profile_scatter_ready_atomic_block_cycles =
+                                clock64() - profile_ready_subphase_start;
+                            profile_ready_subphase_start = clock64();
+#endif
                             if (old_posted_block_count + 1 ==
                                 scheduler.get_current_num_m_blocks()) {
                                 const uint64_t dst_rank_mask =
@@ -2647,6 +2735,11 @@ sm90_fp8_mega_moe_impl(void* y,
                                 // ordering provides the corresponding order
                                 // for inter-node data WQEs and the ready WQE.
                                 __threadfence_system();
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                                profile_scatter_ready_fence_block_cycles =
+                                    clock64() - profile_ready_subphase_start;
+                                profile_ready_subphase_start = clock64();
+#endif
                                 for (uint32_t dst_rank_idx = 0;
                                      dst_rank_idx < kNumRanks; ++ dst_rank_idx) {
                                     if ((dst_rank_mask & (1ull << dst_rank_idx)) == 0)
@@ -2666,10 +2759,23 @@ sm90_fp8_mega_moe_impl(void* y,
                                             launch_epoch);
                                     }
                                 }
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                                profile_scatter_ready_notify_block_cycles =
+                                    clock64() - profile_ready_subphase_start;
+#endif
                             }
                         }
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                        const uint64_t profile_ready_sync_start =
+                            profile_math_leader ? clock64() : 0;
+#endif
                         ptx::sync_aligned(
                             kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                        if (profile_math_leader)
+                            profile_scatter_ready_sync_block_cycles =
+                                clock64() - profile_ready_sync_start;
+#endif
                     }
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
                     if (profile_math_leader) {
@@ -2741,6 +2847,16 @@ sm90_fp8_mega_moe_impl(void* y,
                         profile_scatter_wqe_block_cycles;
                     profile_scatter_ready_cycles +=
                         profile_scatter_ready_block_cycles;
+                    profile_scatter_ready_mask_cycles +=
+                        profile_scatter_ready_mask_block_cycles;
+                    profile_scatter_ready_atomic_cycles +=
+                        profile_scatter_ready_atomic_block_cycles;
+                    profile_scatter_ready_fence_cycles +=
+                        profile_scatter_ready_fence_block_cycles;
+                    profile_scatter_ready_notify_cycles +=
+                        profile_scatter_ready_notify_block_cycles;
+                    profile_scatter_ready_sync_cycles +=
+                        profile_scatter_ready_sync_block_cycles;
                 }
 #endif
             }
@@ -2799,6 +2915,16 @@ sm90_fp8_mega_moe_impl(void* y,
                 profile_scatter_wqe_cycles;
             phase_profile[kProfileScatterReady] =
                 profile_scatter_ready_cycles;
+            phase_profile[kProfileScatterReadyMask] =
+                profile_scatter_ready_mask_cycles;
+            phase_profile[kProfileScatterReadyAtomic] =
+                profile_scatter_ready_atomic_cycles;
+            phase_profile[kProfileScatterReadyFence] =
+                profile_scatter_ready_fence_cycles;
+            phase_profile[kProfileScatterReadyNotify] =
+                profile_scatter_ready_notify_cycles;
+            phase_profile[kProfileScatterReadySync] =
+                profile_scatter_ready_sync_cycles;
             phase_profile[kProfileL1BlockCount] = profile_l1_block_count;
             phase_profile[kProfileL2BlockCount] = profile_l2_block_count;
         }
@@ -3031,6 +3157,11 @@ sm90_fp8_mega_moe_impl(void* y,
             unsigned long long scatter_critical_arrival_cycles = 0;
             unsigned long long scatter_critical_wqe_cycles = 0;
             unsigned long long scatter_critical_ready_cycles = 0;
+            unsigned long long scatter_critical_ready_mask_cycles = 0;
+            unsigned long long scatter_critical_ready_atomic_cycles = 0;
+            unsigned long long scatter_critical_ready_fence_cycles = 0;
+            unsigned long long scatter_critical_ready_notify_cycles = 0;
+            unsigned long long scatter_critical_ready_sync_cycles = 0;
             for (uint32_t sm = 0; sm < kNumSMs; ++ sm) {
                 const auto row = phase_profile_buffer.get_data_buffer(sm)
                     .get_base_ptr<unsigned long long>();
@@ -3056,6 +3187,16 @@ sm90_fp8_mega_moe_impl(void* y,
                         row[kProfileScatterArrival];
                     scatter_critical_wqe_cycles = row[kProfileScatterWQE];
                     scatter_critical_ready_cycles = row[kProfileScatterReady];
+                    scatter_critical_ready_mask_cycles =
+                        row[kProfileScatterReadyMask];
+                    scatter_critical_ready_atomic_cycles =
+                        row[kProfileScatterReadyAtomic];
+                    scatter_critical_ready_fence_cycles =
+                        row[kProfileScatterReadyFence];
+                    scatter_critical_ready_notify_cycles =
+                        row[kProfileScatterReadyNotify];
+                    scatter_critical_ready_sync_cycles =
+                        row[kProfileScatterReadySync];
                 }
             }
             printf(
@@ -3065,7 +3206,10 @@ sm90_fp8_mega_moe_impl(void* y,
                 "l2_cycles=%llu scatter_cycles=%llu scatter_publish_cycles=%llu "
                 "scatter_critical_publish_cycles=%llu "
                 "scatter_staging_cycles=%llu scatter_arrival_cycles=%llu "
-                "scatter_wqe_cycles=%llu scatter_ready_cycles=%llu scatter_critical_sm=%u "
+                "scatter_wqe_cycles=%llu scatter_ready_cycles=%llu "
+                "scatter_ready_mask_cycles=%llu scatter_ready_atomic_cycles=%llu "
+                "scatter_ready_fence_cycles=%llu scatter_ready_notify_cycles=%llu "
+                "scatter_ready_sync_cycles=%llu scatter_critical_sm=%u "
                 "combine_barrier_cycles=%llu combine_ready_wait_cycles=%llu "
                 "combine_reduce_cycles=%llu total_cycles=%llu "
                 "remote_reads=%llu l1_blocks=%llu l2_blocks=%llu scatter_writes=%llu\n",
@@ -3080,6 +3224,11 @@ sm90_fp8_mega_moe_impl(void* y,
                 scatter_critical_arrival_cycles,
                 scatter_critical_wqe_cycles,
                 scatter_critical_ready_cycles,
+                scatter_critical_ready_mask_cycles,
+                scatter_critical_ready_atomic_cycles,
+                scatter_critical_ready_fence_cycles,
+                scatter_critical_ready_notify_cycles,
+                scatter_critical_ready_sync_cycles,
                 scatter_critical_sm,
                 max_cycles[kProfileCombineBarrier],
                 combine_ready_wait_cycles, max_cycles[kProfileCombineReduce],
