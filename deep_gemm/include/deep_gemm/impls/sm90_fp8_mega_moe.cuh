@@ -2688,7 +2688,122 @@ sm90_fp8_mega_moe_impl(void* y,
                         // Aggregate the source ranks touched by the expert and
                         // let the last M block emit one ready notification per
                         // destination rank.
+#ifdef DG_MEGA_MOE_COMBINE_PARALLEL_READY
+                        if (epilogue_warp_idx == 0 and smem_expert_count[1] != 0) {
+#else
                         if (epilogue_thread_idx == 0 and smem_expert_count[1] != 0) {
+#endif
+#ifdef DG_MEGA_MOE_COMBINE_PARALLEL_READY
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                            uint64_t profile_ready_subphase_start =
+                                profile_math_leader ? clock64() : 0;
+#endif
+                            uint64_t block_dst_rank_mask = 0;
+                            for (uint32_t row = lane_idx; row < valid_m; row += 32) {
+                                const auto src_metadata =
+                                    *workspace.get_token_src_metadata_ptr(m_idx + row);
+                                block_dst_rank_mask |= 1ull << src_metadata.rank_idx;
+                            }
+                            #pragma unroll
+                            for (uint32_t offset = 16; offset != 0; offset >>= 1)
+                                block_dst_rank_mask |= __shfl_down_sync(
+                                    0xffffffff, block_dst_rank_mask, offset);
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                            if (profile_math_leader) {
+                                profile_scatter_ready_mask_block_cycles =
+                                    clock64() - profile_ready_subphase_start;
+                                profile_ready_subphase_start = clock64();
+                            }
+#endif
+
+                            uint32_t publish_ready = 0;
+                            uint64_t dst_rank_mask = 0;
+                            uint64_t launch_epoch = 0;
+                            if (lane_idx == 0) {
+                                const auto dst_rank_mask_ptr =
+                                    workspace.get_combine_dst_rank_mask_ptr(
+                                        local_expert_idx);
+                                ptx::red_or_rel_gpu(
+                                    dst_rank_mask_ptr, block_dst_rank_mask);
+                                __threadfence();
+
+                                const auto posted_block_count_ptr =
+                                    workspace.get_combine_posted_block_count_ptr(
+                                        local_expert_idx);
+                                const auto old_posted_block_count =
+                                    ptx::atomic_add_acq_rel_sys(
+                                        posted_block_count_ptr, 1);
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                                profile_scatter_ready_atomic_block_cycles =
+                                    clock64() - profile_ready_subphase_start;
+                                profile_ready_subphase_start = clock64();
+#endif
+                                if (old_posted_block_count + 1 ==
+                                    scheduler.get_current_num_m_blocks()) {
+                                    dst_rank_mask = ptx::ld_acq_gpu(
+                                        dst_rank_mask_ptr);
+                                    launch_epoch = ptx::ld_acq_sys(
+                                        workspace.get_combine_launch_epoch_ptr());
+                                    DG_TRAP_ONLY_DEVICE_ASSERT(launch_epoch != 0);
+
+                                    // Acquire chains through the per-block and
+                                    // per-expert counters.  Publish all same-node
+                                    // stores before the local ready store; RC-QP
+                                    // ordering provides the corresponding order
+                                    // for inter-node data WQEs and the ready WQE.
+                                    __threadfence_system();
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                                    profile_scatter_ready_fence_block_cycles =
+                                        clock64() - profile_ready_subphase_start;
+                                    profile_ready_subphase_start = clock64();
+#endif
+                                    publish_ready = 1;
+                                }
+                            }
+
+                            publish_ready = __shfl_sync(
+                                0xffffffff, publish_ready, 0);
+                            dst_rank_mask = __shfl_sync(
+                                0xffffffff, dst_rank_mask, 0);
+                            launch_epoch = __shfl_sync(
+                                0xffffffff, launch_epoch, 0);
+                            if (publish_ready != 0) {
+                                // Lane 0's system fence must precede all lanes'
+                                // notification WQEs.  Each lane owns distinct
+                                // destination-rank QPs, so notifications can be
+                                // posted in parallel without QP contention.
+                                __syncwarp();
+                                const uint32_t global_expert_idx =
+                                    sym_buffer.rank_idx * kNumExpertsPerRank +
+                                    local_expert_idx;
+                                for (uint32_t dst_rank_idx = lane_idx;
+                                     dst_rank_idx < kNumRanks;
+                                     dst_rank_idx += 32) {
+                                    if ((dst_rank_mask & (1ull << dst_rank_idx)) == 0)
+                                        continue;
+                                    const auto ready_ptr =
+                                        workspace.get_combine_ready_epoch_ptr(
+                                            global_expert_idx);
+                                    if (dst_rank_idx / DG_MEGA_MOE_NVL_PEERS !=
+                                        sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS) {
+                                        comm::ibgda::put_inline_with_credit<uint64_t>(
+                                            ready_ptr, launch_epoch,
+                                            static_cast<int>(dst_rank_idx),
+                                            static_cast<int>(local_expert_idx));
+                                    } else {
+                                        ptx::st_relaxed_sys(
+                                            sym_buffer.map(ready_ptr, dst_rank_idx),
+                                            launch_epoch);
+                                    }
+                                }
+                                __syncwarp();
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                                if (profile_math_leader)
+                                    profile_scatter_ready_notify_block_cycles =
+                                        clock64() - profile_ready_subphase_start;
+#endif
+                            }
+#else
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
                             uint64_t profile_ready_subphase_start = clock64();
 #endif
@@ -2729,11 +2844,6 @@ sm90_fp8_mega_moe_impl(void* y,
                                     local_expert_idx;
                                 DG_TRAP_ONLY_DEVICE_ASSERT(launch_epoch != 0);
 
-                                // Acquire chains through the per-block and
-                                // per-expert counters.  Publish all same-node
-                                // stores before the local ready store; RC-QP
-                                // ordering provides the corresponding order
-                                // for inter-node data WQEs and the ready WQE.
                                 __threadfence_system();
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
                                 profile_scatter_ready_fence_block_cycles =
@@ -2764,6 +2874,7 @@ sm90_fp8_mega_moe_impl(void* y,
                                     clock64() - profile_ready_subphase_start;
 #endif
                             }
+#endif
                         }
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
                         const uint64_t profile_ready_sync_start =
@@ -3212,7 +3323,7 @@ sm90_fp8_mega_moe_impl(void* y,
                 "scatter_ready_sync_cycles=%llu scatter_critical_sm=%u "
                 "combine_barrier_cycles=%llu combine_ready_wait_cycles=%llu "
                 "combine_reduce_cycles=%llu total_cycles=%llu "
-                "remote_reads=%llu l1_blocks=%llu l2_blocks=%llu scatter_writes=%llu\n",
+                "remote_reads=%llu l1_blocks=%llu l2_blocks=%llu\n",
                 sym_buffer.rank_idx, num_tokens, BLOCK_M, BLOCK_N, WG_BLOCK_N,
                 max_cycles[kProfileMetadata], max_cycles[kProfileDispatchBarrier],
                 max_cycles[kProfileDispatchPull], max_cycles[kProfileRemoteRead],
@@ -3233,8 +3344,12 @@ sm90_fp8_mega_moe_impl(void* y,
                 max_cycles[kProfileCombineBarrier],
                 combine_ready_wait_cycles, max_cycles[kProfileCombineReduce],
                 max_cycles[kProfileTotal],
-                remote_read_count, l1_block_count, l2_block_count,
-                scatter_write_count);
+                remote_read_count, l1_block_count, l2_block_count);
+            // Keep the main device printf at CUDA's 32-argument limit.
+            printf(
+                "MEGA_MOE_SCATTER_COUNT_PROFILE rank=%u tokens=%u "
+                "scatter_writes=%llu\n",
+                sym_buffer.rank_idx, num_tokens, scatter_write_count);
         }
 #endif
     }

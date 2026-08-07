@@ -90,6 +90,8 @@ public:
             internode_prefix += "#define DG_MEGA_MOE_PHASE_PROFILE 1\n";
         if (get_env<int>("DG_MEGA_MOE_COMBINE_BATCH_DOORBELL", 0) != 0)
             internode_prefix += "#define DG_MEGA_MOE_COMBINE_BATCH_DOORBELL 1\n";
+        if (get_env<int>("DG_MEGA_MOE_COMBINE_PARALLEL_READY", 1) != 0)
+            internode_prefix += "#define DG_MEGA_MOE_COMBINE_PARALLEL_READY 1\n";
         return internode_prefix + fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 
