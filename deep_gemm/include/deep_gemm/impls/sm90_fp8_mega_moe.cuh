@@ -292,7 +292,7 @@ sm90_fp8_mega_moe_impl(void* y,
         combine_full_row_staging_base);
 
     constexpr uint32_t kPhaseProfileMaxSMs = 256;
-    constexpr uint32_t kPhaseProfileSlots = 18;
+    constexpr uint32_t kPhaseProfileSlots = 22;
     const auto phase_profile_buffer = layout::Buffer(
         layout::Data(kPhaseProfileSlots * sizeof(uint64_t), false),
         1, kPhaseProfileMaxSMs,
@@ -320,6 +320,10 @@ sm90_fp8_mega_moe_impl(void* y,
         kProfileScatterWriteCount = 15,
         kProfileStartClock = 16,
         kProfileCombineReadyWait = 17,
+        kProfileScatterStaging = 18,
+        kProfileScatterArrival = 19,
+        kProfileScatterWQE = 20,
+        kProfileScatterReady = 21,
     };
     auto phase_profile = phase_profile_buffer.get_data_buffer(sm_idx)
         .get_base_ptr<unsigned long long>();
@@ -1269,6 +1273,10 @@ sm90_fp8_mega_moe_impl(void* y,
         uint64_t profile_l2_cycles = 0;
         uint64_t profile_scatter_cycles = 0;
         uint64_t profile_scatter_publish_cycles = 0;
+        uint64_t profile_scatter_staging_cycles = 0;
+        uint64_t profile_scatter_arrival_cycles = 0;
+        uint64_t profile_scatter_wqe_cycles = 0;
+        uint64_t profile_scatter_ready_cycles = 0;
         uint32_t profile_l1_block_count = 0;
         uint32_t profile_l2_block_count = 0;
 #endif
@@ -1300,6 +1308,10 @@ sm90_fp8_mega_moe_impl(void* y,
             uint64_t profile_scatter_block_start = 0;
             uint64_t profile_scatter_block_cycles = 0;
             uint64_t profile_scatter_publish_block_cycles = 0;
+            uint64_t profile_scatter_staging_block_cycles = 0;
+            uint64_t profile_scatter_arrival_block_cycles = 0;
+            uint64_t profile_scatter_wqe_block_cycles = 0;
+            uint64_t profile_scatter_ready_block_cycles = 0;
 #endif
             const uint32_t valid_m = scheduler.template get_valid_m<false>();
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
@@ -2518,6 +2530,17 @@ sm90_fp8_mega_moe_impl(void* y,
                     }
                     __syncwarp();
 
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                    uint64_t profile_arrival_start = 0;
+                    if (profile_math_leader) {
+                        // Includes the initial CTA rendezvous, shared-memory
+                        // reads, metadata lookup, and HBM/NVLink row stores.
+                        profile_scatter_staging_block_cycles =
+                            clock64() - profile_scatter_block_start;
+                        profile_arrival_start = clock64();
+                    }
+#endif
+
                     // Publish this N-block only after every warpgroup has
                     // completed its HBM fragments.  The system-scope acq_rel
                     // RMW makes the final CTA acquire all earlier producers.
@@ -2536,8 +2559,14 @@ sm90_fp8_mega_moe_impl(void* y,
                     // warps divide the rows; all lanes in a warp cooperate on
                     // the registered WRITE.  qp_id is the sender local expert.
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
-                    const uint64_t profile_publish_start =
-                        profile_math_leader ? clock64() : 0;
+                    uint64_t profile_publish_start = 0;
+                    if (profile_math_leader) {
+                        // Includes the CTA rendezvous and system-scope arrival
+                        // RMW that elect the final N-block producer.
+                        profile_scatter_arrival_block_cycles =
+                            clock64() - profile_arrival_start;
+                        profile_publish_start = clock64();
+                    }
 #endif
                     if (smem_expert_count[1] != 0) {
                         for (uint32_t row = epilogue_warp_idx;
@@ -2568,6 +2597,16 @@ sm90_fp8_mega_moe_impl(void* y,
                     }
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
 
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                    uint64_t profile_ready_start = 0;
+                    if (profile_math_leader) {
+                        // The final producer builds/posts full-row WQEs; the
+                        // following CTA rendezvous is part of this interval.
+                        profile_scatter_wqe_block_cycles =
+                            clock64() - profile_publish_start;
+                        profile_ready_start = clock64();
+                    }
+#endif
                     if constexpr (kCombineExpertReady) {
                         // Every M block, including a local-only block, reaches
                         // this point after all of its N blocks have published.
@@ -2633,9 +2672,14 @@ sm90_fp8_mega_moe_impl(void* y,
                             kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                     }
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
-                    if (profile_math_leader)
+                    if (profile_math_leader) {
+                        // Destination-mask aggregation, expert completion
+                        // accounting, system fence, and ordered ready WQEs.
+                        profile_scatter_ready_block_cycles =
+                            clock64() - profile_ready_start;
                         profile_scatter_publish_block_cycles =
                             clock64() - profile_publish_start;
+                    }
 #endif
                 } else
 #endif
@@ -2689,6 +2733,14 @@ sm90_fp8_mega_moe_impl(void* y,
                     profile_scatter_cycles += profile_scatter_block_cycles;
                     profile_scatter_publish_cycles +=
                         profile_scatter_publish_block_cycles;
+                    profile_scatter_staging_cycles +=
+                        profile_scatter_staging_block_cycles;
+                    profile_scatter_arrival_cycles +=
+                        profile_scatter_arrival_block_cycles;
+                    profile_scatter_wqe_cycles +=
+                        profile_scatter_wqe_block_cycles;
+                    profile_scatter_ready_cycles +=
+                        profile_scatter_ready_block_cycles;
                 }
 #endif
             }
@@ -2739,6 +2791,14 @@ sm90_fp8_mega_moe_impl(void* y,
             phase_profile[kProfileScatter] = profile_scatter_cycles;
             phase_profile[kProfileScatterPublish] =
                 profile_scatter_publish_cycles;
+            phase_profile[kProfileScatterStaging] =
+                profile_scatter_staging_cycles;
+            phase_profile[kProfileScatterArrival] =
+                profile_scatter_arrival_cycles;
+            phase_profile[kProfileScatterWQE] =
+                profile_scatter_wqe_cycles;
+            phase_profile[kProfileScatterReady] =
+                profile_scatter_ready_cycles;
             phase_profile[kProfileL1BlockCount] = profile_l1_block_count;
             phase_profile[kProfileL2BlockCount] = profile_l2_block_count;
         }
@@ -2958,7 +3018,7 @@ sm90_fp8_mega_moe_impl(void* y,
             });
 
         if (sm_idx == 0 and epilogue_thread_idx == 0) {
-            unsigned long long max_cycles[kProfileTotal + 1] = {};
+            unsigned long long max_cycles[kPhaseProfileSlots] = {};
             unsigned long long remote_read_count = 0;
             unsigned long long l1_block_count = 0;
             unsigned long long l2_block_count = 0;
@@ -2968,7 +3028,7 @@ sm90_fp8_mega_moe_impl(void* y,
                 const auto row = phase_profile_buffer.get_data_buffer(sm)
                     .get_base_ptr<unsigned long long>();
                 #pragma unroll
-                for (uint32_t slot = 0; slot <= kProfileTotal; ++ slot)
+                for (uint32_t slot = 0; slot < kPhaseProfileSlots; ++ slot)
                     max_cycles[slot] = max_cycles[slot] > row[slot]
                         ? max_cycles[slot] : row[slot];
                 remote_read_count += row[kProfileRemoteReadCount];
@@ -2984,6 +3044,8 @@ sm90_fp8_mega_moe_impl(void* y,
                 "metadata_cycles=%llu dispatch_barrier_cycles=%llu dispatch_pull_cycles=%llu "
                 "remote_read_cycles=%llu cleanup_barrier_cycles=%llu l1_cycles=%llu "
                 "l2_cycles=%llu scatter_cycles=%llu scatter_publish_cycles=%llu "
+                "scatter_staging_cycles=%llu scatter_arrival_cycles=%llu "
+                "scatter_wqe_cycles=%llu scatter_ready_cycles=%llu "
                 "combine_barrier_cycles=%llu combine_ready_wait_cycles=%llu "
                 "combine_reduce_cycles=%llu total_cycles=%llu "
                 "remote_reads=%llu l1_blocks=%llu l2_blocks=%llu scatter_writes=%llu\n",
@@ -2993,6 +3055,10 @@ sm90_fp8_mega_moe_impl(void* y,
                 max_cycles[kProfileCleanupBarrier], max_cycles[kProfileL1],
                 max_cycles[kProfileL2], max_cycles[kProfileScatter],
                 max_cycles[kProfileScatterPublish],
+                max_cycles[kProfileScatterStaging],
+                max_cycles[kProfileScatterArrival],
+                max_cycles[kProfileScatterWQE],
+                max_cycles[kProfileScatterReady],
                 max_cycles[kProfileCombineBarrier],
                 combine_ready_wait_cycles, max_cycles[kProfileCombineReduce],
                 max_cycles[kProfileTotal],
