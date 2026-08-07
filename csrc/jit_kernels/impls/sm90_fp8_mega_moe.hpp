@@ -45,6 +45,7 @@ public:
         bool l2_epilogue_requires_full_sync;
         bool split_phase_hot_path;
         bool dispatch_expert_ready;
+        bool lazy_expert_count;
         bool combine_full_row;
         bool combine_expert_ready;
         bool use_swap_ab;
@@ -114,6 +115,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -136,6 +138,7 @@ static void __instantiate_kernel() {{
     args.l2_epilogue_requires_full_sync ? "true" : "false",
     args.split_phase_hot_path ? "true" : "false",
     args.dispatch_expert_ready ? "true" : "false",
+    args.lazy_expert_count ? "true" : "false",
     args.combine_full_row ? "true" : "false",
     args.combine_expert_ready ? "true" : "false",
     args.use_swap_ab ? "true" : "false");
@@ -175,6 +178,7 @@ static void sm90_fp8_mega_moe(
     const float& activation_clamp,
     const bool& fast_math,
     const bool& dispatch_expert_ready,
+    const bool& lazy_expert_count,
     const bool& combine_full_row,
     const bool& combine_expert_ready
 ) {
@@ -312,6 +316,7 @@ static void sm90_fp8_mega_moe(
         .l2_epilogue_requires_full_sync = l2_epilogue_requires_full_sync,
         .split_phase_hot_path = split_phase_hot_path,
         .dispatch_expert_ready = dispatch_expert_ready,
+        .lazy_expert_count = lazy_expert_count,
         .combine_full_row = combine_full_row,
         .combine_expert_ready = combine_expert_ready,
         .use_swap_ab = use_swap_ab,

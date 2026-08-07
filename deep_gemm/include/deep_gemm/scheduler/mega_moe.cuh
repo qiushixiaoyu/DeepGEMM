@@ -27,7 +27,8 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
           uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K,
           uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K,
-          typename WorkspaceT = layout::Workspace>
+          typename WorkspaceT = layout::Workspace,
+          bool kLazyExpertCount = false>
 struct MegaMoEScheduler {
     DG_STATIC_ASSERT(L1_SHAPE_N % BLOCK_N == 0, "Invalid shape");
     DG_STATIC_ASSERT(L2_SHAPE_N % BLOCK_N == 0, "Invalid shape");
@@ -56,9 +57,11 @@ struct MegaMoEScheduler {
     uint32_t m_block_idx = 0;
     uint32_t n_block_idx = 0;
 
-    // Pre-cached per-expert token counts (filled during `for_each_block` init)
+    // Per-expert token counts.  The eager scheduler fills the complete array
+    // before scheduling starts; the lazy scheduler fills entries on demand.
     // Layout: `stored_num_tokens_per_expert[i]` holds expert (i * 32 + lane_idx)'s count
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
+    uint32_t stored_num_tokens_per_expert_valid[kNumExpertsPerLane] = {};
 
     CUTLASS_DEVICE explicit MegaMoEScheduler(
         const WorkspaceT& workspace, const uint64_t* dispatch_launch_epoch_ptr = nullptr):
@@ -72,7 +75,69 @@ struct MegaMoEScheduler {
         return cute::min(aligned, kNumExpertsPerRank);
     }
 
-    CUTLASS_DEVICE uint32_t get_num_tokens(const uint32_t& expert_idx) const {
+    // Wait until all source ranks have published the count for one local
+    // expert, then return its aggregate token count.  In expert-ready mode,
+    // each source's route entries and final epoch/count marker share one RC
+    // QP, so observing the marker also orders the corresponding route slots.
+    CUTLASS_DEVICE uint32_t wait_expert_recv_count(const uint32_t& expert_idx) const {
+        uint64_t value = 0;
+#ifdef DG_MEGA_MOE_INTERNODE
+        // Keep a bounded wait so a missing RDMA write fails instead of hanging forever.
+        constexpr int64_t kSlotTimeoutCycles = 60ll * 2000000000ll;
+        const auto start_clock = clock64();
+        uint32_t expected_marker = kNumSMs;
+        if (dispatch_launch_epoch_ptr != nullptr) {
+            expected_marker = static_cast<uint32_t>(
+                ptx::ld_acq_sys(dispatch_launch_epoch_ptr));
+            while (expected_marker == 0) {
+                DG_TRAP_ONLY_DEVICE_ASSERT(clock64() - start_clock < kSlotTimeoutCycles);
+                expected_marker = static_cast<uint32_t>(
+                    ptx::ld_acq_sys(dispatch_launch_epoch_ptr));
+            }
+        }
+        for (uint32_t src = 0; src < kNumRanks; ++ src) {
+            const auto slot_ptr = workspace.get_expert_recv_count_ptr(src, expert_idx);
+            uint64_t slot_value = ptx::ld_acq_sys(slot_ptr);
+            while (static_cast<uint32_t>(slot_value >> 32) != expected_marker) {
+                DG_TRAP_ONLY_DEVICE_ASSERT(clock64() - start_clock < kSlotTimeoutCycles);
+                if (dispatch_launch_epoch_ptr != nullptr)
+                    expected_marker = static_cast<uint32_t>(
+                        ptx::ld_acq_sys(dispatch_launch_epoch_ptr));
+                slot_value = ptx::ld_acq_sys(slot_ptr);
+            }
+            value += slot_value & 0xffffffffull;
+        }
+#else
+        do {
+            value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
+        } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+#endif
+        return static_cast<uint32_t>(value);
+    }
+
+    // Warp-collective lazy fill.  Only the lane owning `expert_idx` polls the
+    // count slots; the other lanes wait at the warp boundary and consume the
+    // cached value through a shuffle.
+    CUTLASS_DEVICE void ensure_expert_recv_count(const uint32_t& expert_idx) {
+        DG_STATIC_ASSERT(kNumExpertsPerLane > 0, "Invalid number of experts per lane");
+        const auto owner_lane = expert_idx % 32;
+        const auto owner_slot = expert_idx / 32;
+        uint32_t valid = 0;
+        if (ptx::get_lane_idx() == owner_lane)
+            valid = stored_num_tokens_per_expert_valid[owner_slot];
+        valid = ptx::exchange(valid, owner_lane);
+        if (valid == 0) {
+            if (ptx::get_lane_idx() == owner_lane) {
+                stored_num_tokens_per_expert[owner_slot] = wait_expert_recv_count(expert_idx);
+                stored_num_tokens_per_expert_valid[owner_slot] = 1;
+            }
+            __syncwarp();
+        }
+    }
+
+    CUTLASS_DEVICE uint32_t get_num_tokens(const uint32_t& expert_idx) {
+        if constexpr (kLazyExpertCount)
+            ensure_expert_recv_count(expert_idx);
         uint32_t valid_value;
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
@@ -84,6 +149,13 @@ struct MegaMoEScheduler {
 
     // Get pool block offset for a given expert index from a per-lane token count array
     CUTLASS_DEVICE uint32_t get_pool_block_offset(const uint32_t& expert_idx) {
+        if constexpr (kLazyExpertCount) {
+            // The pool layout remains the fixed expert-prefix layout.  Expert
+            // e can start once counts [0, e] are known; later experts are not
+            // part of its placement dependency.
+            for (uint32_t i = 0; i < expert_idx; ++ i)
+                ensure_expert_recv_count(i);
+        }
         uint32_t num_blocks = 0;
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
@@ -96,7 +168,8 @@ struct MegaMoEScheduler {
     CUTLASS_DEVICE void advance_expert_idx() {
         current_pool_block_offset += get_current_num_m_blocks();
         current_local_expert_idx += 1;
-        current_num_tokens = get_num_tokens(current_local_expert_idx);
+        if (current_local_expert_idx < kNumExpertsPerRank)
+            current_num_tokens = get_num_tokens(current_local_expert_idx);
     }
 
     CUTLASS_DEVICE void set_expert_idx(const uint32_t& expert_idx) {
@@ -191,46 +264,10 @@ struct MegaMoEScheduler {
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
-            uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
-#ifdef DG_MEGA_MOE_INTERNODE
-                // Legacy slots use kNumSMs as the high-32 arrival marker.  The
-                // barrier-free dispatch path instead uses this launch's epoch.
-                // Route entries and the final epoch/count WRITE share one RC
-                // QP, so observing the ready value also orders all route slots.
-                // Keep a bounded wait so a missing RDMA write fails instead of hanging forever.
-                constexpr int64_t kSlotTimeoutCycles = 60ll * 2000000000ll;
-                const auto start_clock = clock64();
-                uint32_t expected_marker = kNumSMs;
-                if (dispatch_launch_epoch_ptr != nullptr) {
-                    expected_marker = static_cast<uint32_t>(
-                        ptx::ld_acq_sys(dispatch_launch_epoch_ptr));
-                    while (expected_marker == 0) {
-                        DG_TRAP_ONLY_DEVICE_ASSERT(clock64() - start_clock < kSlotTimeoutCycles);
-                        expected_marker = static_cast<uint32_t>(
-                            ptx::ld_acq_sys(dispatch_launch_epoch_ptr));
-                    }
-                }
-                value = 0;
-                for (uint32_t src = 0; src < kNumRanks; ++ src) {
-                    const auto slot_ptr = workspace.get_expert_recv_count_ptr(src, expert_idx);
-                    uint64_t slot_value = ptx::ld_acq_sys(slot_ptr);
-                    while (static_cast<uint32_t>(slot_value >> 32) != expected_marker) {
-                        DG_TRAP_ONLY_DEVICE_ASSERT(clock64() - start_clock < kSlotTimeoutCycles);
-                        if (dispatch_launch_epoch_ptr != nullptr)
-                            expected_marker = static_cast<uint32_t>(
-                                ptx::ld_acq_sys(dispatch_launch_epoch_ptr));
-                        slot_value = ptx::ld_acq_sys(slot_ptr);
-                    }
-                    value += slot_value & 0xffffffffull;
-                }
-#else
-                do {
-                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
-#endif
+                stored_num_tokens_per_expert[i] = wait_expert_recv_count(expert_idx);
+                stored_num_tokens_per_expert_valid[i] = 1;
             }
-            stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }
         __syncwarp();
     }
@@ -238,7 +275,8 @@ struct MegaMoEScheduler {
     template <typename Func>
     CUTLASS_DEVICE void for_each_block(Func&& func) {
         // Wait for all expert counters to be finalized
-        fetch_expert_recv_count();
+        if constexpr (not kLazyExpertCount)
+            fetch_expert_recv_count();
 
         // Initialize current expert with 0
         set_expert_idx(0);

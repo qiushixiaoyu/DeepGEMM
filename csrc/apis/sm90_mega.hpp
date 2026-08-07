@@ -29,6 +29,11 @@ enum class SM90MegaMoEDispatchImpl {
     ExpertReady,
 };
 
+enum class SM90MegaMoESchedulerCountImpl {
+    Eager,
+    Lazy,
+};
+
 // Keep the legacy path available for A/B and cache the selection for the
 // lifetime of a SymmBuffer, matching the combine selector's behavior.
 static SM90MegaMoEDispatchImpl get_sm90_mega_moe_dispatch_impl() {
@@ -38,6 +43,20 @@ static SM90MegaMoEDispatchImpl get_sm90_mega_moe_dispatch_impl() {
         DG_HOST_ASSERT(value == "legacy" or value == "expert_ready");
         return value == "expert_ready" ?
             SM90MegaMoEDispatchImpl::ExpertReady : SM90MegaMoEDispatchImpl::Legacy;
+    }();
+    return impl;
+}
+
+// Keep eager as the default and as an A/B reference.  Lazy count scheduling
+// relies on the per-expert epoch/count marker provided by expert-ready
+// dispatch, so the API validates that pairing before launch.
+static SM90MegaMoESchedulerCountImpl get_sm90_mega_moe_scheduler_count_impl() {
+    static const auto impl = []() {
+        const auto value = get_env<std::string>(
+            "DG_MEGA_MOE_SCHEDULER_COUNT_IMPL", std::string("eager"));
+        DG_HOST_ASSERT(value == "eager" or value == "lazy");
+        return value == "lazy" ?
+            SM90MegaMoESchedulerCountImpl::Lazy : SM90MegaMoESchedulerCountImpl::Eager;
     }();
     return impl;
 }
@@ -438,6 +457,11 @@ static void fp8_mega_moe(
     const auto num_experts_ = num_experts_per_rank * num_ranks;
     const auto combine_impl = get_sm90_mega_moe_combine_impl();
     const auto dispatch_impl = get_sm90_mega_moe_dispatch_impl();
+    const auto scheduler_count_impl = get_sm90_mega_moe_scheduler_count_impl();
+    if (scheduler_count_impl == SM90MegaMoESchedulerCountImpl::Lazy) {
+        DG_HOST_ASSERT(dispatch_impl == SM90MegaMoEDispatchImpl::ExpertReady);
+        DG_HOST_ASSERT(num_ranks > 8);
+    }
     if ((combine_impl != SM90MegaMoECombineImpl::Legacy or
          dispatch_impl != SM90MegaMoEDispatchImpl::Legacy) and num_ranks > 8) {
         const auto num_rc_per_pe = get_env<int>("NVSHMEM_IBGDA_NUM_RC_PER_PE", 0);
@@ -466,6 +490,7 @@ static void fp8_mega_moe(
                      hidden, intermediate_hidden,
                      activation_clamp, fast_math,
                      dispatch_impl == SM90MegaMoEDispatchImpl::ExpertReady and num_ranks > 8,
+                     scheduler_count_impl == SM90MegaMoESchedulerCountImpl::Lazy,
                      combine_impl != SM90MegaMoECombineImpl::Legacy and num_ranks > 8,
                      combine_impl == SM90MegaMoECombineImpl::ExpertReady and num_ranks > 8);
 

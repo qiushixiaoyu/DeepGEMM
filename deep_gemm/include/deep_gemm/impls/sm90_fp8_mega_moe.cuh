@@ -74,7 +74,8 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumExpertsPerLane,
           uint32_t kNumL1BlockNs, uint32_t kNumL2BlockNs,
           uint32_t kNumL1BlockKs, uint32_t kNumL2BlockKs,
-          typename WorkspaceT, typename L1Func, typename L2Func>
+          typename WorkspaceT, bool kLazyExpertCount,
+          typename L1Func, typename L2Func>
 CUTLASS_DEVICE void sm90_fp8_mega_moe_for_each_block_split(
     sched::MegaMoEScheduler<BLOCK_M, BLOCK_N, BLOCK_K,
                             L1_SHAPE_N, L1_SHAPE_K,
@@ -85,9 +86,10 @@ CUTLASS_DEVICE void sm90_fp8_mega_moe_for_each_block_split(
                             kNumExpertsPerLane,
                             kNumL1BlockNs, kNumL2BlockNs,
                             kNumL1BlockKs, kNumL2BlockKs,
-                            WorkspaceT>& scheduler,
+                            WorkspaceT, kLazyExpertCount>& scheduler,
     L1Func&& l1_func, L2Func&& l2_func) {
-    scheduler.fetch_expert_recv_count();
+    if constexpr (not kLazyExpertCount)
+        scheduler.fetch_expert_recv_count();
     scheduler.set_expert_idx(0);
 
     while (true) {
@@ -144,6 +146,7 @@ template <
     bool kL2EpilogueRequiresFullSync,
     bool kSplitPhaseHotPath,
     bool kDispatchExpertReady,
+    bool kLazyExpertCount,
     bool kCombineFullRow,
     bool kCombineExpertReady,
     bool kFP8SwapAB = false,
@@ -193,6 +196,8 @@ sm90_fp8_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(BLOCK_K == 128, "BLOCK_K is fixed to 128 (per-128 SF)");
     DG_STATIC_ASSERT(not kCombineExpertReady or kCombineFullRow,
                      "Per-expert ready requires full-row combine staging");
+    DG_STATIC_ASSERT(not kLazyExpertCount or kDispatchExpertReady,
+                     "Lazy expert counts require expert-ready dispatch");
     DG_STATIC_ASSERT(not kCombineExpertReady or kNumRanks <= 64,
                      "Per-expert destination mask supports at most 64 ranks");
 
@@ -526,7 +531,7 @@ sm90_fp8_mega_moe_impl(void* y,
         kNumSMs, kNumRanks,
         kNumExpertsPerLane, kNumL1BlockNs, kNumL2BlockNs,
         kNumL1BlockKs, kNumL2BlockKs,
-        layout::SM90Workspace>(
+        layout::SM90Workspace, kLazyExpertCount>(
             workspace,
             kDispatchExpertReady ? workspace.get_dispatch_launch_epoch_ptr() : nullptr);
 
@@ -722,7 +727,8 @@ sm90_fp8_mega_moe_impl(void* y,
             profile_dispatch_leader ? clock64() : 0;
 #endif
         if constexpr (kDispatchExpertReady) {
-            scheduler.fetch_expert_recv_count();
+            if constexpr (not kLazyExpertCount)
+                scheduler.fetch_expert_recv_count();
         } else {
             comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                                  kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
