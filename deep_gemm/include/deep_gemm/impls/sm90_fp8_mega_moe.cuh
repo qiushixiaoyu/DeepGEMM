@@ -3024,6 +3024,13 @@ sm90_fp8_mega_moe_impl(void* y,
             unsigned long long l2_block_count = 0;
             unsigned long long scatter_write_count = 0;
             unsigned long long combine_ready_wait_cycles = 0;
+            uint32_t scatter_critical_sm = 0;
+            unsigned long long scatter_critical_cycles = 0;
+            unsigned long long scatter_critical_publish_cycles = 0;
+            unsigned long long scatter_critical_staging_cycles = 0;
+            unsigned long long scatter_critical_arrival_cycles = 0;
+            unsigned long long scatter_critical_wqe_cycles = 0;
+            unsigned long long scatter_critical_ready_cycles = 0;
             for (uint32_t sm = 0; sm < kNumSMs; ++ sm) {
                 const auto row = phase_profile_buffer.get_data_buffer(sm)
                     .get_base_ptr<unsigned long long>();
@@ -3038,14 +3045,27 @@ sm90_fp8_mega_moe_impl(void* y,
                 combine_ready_wait_cycles =
                     combine_ready_wait_cycles > row[kProfileCombineReadyWait] ?
                     combine_ready_wait_cycles : row[kProfileCombineReadyWait];
+                if (row[kProfileScatter] > scatter_critical_cycles) {
+                    scatter_critical_sm = sm;
+                    scatter_critical_cycles = row[kProfileScatter];
+                    scatter_critical_publish_cycles =
+                        row[kProfileScatterPublish];
+                    scatter_critical_staging_cycles =
+                        row[kProfileScatterStaging];
+                    scatter_critical_arrival_cycles =
+                        row[kProfileScatterArrival];
+                    scatter_critical_wqe_cycles = row[kProfileScatterWQE];
+                    scatter_critical_ready_cycles = row[kProfileScatterReady];
+                }
             }
             printf(
                 "MEGA_MOE_PHASE_PROFILE rank=%u tokens=%u block_m=%u block_n=%u wg_n=%u "
                 "metadata_cycles=%llu dispatch_barrier_cycles=%llu dispatch_pull_cycles=%llu "
                 "remote_read_cycles=%llu cleanup_barrier_cycles=%llu l1_cycles=%llu "
                 "l2_cycles=%llu scatter_cycles=%llu scatter_publish_cycles=%llu "
+                "scatter_critical_publish_cycles=%llu "
                 "scatter_staging_cycles=%llu scatter_arrival_cycles=%llu "
-                "scatter_wqe_cycles=%llu scatter_ready_cycles=%llu "
+                "scatter_wqe_cycles=%llu scatter_ready_cycles=%llu scatter_critical_sm=%u "
                 "combine_barrier_cycles=%llu combine_ready_wait_cycles=%llu "
                 "combine_reduce_cycles=%llu total_cycles=%llu "
                 "remote_reads=%llu l1_blocks=%llu l2_blocks=%llu scatter_writes=%llu\n",
@@ -3055,10 +3075,12 @@ sm90_fp8_mega_moe_impl(void* y,
                 max_cycles[kProfileCleanupBarrier], max_cycles[kProfileL1],
                 max_cycles[kProfileL2], max_cycles[kProfileScatter],
                 max_cycles[kProfileScatterPublish],
-                max_cycles[kProfileScatterStaging],
-                max_cycles[kProfileScatterArrival],
-                max_cycles[kProfileScatterWQE],
-                max_cycles[kProfileScatterReady],
+                scatter_critical_publish_cycles,
+                scatter_critical_staging_cycles,
+                scatter_critical_arrival_cycles,
+                scatter_critical_wqe_cycles,
+                scatter_critical_ready_cycles,
+                scatter_critical_sm,
                 max_cycles[kProfileCombineBarrier],
                 combine_ready_wait_cycles, max_cycles[kProfileCombineReduce],
                 max_cycles[kProfileTotal],
