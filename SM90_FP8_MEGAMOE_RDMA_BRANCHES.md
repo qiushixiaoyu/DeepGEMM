@@ -7,7 +7,7 @@
 本节覆盖下文 2026-08-05 的“当前”描述；下文继续保留，作为简化基线和历史优化分支的查阅记录。
 
 - 当前开发分支：`experiment/mega-moe-combine-expert-ready`。
-- 当前 HEAD：`ab4804e0c`。运行时功能仍以 `2a127b975` 为基础；后续 `b04d9299e`、`ab4804e0c` 只扩展 phase profiler，将 scatter 拆成四段并保证四段来自同一个 critical SM。
+- 当前 HEAD：`cf99dde67`。`7bae60048` 增加 expert-ready 子阶段打点和 combine 多行批量 doorbell 实验；`cf99dde67` 将 ready mask/notify 改为 warp 并行，并保留串行回退路径。
 - dispatch 与 combine 均已采用 per-expert ready 协议；dispatch QP/metadata、三条 READ 的 reserve/doorbell，以及 combine full-pool staging 等后续改造已经落在本分支历史中。
 - scheduler 新增 `DG_MEGA_MOE_SCHEDULER_COUNT_IMPL=eager|lazy`。公开 Python/C++ 接口不变，默认值仍为 `eager`，只有显式设置 `lazy` 才启用本轮实验路径。
 - lazy 路径由一个全局 producer warp 按 expert 聚合各 source rank 的 count，并以 `(launch_epoch << 32) | count` 发布到 internode 路径下闲置的 `recv_count_sum`；consumer scheduler 按 expert 等待共享结果。没有新增 SymmBuffer 空间。
@@ -19,7 +19,9 @@
 | `225c87404` | scheduler-local lazy cache，每个 scheduler 重复轮询 source count | 精度通过；性能回退 6%～19% |
 | `278fc30c7` | single global producer，lane 并行聚合 source，epoch-tagged shared cache | 精度通过；最终保留的 lazy 实验实现 |
 | `4d06101ba` | 多个 dispatch warp 按 expert 分片发布 | 精度通过；低 batch 退化，拒绝 |
-| `2a127b975` | 回退 sharded producer，恢复 single producer | 当前代码状态 |
+| `2a127b975` | 回退 sharded producer，恢复 single producer | 当前 eager/lazy scheduler 功能基线 |
+| `7bae60048` | ready 五段 profile；同 `(dst_rank, expert)` 多行一次 reserve/doorbell | 精度通过；batch 路径保留为显式实验开关 |
+| `cf99dde67` | warp 并行 destination mask 与 per-rank ready notify | 精度通过；b64/b256 三模型均明显改善，默认开启 |
 
 最终 single-producer tree 已在 COMM5、COMM6 的 `mega_moe_rdma` 容器中完成双机 16 卡验证：full-remote t64、同一 SymmBuffer t256 A/B 交替 100 次、7 种极端路由，以及 `NVSHMEM_QP_DEPTH=4096` 下 full-remote t8192 全部通过；最大归一化 diff 约 `0.0006`，无 NaN/nonfinite。
 
@@ -34,6 +36,16 @@
 COMM5/COMM6 上开启 profiler 的 full-remote t64 精度通过，最大归一化 diff 约 `0.0006`。三模型 b64/b256 的五次 critical-SM 中位样本显示：staging 仅占 scatter 4.2%～6.0%，arrival 占 2.9%～4.0%；b64 的 expert-ready 占 66.2%～73.1%，而 Flash/GLM b256 的逐行 WQE+doorbell 增长到 43%～44%。下一步优先拆解/优化 ready 协议，并在高 batch A/B 验证同一 `(dst_rank, expert)` 的多行 WQE 批量 doorbell。
 
 详细表格、命令和原始日志见 `../test_logs/20260807_scatter_split_profile/RESULTS.md` 和 `../test_logs/20260807_scatter_split_profile/COMMANDS.md`。
+
+### Expert-ready 与 batch doorbell 优化
+
+`7bae60048` 将 ready 进一步拆成 mask、atomic、system fence、notify、CTA sync 五段，并增加 `put_nbi_warp_batch_rows`：同一 warp 的 active lane 各负责一行，经 WQE-count prefix sum 后由 lane 0 一次 reserve、一次 doorbell。combine 继续使用 `QP(dst_rank, local_expert)`，不增加 `quiet`，公开接口不变。profile buffer从 22 增至 27 个 slot，每 rank 增加 10 KiB。
+
+五段基线显示串行 ready notify 占 ready 的约 76%～80%。`cf99dde67` 因此将 mask 形成与 ready notify 改为一个 warp 并行；lane 0 仍独占 per-expert atomic、最终 producer 判定和 system fence，ready WQE 与先前 data WQE 仍在同一 RC QP 上保持顺序。`DG_MEGA_MOE_COMBINE_PARALLEL_READY` 默认开启，设置为 0 可回到串行实现。
+
+最终组合“parallel ready + batch doorbell”在 COMM5/COMM6 上通过 full-remote t64、同一 SymmBuffer t256 A/B 交替 100 次和 QP depth 4096 下 full-remote t8192，最大归一化 diff `0.0006`，无 NaN/nonfinite。parallel ready 使三模型 b64/b256 的 ready 段下降 56.7%～73.6%，notify 下降 77.7%～86.4%。batch doorbell 在 parallel-ready 基线上使 Flash/GLM b256 的 WQE 段下降 39.7%/42.8%；最终端到端相对原始逐行+串行 ready 分别改善 9.8%/13.1%。
+
+当前 `DG_MEGA_MOE_COMBINE_BATCH_DOORBELL` 默认仍为 0：本轮只按计划验证 Flash/GLM b256，待补低 batch、Pro 和路由矩阵后再决定是否默认启用。详细命令、样本、phase 表和原始日志见 `../test_logs/20260807_ready_batch_doorbell/RESULTS.md`。
 
 ## 当前决策
 
