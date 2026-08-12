@@ -49,6 +49,7 @@ public:
         bool combine_full_row;
         bool combine_expert_ready;
         bool use_swap_ab;
+        bool fuse_shared_expert;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -69,6 +70,12 @@ public:
         CUtensorMap tensor_map_l2_acts_sf;
         CUtensorMap tensor_map_l2_weights;
         const float* l2_weights_sf;
+        CUtensorMap tensor_map_shared_l1_acts;
+        const float* shared_l1_acts_sf;
+        CUtensorMap tensor_map_shared_l1_weights;
+        const float* shared_l1_weights_sf;
+        CUtensorMap tensor_map_shared_l2_weights;
+        const float* shared_l2_weights_sf;
 
         // Launch configs
         LaunchArgs launch_args;
@@ -88,8 +95,272 @@ public:
                 "#define DG_MEGA_MOE_NVL_PEERS {}\n", kNvlPeers);
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE", 0) != 0)
             internode_prefix += "#define DG_MEGA_MOE_PHASE_PROFILE 1\n";
-        if (get_env<int>("DG_MEGA_MOE_COMBINE_BATCH_DOORBELL", 0) != 0)
+        // Keep the counters, drop the device printf: the host reads the
+        // profile region (the tail of the symmetric buffer) after the run,
+        // so a real benchmark loop stays unperturbed.
+        // Removes the tag-3 cross-rank barrier: epoch-tagged control-plane
+        // slots are never cleared, making cleanup rank-local (see the
+        // "Barrier 与跨卡 Store 优化方案" doc, section 6).  Requires the
+        // expert-ready dispatch protocol, which is what tags the slots.
+        const bool no_tag3 =
+            get_env<int>("DG_MEGA_MOE_NO_TAG3",
+                         args.dispatch_expert_ready ? 1 : 0) != 0;
+        DG_HOST_ASSERT(not no_tag3 or args.dispatch_expert_ready);
+        if (no_tag3)
+            internode_prefix += "#define DG_MEGA_MOE_NO_TAG3 1\n";
+        if (get_env<int>("DG_MEGA_MOE_SKIP_NVSHMEM_QUIET", 0) != 0)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_SKIP_NVSHMEM_QUIET 1\n";
+        if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE_SILENT", 0) != 0)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_PHASE_PROFILE_SILENT 1\n";
+        const bool merge_ab_loader =
+            get_env<int>("DG_MEGA_MOE_MERGE_AB_LOADER", 0) != 0;
+        const bool async_publisher =
+            get_env<int>("DG_MEGA_MOE_ASYNC_PUBLISHER", 0) != 0;
+        const bool async_stage_local_rows =
+            get_env<int>("DG_MEGA_MOE_ASYNC_STAGE_LOCAL_ROWS", 0) != 0;
+        const bool async_publisher_row_doorbell =
+            get_env<int>("DG_MEGA_MOE_ASYNC_PUBLISHER_ROW_DOORBELL", 0) != 0;
+        DG_HOST_ASSERT(not async_publisher or merge_ab_loader);
+        DG_HOST_ASSERT(not async_publisher or args.num_ranks > kNvlPeers);
+        DG_HOST_ASSERT(not async_publisher or args.combine_full_row);
+        DG_HOST_ASSERT(not async_publisher or args.combine_expert_ready);
+        DG_HOST_ASSERT(not async_stage_local_rows or async_publisher);
+        DG_HOST_ASSERT(not async_publisher_row_doorbell or async_publisher);
+        const int publisher_max_active =
+            get_env<int>("DG_MEGA_MOE_PUBLISHER_MAX_ACTIVE", 0);
+        DG_HOST_ASSERT(
+            publisher_max_active >= 0 and publisher_max_active <= 1024);
+        DG_HOST_ASSERT(publisher_max_active == 0 or async_publisher);
+        const int qp_inflight_wqes =
+            get_env<int>("DG_MEGA_MOE_QP_INFLIGHT_WQES", 0);
+        DG_HOST_ASSERT(qp_inflight_wqes >= 0 and qp_inflight_wqes <= 4096);
+        DG_HOST_ASSERT(qp_inflight_wqes == 0 or async_publisher);
+        const int publisher_rate_mbps =
+            get_env<int>("DG_MEGA_MOE_PUBLISHER_RATE_MBPS", 0);
+        DG_HOST_ASSERT(
+            publisher_rate_mbps >= 0 and publisher_rate_mbps <= 60000);
+        DG_HOST_ASSERT(publisher_rate_mbps == 0 or async_publisher);
+        // Congestion controls (per-dst token bucket, dst grouping) exist for
+        // the multi-MB bursts of large batches.  A decode-shaped instance
+        // never approaches the ECN trip point, so there they are pure
+        // overhead — measured -8%~-15% on b2..b64.  Split the default by
+        // instance capacity, the same launch-time selection used for V3.
+        const bool congestion_control_needed =
+            args.num_max_tokens_per_rank > 512;
+        const int publisher_link_mbps =
+            get_env<int>("DG_MEGA_MOE_PUBLISHER_LINK_MBPS", 50000);
+        DG_HOST_ASSERT(
+            publisher_link_mbps > 0 and publisher_link_mbps <= 100000);
+        // Defaults to auto (-1) with the async publisher: 56% of line rate
+        // split across inter-node peers.  The 44% headroom covers dispatch
+        // traffic sharing each receiver NIC — the publish fan-in budget
+        // measures at 24~28 GB/s on 400G links, well below line rate, and
+        // 56% lands on the per-dst rate validated on all three models
+        // (3500 MB/s at 400G / 16 ranks).  Explicit 0 disables.  The
+        // historical batch-4096 bistable slow mode under per-dst buckets
+        // is fixed by chain polling below, which is also on by default.
+        int publisher_dst_rate_mbps =
+            get_env<int>("DG_MEGA_MOE_PUBLISHER_DST_RATE_MBPS", -1);
+        if (publisher_dst_rate_mbps < 0)
+            publisher_dst_rate_mbps =
+                (async_publisher and congestion_control_needed)
+                ? publisher_link_mbps * 56 / 100 /
+                      static_cast<int>(args.num_ranks - kNvlPeers)
+                : 0;
+        DG_HOST_ASSERT(publisher_dst_rate_mbps <= 60000);
+        DG_HOST_ASSERT(publisher_dst_rate_mbps == 0 or async_publisher);
+        // Dst grouping and chain polling are the validated defaults with
+        // the async publisher (all three models beat inline publish across
+        // b1024-8192 with CNP at zero).  Explicit 0 opts out of either.
+        const bool publisher_dst_grouped =
+            get_env<int>("DG_MEGA_MOE_PUBLISHER_DST_GROUPED",
+                         (async_publisher and congestion_control_needed)
+                             ? 1 : 0) != 0;
+        DG_HOST_ASSERT(not publisher_dst_grouped or async_publisher);
+        // Chain polling advances whichever chained pair has data ready
+        // instead of serially owning one pair until its long-tail block
+        // lands.  It assumes the dst-grouped chain layout and replaces the
+        // per-pair loop body, so the other publisher experiments (and the
+        // pair-granular profiler) are mutually exclusive with it: when any
+        // of those is explicitly enabled the DEFAULT gracefully degrades
+        // to the serial grouped path, while an EXPLICIT poll request still
+        // asserts on the illegal combination.
+        // Two-level dispatch handshake (same-rail gateway aggregation):
+        // inter-node route entries and count rows are staged on the local
+        // same-rail gateway over NVLink, which forwards them as a few bulk
+        // WRITEs plus one trailing 1KB manifest.  First increment supports
+        // exactly two nodes and the expert-ready dispatch protocol.
+        // 0 = off, 1 = alpha (aggregation only, keeps grid_sync),
+        // 2 = beta (eager send-when-full triggers, removes grid_sync),
+        // 3 = beta + V3 (whole collect box shipped as one WRITE into the
+        //     remote landing zone; pull reads inter entries from there).
+        // V3's bulk WRITE size scales with the instance's max tokens per
+        // rank, so it is a small-instance path by construction.  Default:
+        // V3 on decode-shaped instances (capacity <= 512 tokens/rank,
+        // measured net win across b1-256 on two nodes), classic path
+        // otherwise — this IS the design doc's launch-time path selection.
+        // Explicit env always overrides.
+        const bool gateway_default_capable =
+            args.num_ranks == 2 * static_cast<uint32_t>(kNvlPeers) and
+            args.dispatch_expert_ready and
+            args.num_max_tokens_per_rank <= 512;
+        const int dispatch_gateway = get_env<int>(
+            "DG_MEGA_MOE_DISPATCH_GATEWAY",
+            gateway_default_capable ? 3 : 0);
+        DG_HOST_ASSERT(dispatch_gateway >= 0 and dispatch_gateway <= 3);
+        DG_HOST_ASSERT(dispatch_gateway == 0 or
+                       args.num_ranks == 2 * static_cast<uint32_t>(kNvlPeers));
+        DG_HOST_ASSERT(dispatch_gateway == 0 or args.dispatch_expert_ready);
+        // Correctness never depends on this bound (cell capacity equals the
+        // instance's max tokens); it only guards against pointlessly large
+        // bulk WRITEs.  Production-shape V3 instances should be <= 512.
+        DG_HOST_ASSERT(dispatch_gateway < 3 or
+                       args.num_max_tokens_per_rank <= 4096);
+        const bool chain_poll_incompatible =
+            publisher_max_active != 0 or
+            async_publisher_row_doorbell or
+            async_stage_local_rows or
+            get_env<int>("DG_MEGA_MOE_PHASE_PROFILE", 0) != 0;
+        const bool publisher_chain_poll =
+            get_env<int>("DG_MEGA_MOE_PUBLISHER_CHAIN_POLL",
+                         (async_publisher and publisher_dst_grouped and
+                          not chain_poll_incompatible) ? 1 : 0) != 0;
+        DG_HOST_ASSERT(not publisher_chain_poll or publisher_dst_grouped);
+        DG_HOST_ASSERT(
+            not publisher_chain_poll or not chain_poll_incompatible);
+        if (merge_ab_loader)
+            internode_prefix += "#define DG_MEGA_MOE_MERGE_AB_LOADER 1\n";
+        if (async_publisher)
+            internode_prefix += "#define DG_MEGA_MOE_ASYNC_PUBLISHER 1\n";
+        if (async_stage_local_rows)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_ASYNC_STAGE_LOCAL_ROWS 1\n";
+        if (async_publisher_row_doorbell)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_ASYNC_PUBLISHER_ROW_DOORBELL 1\n";
+        if (publisher_max_active != 0)
+            internode_prefix += fmt::format(
+                "#define DG_MEGA_MOE_PUBLISHER_MAX_ACTIVE {}\n",
+                publisher_max_active);
+        if (qp_inflight_wqes != 0)
+            internode_prefix += fmt::format(
+                "#define DG_MEGA_MOE_QP_INFLIGHT_WQES {}\n",
+                qp_inflight_wqes);
+        if (publisher_rate_mbps != 0)
+            internode_prefix += fmt::format(
+                "#define DG_MEGA_MOE_PUBLISHER_RATE_MBPS {}\n",
+                publisher_rate_mbps);
+        if (publisher_dst_rate_mbps != 0)
+            internode_prefix += fmt::format(
+                "#define DG_MEGA_MOE_PUBLISHER_DST_RATE_MBPS {}\n",
+                publisher_dst_rate_mbps);
+        if (publisher_dst_grouped)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_PUBLISHER_DST_GROUPED 1\n";
+        if (publisher_chain_poll)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_PUBLISHER_CHAIN_POLL 1\n";
+        if (dispatch_gateway >= 1)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_DISPATCH_GATEWAY 1\n";
+        if (dispatch_gateway >= 2)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_DISPATCH_GATEWAY_EAGER 1\n";
+        if (dispatch_gateway >= 3)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_DISPATCH_GATEWAY_V3 1\n";
+        const bool combine_batch_doorbell =
+            get_env<int>("DG_MEGA_MOE_COMBINE_BATCH_DOORBELL", 0) != 0;
+        if (combine_batch_doorbell)
             internode_prefix += "#define DG_MEGA_MOE_COMBINE_BATCH_DOORBELL 1\n";
+        const int combine_compact_batch_rows =
+            get_env<int>("DG_MEGA_MOE_COMBINE_COMPACT_BATCH_ROWS", 0);
+        DG_HOST_ASSERT(
+            combine_compact_batch_rows == 0 or
+            combine_compact_batch_rows == 8 or
+            combine_compact_batch_rows == 16);
+        DG_HOST_ASSERT(
+            combine_compact_batch_rows == 0 or combine_batch_doorbell);
+        if (combine_compact_batch_rows != 0)
+            internode_prefix += fmt::format(
+                "#define DG_MEGA_MOE_COMBINE_COMPACT_BATCH_ROWS {}\n",
+                combine_compact_batch_rows);
+        if (get_env<int>("DG_MEGA_MOE_RANK_MAJOR_POOL", 0) != 0)
+            internode_prefix += "#define DG_MEGA_MOE_RANK_MAJOR_POOL 1\n";
+        const auto expert_schedule =
+            get_env<std::string>("DG_MEGA_MOE_EXPERT_SCHEDULE", "id");
+        bool expert_schedule_enabled = false;
+        if (expert_schedule == "load") {
+            expert_schedule_enabled = true;
+            internode_prefix +=
+                "#define DG_MEGA_MOE_EXPERT_SCHEDULE_PRIORITY 1\n"
+                "#define DG_MEGA_MOE_EXPERT_SCHEDULE_LOAD 1\n";
+        } else if (expert_schedule == "remote_load") {
+            expert_schedule_enabled = true;
+            internode_prefix +=
+                "#define DG_MEGA_MOE_EXPERT_SCHEDULE_PRIORITY 1\n"
+                "#define DG_MEGA_MOE_EXPERT_SCHEDULE_REMOTE_LOAD 1\n";
+        } else if (expert_schedule == "wave_load") {
+            expert_schedule_enabled = true;
+            internode_prefix +=
+                "#define DG_MEGA_MOE_EXPERT_SCHEDULE_PRIORITY 1\n"
+                "#define DG_MEGA_MOE_EXPERT_SCHEDULE_LOAD 1\n"
+                "#define DG_MEGA_MOE_EXPERT_SCHEDULE_WITHIN_WAVE 1\n";
+        } else if (expert_schedule == "wave_remote_load") {
+            expert_schedule_enabled = true;
+            internode_prefix +=
+                "#define DG_MEGA_MOE_EXPERT_SCHEDULE_PRIORITY 1\n"
+                "#define DG_MEGA_MOE_EXPERT_SCHEDULE_REMOTE_LOAD 1\n"
+                "#define DG_MEGA_MOE_EXPERT_SCHEDULE_WITHIN_WAVE 1\n";
+        } else if (expert_schedule == "staged_remote") {
+            const int prefix_experts =
+                get_env<int>("DG_MEGA_MOE_EXPERT_PREFIX", 2);
+            const int remote_min_tokens =
+                get_env<int>("DG_MEGA_MOE_EXPERT_REMOTE_MIN_TOKENS", 2);
+            const int schedule_max_tokens =
+                get_env<int>("DG_MEGA_MOE_EXPERT_SCHEDULE_MAX_TOKENS", 16);
+            DG_HOST_ASSERT(prefix_experts >= 0 and prefix_experts <= 32);
+            DG_HOST_ASSERT(remote_min_tokens > 0);
+            DG_HOST_ASSERT(schedule_max_tokens > 0);
+            if (args.num_tokens <= schedule_max_tokens) {
+                expert_schedule_enabled = true;
+                internode_prefix += fmt::format(
+                    "#define DG_MEGA_MOE_EXPERT_SCHEDULE_PRIORITY 1\n"
+                    "#define DG_MEGA_MOE_EXPERT_SCHEDULE_STAGED_REMOTE 1\n"
+                    "#define DG_MEGA_MOE_EXPERT_PREFIX {}\n"
+                    "#define DG_MEGA_MOE_EXPERT_REMOTE_MIN_TOKENS {}\n",
+                    prefix_experts, remote_min_tokens);
+            }
+        } else {
+            DG_HOST_ASSERT(expert_schedule == "id" and
+                           "Invalid DG_MEGA_MOE_EXPERT_SCHEDULE");
+        }
+        const int decode_active_max_tokens =
+            get_env<int>("DG_MEGA_MOE_DECODE_ACTIVE_MAX_TOKENS", 0);
+        DG_HOST_ASSERT(decode_active_max_tokens >= 0);
+        const bool decode_active_experts =
+            decode_active_max_tokens > 0 and
+            args.num_tokens <= decode_active_max_tokens;
+        if (decode_active_experts) {
+            // The first decode-specialized decomposition deliberately keeps
+            // the full persistent grid.  It reuses the existing eager count
+            // path and only compacts empty experts out of the deterministic
+            // dispatch/GEMM schedule.
+            DG_HOST_ASSERT(args.num_ranks > kNvlPeers);
+            DG_HOST_ASSERT(args.dispatch_expert_ready);
+            DG_HOST_ASSERT(not args.lazy_expert_count);
+            DG_HOST_ASSERT(not expert_schedule_enabled);
+            DG_HOST_ASSERT(args.num_experts / args.num_ranks <= 32);
+            internode_prefix +=
+                "#define DG_MEGA_MOE_DECODE_ACTIVE_EXPERTS 1\n"
+                "#define DG_MEGA_MOE_DISPATCH_FOLLOW_EXPERT_SCHEDULE 1\n";
+        }
+        if (expert_schedule_enabled and
+            get_env<int>("DG_MEGA_MOE_DISPATCH_FOLLOW_EXPERT_SCHEDULE", 0) != 0)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_DISPATCH_FOLLOW_EXPERT_SCHEDULE 1\n";
         if (get_env<int>("DG_MEGA_MOE_COMBINE_PARALLEL_READY", 1) != 0)
             internode_prefix += "#define DG_MEGA_MOE_COMBINE_PARALLEL_READY 1\n";
         return internode_prefix + fmt::format(R"(
@@ -110,6 +381,7 @@ static void __instantiate_kernel() {{
         {},
         {}, {}, {},
         {}, {},
+        {},
         {},
         {},
         {},
@@ -145,7 +417,8 @@ static void __instantiate_kernel() {{
     args.lazy_expert_count ? "true" : "false",
     args.combine_full_row ? "true" : "false",
     args.combine_expert_ready ? "true" : "false",
-    args.use_swap_ab ? "true" : "false");
+    args.use_swap_ab ? "true" : "false",
+    args.fuse_shared_expert ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -162,7 +435,13 @@ static void __instantiate_kernel() {{
             args.tensor_map_l2_acts,
             args.tensor_map_l2_acts_sf,
             args.tensor_map_l2_weights,
-            args.l2_weights_sf
+            args.l2_weights_sf,
+            args.tensor_map_shared_l1_acts,
+            args.shared_l1_acts_sf,
+            args.tensor_map_shared_l1_weights,
+            args.shared_l1_weights_sf,
+            args.tensor_map_shared_l2_weights,
+            args.shared_l2_weights_sf
         ));
     }
 };
@@ -173,6 +452,13 @@ static void sm90_fp8_mega_moe(
     const torch::Tensor& l2_acts, const torch::Tensor& l2_acts_sf,
     const torch::Tensor& l1_weights, const torch::Tensor& l2_weights,
     const torch::Tensor& l1_weights_sf, const torch::Tensor& l2_weights_sf,
+    const torch::Tensor& shared_l1_acts,
+    const torch::Tensor& shared_l1_acts_sf,
+    const torch::Tensor& shared_l1_weights,
+    const torch::Tensor& shared_l1_weights_sf,
+    const torch::Tensor& shared_l2_weights,
+    const torch::Tensor& shared_l2_weights_sf,
+    const bool& fuse_shared_expert,
     const std::optional<torch::Tensor> cumulative_local_expert_recv_stats,
     const std::vector<int64_t>& sym_buffer_ptrs,
     const int& rank_idx, const int& num_max_tokens_per_rank,
@@ -195,6 +481,7 @@ static void sm90_fp8_mega_moe(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden, num_padded_sf_pool_tokens);
+    DG_HOST_ASSERT(not fuse_shared_expert or num_tokens <= config.block_m);
     const int default_epilogue_registers =
         config.num_epilogue_threads == 512 ? 112 : 0;
     const int epilogue_registers = default_epilogue_registers;
@@ -299,6 +586,24 @@ static void sm90_fp8_mega_moe(
                                                         config.block_k, weight_tma_block_n,
                                                         static_cast<int>(l2_weights.stride(-2)),
                                                         config.swizzle_weights_mode);
+    const auto tensor_map_shared_l1_acts = make_tma_2d_desc(
+        shared_l1_acts,
+        hidden, num_max_tokens_per_rank,
+        config.block_k, config.block_m,
+        static_cast<int>(shared_l1_acts.stride(-2)),
+        config.swizzle_acts_mode);
+    const auto tensor_map_shared_l1_weights = make_tma_2d_desc(
+        shared_l1_weights,
+        hidden, intermediate_hidden * 2,
+        config.block_k, weight_tma_block_n,
+        static_cast<int>(shared_l1_weights.stride(-2)),
+        config.swizzle_weights_mode);
+    const auto tensor_map_shared_l2_weights = make_tma_2d_desc(
+        shared_l2_weights,
+        intermediate_hidden, hidden,
+        config.block_k, weight_tma_block_n,
+        static_cast<int>(shared_l2_weights.stride(-2)),
+        config.swizzle_weights_mode);
 
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
@@ -324,6 +629,7 @@ static void sm90_fp8_mega_moe(
         .combine_full_row = combine_full_row,
         .combine_expert_ready = combine_expert_ready,
         .use_swap_ab = use_swap_ab,
+        .fuse_shared_expert = fuse_shared_expert,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -338,6 +644,12 @@ static void sm90_fp8_mega_moe(
         .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
         .tensor_map_l2_weights = tensor_map_l2_weights,
         .l2_weights_sf = l2_weights_sf.data_ptr<float>(),
+        .tensor_map_shared_l1_acts = tensor_map_shared_l1_acts,
+        .shared_l1_acts_sf = shared_l1_acts_sf.data_ptr<float>(),
+        .tensor_map_shared_l1_weights = tensor_map_shared_l1_weights,
+        .shared_l1_weights_sf = shared_l1_weights_sf.data_ptr<float>(),
+        .tensor_map_shared_l2_weights = tensor_map_shared_l2_weights,
+        .shared_l2_weights_sf = shared_l2_weights_sf.data_ptr<float>(),
         .launch_args = LaunchArgs(num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, config.cluster_size)
     };

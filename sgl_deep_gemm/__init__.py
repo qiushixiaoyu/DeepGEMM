@@ -492,6 +492,45 @@ def fp8_mega_moe(y: torch.Tensor,
     )
 
 
+def fp8_mega_moe_with_shared(
+        y: torch.Tensor,
+        l1_weights: Tuple[torch.Tensor, torch.Tensor],
+        l2_weights: Tuple[torch.Tensor, torch.Tensor],
+        shared_l1_weights: Tuple[torch.Tensor, torch.Tensor],
+        shared_l2_weights: Tuple[torch.Tensor, torch.Tensor],
+        sym_buffer: SM90SymmBuffer,
+        cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+        recipe: Tuple[int, int, int] = (128, 128, 128),
+        activation: str = 'swiglu',
+        activation_clamp: Optional[float] = None,
+        fast_math: bool = True):
+    """Run routed and one always-local shared expert in one MegaMoE kernel.
+
+    Shared weights use the same transformed SM90 FP8 layout as routed weights,
+    with a leading expert dimension of one.  The fused path is decode-only and
+    requires the current token count to fit in the selected ``block_m``.
+    """
+    (l1_weights_data, l1_weights_sf) = l1_weights
+    (l2_weights_data, l2_weights_sf) = l2_weights
+    (shared_l1_weights_data, shared_l1_weights_sf) = shared_l1_weights
+    (shared_l2_weights_data, shared_l2_weights_sf) = shared_l2_weights
+    _C.fp8_mega_moe_with_shared(
+        y,
+        l1_weights_data, l1_weights_sf,
+        l2_weights_data, l2_weights_sf,
+        shared_l1_weights_data, shared_l1_weights_sf,
+        shared_l2_weights_data, shared_l2_weights_sf,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        recipe,
+        activation, activation_clamp,
+        fast_math
+    )
+
+
 def mega_moe_pre_dispatch_sm90(x: torch.Tensor,
                                topk_idx: torch.Tensor,
                                topk_weights: torch.Tensor,

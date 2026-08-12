@@ -19,6 +19,12 @@ CUTLASS_DEVICE uint32_t get_lane_idx() {
     return lane_id;
 }
 
+CUTLASS_DEVICE uint64_t get_globaltimer() {
+    uint64_t globaltimer;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(globaltimer));
+    return globaltimer;
+}
+
 CUTLASS_DEVICE void sync_aligned(const uint32_t& num_threads, const uint32_t& barrier_idx) {
     asm volatile("bar.sync %0, %1;" : : "r"(barrier_idx), "r"(num_threads));
 }

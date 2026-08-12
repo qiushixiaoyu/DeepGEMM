@@ -45,12 +45,32 @@ struct MegaMoEScheduler {
     // Arrival counts
     const WorkspaceT& workspace;
     const uint64_t* dispatch_launch_epoch_ptr;
+    const uint32_t local_rank_idx;
 
     // Scheduler state
     BlockPhase next_phase = BlockPhase::Linear1;
 
     // Current expert and block indices
     uint32_t current_local_expert_idx = 0;
+#if defined(DG_MEGA_MOE_EXPERT_SCHEDULE_PRIORITY) || \
+    defined(DG_MEGA_MOE_DECODE_ACTIVE_EXPERTS)
+    // The physical pool remains in expert-ID order.  This is only the logical
+    // position in the deterministic L1/L2 execution order.
+    uint32_t current_schedule_pos = 0;
+#endif
+#ifdef DG_MEGA_MOE_EXPERT_SCHEDULE_PRIORITY
+    // Each valid lane owns one expert and stores that expert's sorted position.
+    uint32_t expert_schedule_pos = 0;
+#endif
+#ifdef DG_MEGA_MOE_DECODE_ACTIVE_EXPERTS
+    // One bit per non-empty local expert.  Every scheduler warp reconstructs
+    // this mask from its eager count snapshot, so no worklist-sized workspace
+    // or public interface change is required.
+    uint32_t active_expert_mask = 0;
+    uint32_t num_active_experts = 0;
+    // Each lane owns the physical pool prefix of the expert with the same ID.
+    uint32_t lane_pool_block_offset = 0;
+#endif
     uint32_t current_num_tokens = 0;
     uint32_t current_pool_block_offset = 0;
     uint32_t block_idx = 0;
@@ -64,15 +84,32 @@ struct MegaMoEScheduler {
     uint32_t stored_num_tokens_per_expert_valid[kNumExpertsPerLane] = {};
 
     CUTLASS_DEVICE explicit MegaMoEScheduler(
-        const WorkspaceT& workspace, const uint64_t* dispatch_launch_epoch_ptr = nullptr):
-        workspace(workspace), dispatch_launch_epoch_ptr(dispatch_launch_epoch_ptr) {
+        const WorkspaceT& workspace,
+        const uint64_t* dispatch_launch_epoch_ptr = nullptr,
+        const uint32_t local_rank_idx = 0):
+        workspace(workspace),
+        dispatch_launch_epoch_ptr(dispatch_launch_epoch_ptr),
+        local_rank_idx(local_rank_idx) {
         block_idx = blockIdx.x;
     }
 
     CUTLASS_DEVICE uint32_t get_wave_expert_end_idx() const {
         // Align up to wave boundary, clamped for the last partial wave
+#if defined(DG_MEGA_MOE_EXPERT_SCHEDULE_PRIORITY) || \
+    defined(DG_MEGA_MOE_DECODE_ACTIVE_EXPERTS)
+        const auto aligned = math::align(current_schedule_pos + 1, kNumExpertsPerWave);
+#else
         const auto aligned = math::align(current_local_expert_idx + 1, kNumExpertsPerWave);
-        return cute::min(aligned, kNumExpertsPerRank);
+#endif
+        return cute::min(aligned, get_num_scheduled_experts());
+    }
+
+    CUTLASS_DEVICE uint32_t get_num_scheduled_experts() const {
+#ifdef DG_MEGA_MOE_DECODE_ACTIVE_EXPERTS
+        return num_active_experts;
+#else
+        return kNumExpertsPerRank;
+#endif
     }
 
     // Wait until all source ranks have published the count for one local
@@ -215,6 +252,10 @@ struct MegaMoEScheduler {
 
     // Get pool block offset for a given expert index from a per-lane token count array
     CUTLASS_DEVICE uint32_t get_pool_block_offset(const uint32_t& expert_idx) {
+#ifdef DG_MEGA_MOE_DECODE_ACTIVE_EXPERTS
+        DG_DEVICE_ASSERT(expert_idx < kNumExpertsPerRank);
+        return __shfl_sync(0xffffffff, lane_pool_block_offset, expert_idx);
+#else
         if constexpr (kLazyExpertCount) {
             // The pool layout remains the fixed expert-prefix layout.  Expert
             // e can start once counts [0, e] are known; later experts are not
@@ -229,19 +270,189 @@ struct MegaMoEScheduler {
                 num_blocks += math::ceil_div(stored_num_tokens_per_expert[i], BLOCK_M);
         }
         return __reduce_add_sync(0xffffffff, num_blocks);
+#endif
+    }
+
+    // Build one deterministic expert order per scheduler warp.  Counts are
+    // already complete in the eager path, so every TMA/math warp observes the
+    // same keys without a global order-publishing buffer.  The physical pool
+    // prefix is deliberately not reordered.
+    CUTLASS_DEVICE void prepare_expert_schedule() {
+#ifdef DG_MEGA_MOE_DECODE_ACTIVE_EXPERTS
+        DG_STATIC_ASSERT(not kLazyExpertCount,
+                         "Active decode scheduling requires eager counts");
+        DG_STATIC_ASSERT(kNumExpertsPerRank <= 32,
+                         "Active decode scheduling supports at most 32 local experts");
+#ifdef DG_MEGA_MOE_EXPERT_SCHEDULE_PRIORITY
+        DG_STATIC_ASSERT(false,
+                         "Active decode scheduling and expert priority are mutually exclusive");
+#endif
+        const uint32_t lane_idx = ptx::get_lane_idx();
+        const bool valid = lane_idx < kNumExpertsPerRank;
+        const uint32_t lane_num_tokens =
+            valid ? stored_num_tokens_per_expert[0] : 0;
+        active_expert_mask = __ballot_sync(
+            0xffffffff, valid and lane_num_tokens != 0);
+        num_active_experts = __popc(active_expert_mask);
+
+        // Inclusive warp scan of physical M-block counts.  Subtracting the
+        // current lane yields the stable expert-ID pool prefix, including for
+        // empty experts used by cleanup.
+        const uint32_t lane_num_blocks =
+            valid ? math::ceil_div(lane_num_tokens, BLOCK_M) : 0;
+        uint32_t inclusive_num_blocks = lane_num_blocks;
+        #pragma unroll
+        for (uint32_t offset = 1; offset < 32; offset <<= 1) {
+            const auto preceding = __shfl_up_sync(
+                0xffffffff, inclusive_num_blocks, offset);
+            if (lane_idx >= offset)
+                inclusive_num_blocks += preceding;
+        }
+        lane_pool_block_offset = inclusive_num_blocks - lane_num_blocks;
+        __syncwarp();
+#endif
+#ifdef DG_MEGA_MOE_EXPERT_SCHEDULE_PRIORITY
+        DG_STATIC_ASSERT(not kLazyExpertCount,
+                         "Priority expert scheduling currently requires eager counts");
+        DG_STATIC_ASSERT(kNumExpertsPerRank <= 32,
+                         "Priority expert scheduling supports at most 32 local experts");
+        const uint32_t lane_idx = ptx::get_lane_idx();
+        const bool valid = lane_idx < kNumExpertsPerRank;
+        const uint32_t total_count = valid ? stored_num_tokens_per_expert[0] : 0;
+        uint32_t remote_count = 0;
+#if defined(DG_MEGA_MOE_EXPERT_SCHEDULE_REMOTE_LOAD) || \
+    defined(DG_MEGA_MOE_EXPERT_SCHEDULE_STAGED_REMOTE)
+#ifdef DG_MEGA_MOE_INTERNODE
+        const uint32_t local_node_idx = local_rank_idx / DG_MEGA_MOE_NVL_PEERS;
+        if (valid) {
+            #pragma unroll
+            for (uint32_t src_rank_idx = 0; src_rank_idx < kNumRanks; ++ src_rank_idx) {
+                if (src_rank_idx / DG_MEGA_MOE_NVL_PEERS != local_node_idx) {
+                    const uint64_t slot_value = ptx::ld_acq_sys(
+                        workspace.get_expert_recv_count_ptr(src_rank_idx, lane_idx));
+                    remote_count += static_cast<uint32_t>(slot_value);
+                }
+            }
+        }
+#endif
+#endif
+
+        uint32_t schedule_pos = 0;
+#ifdef DG_MEGA_MOE_EXPERT_SCHEDULE_WITHIN_WAVE
+        if (valid)
+            schedule_pos = lane_idx / kNumExpertsPerWave * kNumExpertsPerWave;
+#endif
+        #pragma unroll
+        for (uint32_t other_lane = 0; other_lane < 32; ++ other_lane) {
+            if (other_lane >= kNumExpertsPerRank)
+                continue;
+            // All 32 lanes must execute shuffles named by the full-warp mask;
+            // invalid expert lanes only skip the comparison below.
+            const uint32_t other_total = __shfl_sync(
+                0xffffffff, total_count, other_lane);
+            const uint32_t other_remote = __shfl_sync(
+                0xffffffff, remote_count, other_lane);
+            bool compare_other = valid;
+#ifdef DG_MEGA_MOE_EXPERT_SCHEDULE_WITHIN_WAVE
+            compare_other = compare_other and
+                other_lane / kNumExpertsPerWave ==
+                    lane_idx / kNumExpertsPerWave;
+#endif
+            if (compare_other) {
+                bool other_has_higher_priority = false;
+#ifdef DG_MEGA_MOE_EXPERT_SCHEDULE_STAGED_REMOTE
+                constexpr uint32_t kPrefixExperts =
+                    cute::min(static_cast<uint32_t>(DG_MEGA_MOE_EXPERT_PREFIX),
+                              kNumExpertsPerRank);
+                const uint32_t category = lane_idx < kPrefixExperts ? 0 :
+                    (remote_count >= DG_MEGA_MOE_EXPERT_REMOTE_MIN_TOKENS ? 1 : 2);
+                const uint32_t other_category = other_lane < kPrefixExperts ? 0 :
+                    (other_remote >= DG_MEGA_MOE_EXPERT_REMOTE_MIN_TOKENS ? 1 : 2);
+                if (other_category != category) {
+                    other_has_higher_priority = other_category < category;
+                } else if (category == 1 and other_remote != remote_count) {
+                    other_has_higher_priority = other_remote > remote_count;
+                } else if (category == 1 and other_total != total_count) {
+                    other_has_higher_priority = other_total > total_count;
+                } else {
+                    other_has_higher_priority = other_lane < lane_idx;
+                }
+#else
+#ifdef DG_MEGA_MOE_EXPERT_SCHEDULE_REMOTE_LOAD
+                const bool has_remote = remote_count != 0;
+                const bool other_has_remote = other_remote != 0;
+                if (other_has_remote != has_remote) {
+                    other_has_higher_priority = other_has_remote;
+                } else if (other_remote != remote_count) {
+                    other_has_higher_priority = other_remote > remote_count;
+                } else
+#endif
+                if (other_total != total_count) {
+                    other_has_higher_priority = other_total > total_count;
+                } else {
+                    other_has_higher_priority = other_lane < lane_idx;
+                }
+#endif
+                schedule_pos += other_has_higher_priority;
+            }
+        }
+        expert_schedule_pos = schedule_pos;
+        __syncwarp();
+#endif
+    }
+
+    CUTLASS_DEVICE uint32_t get_scheduled_expert_idx(
+        const uint32_t& schedule_pos) const {
+#ifdef DG_MEGA_MOE_DECODE_ACTIVE_EXPERTS
+        DG_DEVICE_ASSERT(schedule_pos < num_active_experts);
+        return __fns(active_expert_mask, 0, schedule_pos + 1);
+#elif defined(DG_MEGA_MOE_EXPERT_SCHEDULE_PRIORITY)
+        const uint32_t owner_mask = __ballot_sync(
+            0xffffffff,
+            ptx::get_lane_idx() < kNumExpertsPerRank and
+            expert_schedule_pos == schedule_pos);
+        DG_DEVICE_ASSERT(owner_mask != 0);
+        return __ffs(owner_mask) - 1;
+#else
+        return schedule_pos;
+#endif
     }
 
     CUTLASS_DEVICE void advance_expert_idx() {
+#if defined(DG_MEGA_MOE_EXPERT_SCHEDULE_PRIORITY) || \
+    defined(DG_MEGA_MOE_DECODE_ACTIVE_EXPERTS)
+        current_schedule_pos += 1;
+        if (current_schedule_pos < get_num_scheduled_experts()) {
+            current_local_expert_idx = get_scheduled_expert_idx(current_schedule_pos);
+            current_num_tokens = get_num_tokens(current_local_expert_idx);
+            current_pool_block_offset = get_pool_block_offset(current_local_expert_idx);
+        }
+#else
         current_pool_block_offset += get_current_num_m_blocks();
         current_local_expert_idx += 1;
         if (current_local_expert_idx < kNumExpertsPerRank)
             current_num_tokens = get_num_tokens(current_local_expert_idx);
+#endif
     }
 
     CUTLASS_DEVICE void set_expert_idx(const uint32_t& expert_idx) {
+#if defined(DG_MEGA_MOE_EXPERT_SCHEDULE_PRIORITY) || \
+    defined(DG_MEGA_MOE_DECODE_ACTIVE_EXPERTS)
+        current_schedule_pos = expert_idx;
+        if (current_schedule_pos < get_num_scheduled_experts()) {
+            current_local_expert_idx = get_scheduled_expert_idx(current_schedule_pos);
+            current_num_tokens = get_num_tokens(current_local_expert_idx);
+            current_pool_block_offset = get_pool_block_offset(current_local_expert_idx);
+        } else {
+            current_local_expert_idx = kNumExpertsPerRank;
+            current_num_tokens = 0;
+            current_pool_block_offset = 0;
+        }
+#else
         current_local_expert_idx = expert_idx;
         current_num_tokens = get_num_tokens(expert_idx);
         current_pool_block_offset = get_pool_block_offset(expert_idx);
+#endif
     }
 
     CUTLASS_DEVICE uint32_t get_current_pool_block_offset() const {
@@ -260,7 +471,12 @@ struct MegaMoEScheduler {
 
     CUTLASS_DEVICE bool fetch_next_l1_block() {
         const auto wave_end_expert_idx = get_wave_expert_end_idx();
+#if defined(DG_MEGA_MOE_EXPERT_SCHEDULE_PRIORITY) || \
+    defined(DG_MEGA_MOE_DECODE_ACTIVE_EXPERTS)
+        while (current_schedule_pos < wave_end_expert_idx) {
+#else
         while (current_local_expert_idx < wave_end_expert_idx) {
+#endif
             const auto num_m_blocks = get_current_num_m_blocks();
             m_block_idx = block_idx / kNumL1BlockNs;
             if (m_block_idx < num_m_blocks)
@@ -275,7 +491,12 @@ struct MegaMoEScheduler {
 
     CUTLASS_DEVICE bool fetch_next_l2_block() {
         const auto wave_end_expert_idx = get_wave_expert_end_idx();
+#if defined(DG_MEGA_MOE_EXPERT_SCHEDULE_PRIORITY) || \
+    defined(DG_MEGA_MOE_DECODE_ACTIVE_EXPERTS)
+        while (current_schedule_pos < wave_end_expert_idx) {
+#else
         while (current_local_expert_idx < wave_end_expert_idx) {
+#endif
             const auto num_m_blocks = get_current_num_m_blocks();
             if (block_idx < num_m_blocks * kNumL2BlockNs) {
                 m_block_idx = block_idx / kNumL2BlockNs;
@@ -292,7 +513,12 @@ struct MegaMoEScheduler {
     // Core state machine: assigns the next block
     CUTLASS_DEVICE cute::tuple<BlockPhase, uint32_t, uint32_t, uint32_t> get_next_block() {
         while (true) {
+#if defined(DG_MEGA_MOE_EXPERT_SCHEDULE_PRIORITY) || \
+    defined(DG_MEGA_MOE_DECODE_ACTIVE_EXPERTS)
+            if (current_schedule_pos >= get_num_scheduled_experts())
+#else
             if (current_local_expert_idx >= kNumExpertsPerRank)
+#endif
                 break;
 
             if (next_phase == BlockPhase::Linear1) {
@@ -305,7 +531,13 @@ struct MegaMoEScheduler {
                 } else {
                     // L1 for the current wave is complete, transition to L2
                     next_phase = BlockPhase::Linear2;
+#if defined(DG_MEGA_MOE_EXPERT_SCHEDULE_PRIORITY) || \
+    defined(DG_MEGA_MOE_DECODE_ACTIVE_EXPERTS)
+                    set_expert_idx(math::align<uint32_t, false>(
+                        current_schedule_pos - 1, kNumExpertsPerWave));
+#else
                     set_expert_idx(math::align<uint32_t, false>(current_local_expert_idx - 1, kNumExpertsPerWave));
+#endif
                 }
             } else {
                 if (fetch_next_l2_block()) {
@@ -343,6 +575,8 @@ struct MegaMoEScheduler {
         // Wait for all expert counters to be finalized
         if constexpr (not kLazyExpertCount)
             fetch_expert_recv_count();
+
+        prepare_expert_schedule();
 
         // Initialize current expert with 0
         set_expert_idx(0);

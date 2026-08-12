@@ -11,6 +11,10 @@ static constexpr int kNumCandidateBlockMs = 7;
 static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96, 128, 192};
 static constexpr int kMaxCandidateBlockM = 192;
 static constexpr int kMinCandidateBlockM = 8;
+
+// Matches DG_MEGA_MOE_NVL_PEERS (8 GPUs per NVLink domain); namespace scope
+// so device code can bind it to const-reference parameters.
+static constexpr uint32_t kGatewayNvlPeers = 8;
 static constexpr int kLCMCandidateBlockM = 384;
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
@@ -259,6 +263,26 @@ struct SM90Workspace {
         num_bytes += num_max_pool_blocks * sizeof(uint64_t);
         num_bytes += num_experts_per_rank * num_ranks * num_max_recv_tokens_per_expert * sizeof(int);
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
+
+        // Gateway collect box for the two-level dispatch handshake: local
+        // NVLink peers stage their inter-node route entries and manifest
+        // rows here, and this rank forwards them over one same-rail QP.
+        //   entries:  [src nvl peer][local expert][token slot] u32
+        //   manifest: [src nvl peer][local expert] u64 (epoch<<32 | count)
+        //   flags:    [src nvl peer] u64 launch-epoch flags
+        num_bytes += kGatewayNvlPeers * num_experts_per_rank *
+            num_max_tokens_per_rank * sizeof(uint32_t);
+        num_bytes += kGatewayNvlPeers * num_experts_per_rank * sizeof(uint64_t);
+        num_bytes += kGatewayNvlPeers * sizeof(uint64_t);
+        // Eager handshake: per-destination-rank CTA completion counters
+        // (local, zeroed by dispatch cleanup each launch).
+        num_bytes += num_ranks * sizeof(uint32_t);
+
+        // V3 landing zone: a byte-for-byte mirror of the remote gateway's
+        // collect-box entry area, so the gateway ships all entries as one
+        // contiguous WRITE.  Pull reads inter-node entries from here.
+        num_bytes += kGatewayNvlPeers * num_experts_per_rank *
+            num_max_tokens_per_rank * sizeof(uint32_t);
         return math::align<uint64_t>(num_bytes, 16);
     }
 
@@ -315,6 +339,24 @@ struct SM90Workspace {
         return reinterpret_cast<uint64_t*>(base) + local_expert_idx;
     }
 
+    // Async pair-publisher aliases.  The inline scatter path uses these rows
+    // as posted-M-block counters and destination masks; the async path does
+    // not, so it reuses the same storage for the number of completed
+    // (expert, destination-rank) tasks and the launch epoch that releases the
+    // expert to overlapping cleanup.  Keeping aliases here makes the two
+    // compile-time protocols explicit without growing SymmBuffer.
+    CUTLASS_DEVICE
+    uint32_t* get_combine_publish_pair_done_count_ptr(
+        const uint32_t& local_expert_idx = 0) const {
+        return get_combine_posted_block_count_ptr(local_expert_idx);
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_combine_publish_done_epoch_ptr(
+        const uint32_t& local_expert_idx = 0) const {
+        return get_combine_dst_rank_mask_ptr(local_expert_idx);
+    }
+
     CUTLASS_DEVICE
     uint64_t* get_expert_send_count_ptr(const uint32_t& expert_idx = 0) const {
         return get_combine_dst_rank_mask_ptr(num_experts_per_rank) + expert_idx;
@@ -356,6 +398,62 @@ struct SM90Workspace {
     TokenSrcMetadata* get_token_src_metadata_ptr(const uint32_t& pool_token_idx = 0) const {
         const auto base = reinterpret_cast<TokenSrcMetadata*>(get_src_token_topk_idx_ptr(num_experts_per_rank));
         return base + pool_token_idx;
+    }
+
+    // Gateway collect box accessors (see get_num_bytes for the layout).
+    // Cell capacity is num_max_tokens_per_rank: one source rank can route
+    // at most its own token count to a single expert (top-k never repeats
+    // an expert within a token).
+    CUTLASS_DEVICE
+    uint32_t* get_gateway_entry_ptr(const uint32_t& src_nvl_idx = 0,
+                                    const uint32_t& expert_idx = 0,
+                                    const uint32_t& token_idx = 0) const {
+        const auto base = reinterpret_cast<uint32_t*>(
+            get_token_src_metadata_ptr(num_max_pool_tokens));
+        return base +
+            (src_nvl_idx * num_experts_per_rank + expert_idx) *
+                num_max_tokens_per_rank + token_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_gateway_manifest_ptr(const uint32_t& src_nvl_idx = 0,
+                                       const uint32_t& expert_idx = 0) const {
+        // Pass prvalue copies: binding the namespace constexpr directly to
+        // a const reference would ODR-use it in device code.
+        const auto base = reinterpret_cast<uint64_t*>(
+            get_gateway_entry_ptr(uint32_t(kGatewayNvlPeers)));
+        return base + src_nvl_idx * num_experts_per_rank + expert_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_gateway_flag_ptr(const uint32_t& src_nvl_idx = 0) const {
+        return get_gateway_manifest_ptr(uint32_t(kGatewayNvlPeers)) +
+            src_nvl_idx;
+    }
+
+    // Eager handshake: counts CTAs that finished writing route entries for
+    // one destination rank.  Reaching kNumSMs implies every CTA passed
+    // stake-out and fenced its stores, so the counter's final adder is the
+    // direction's trigger.  Local memory, reset by dispatch cleanup.
+    CUTLASS_DEVICE
+    uint32_t* get_gateway_direction_done_ptr(
+        const uint32_t& dst_rank_idx = 0) const {
+        return reinterpret_cast<uint32_t*>(
+            get_gateway_flag_ptr(uint32_t(kGatewayNvlPeers))) +
+            dst_rank_idx;
+    }
+
+    // V3 landing zone (same [src nvl][expert][slot] shape as the collect
+    // box).  Written by the remote same-rail gateway as one bulk WRITE;
+    // pull reads inter-node route entries from here instead of the inbox.
+    CUTLASS_DEVICE
+    uint32_t* get_gateway_landing_ptr(const uint32_t& src_nvl_idx = 0,
+                                      const uint32_t& expert_idx = 0,
+                                      const uint32_t& token_idx = 0) const {
+        const auto base = get_gateway_direction_done_ptr(num_ranks);
+        return base +
+            (src_nvl_idx * num_experts_per_rank + expert_idx) *
+                num_max_tokens_per_rank + token_idx;
     }
 };
 
@@ -448,6 +546,8 @@ struct Buffer {
 // the diagnostic branch, so toggling the JIT-only profiler does not change the
 // public API or any tensor slice.
 static constexpr uint32_t kSM90MegaMoEProfileMaxSMs = 256;
-static constexpr uint32_t kSM90MegaMoEProfileSlots = 27;
+// 31 phase slots + 3 absolute globaltimer stamps (kernel entry, counts sent,
+// count barrier released) used to separate launch skew from protocol cost.
+static constexpr uint32_t kSM90MegaMoEProfileSlots = 37;
 
 } // namespace deep_gemm::layout

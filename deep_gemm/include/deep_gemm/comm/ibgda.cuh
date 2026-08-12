@@ -283,7 +283,18 @@ __device__ static __forceinline__ uint64_t ibgda_reserve_wqe_slots_with_credit(
     ibgda_lock_acquire(&mvars->post_send_lock);
     uint64_t base_wqe_idx = ld_na_relaxed(&mvars->tx_wq.resv_head);
     uint64_t cq_cons_idx = ld_na_relaxed(reinterpret_cast<uint64_t*>(qp->tx_wq.cq->cons_idx));
-    if (base_wqe_idx + num_wqes - cq_cons_idx >= qp->tx_wq.nwqes) {
+#ifdef DG_MEGA_MOE_QP_INFLIGHT_WQES
+    // Bounded per-QP in-flight window: every WQE carries CQ_UPDATE, so the CQ
+    // wqe_counter tracks NIC execution continuously and any index is waitable.
+    // Congestion slows CQE progress and back-pressures this producer, and a
+    // ready WQE can only ever queue behind at most this many data WQEs.
+    const uint32_t inflight_cap = min(
+        static_cast<uint32_t>(DG_MEGA_MOE_QP_INFLIGHT_WQES),
+        static_cast<uint32_t>(qp->tx_wq.nwqes));
+#else
+    const uint32_t inflight_cap = qp->tx_wq.nwqes;
+#endif
+    if (base_wqe_idx + num_wqes - cq_cons_idx >= inflight_cap) {
         uint64_t* ready_idx = state->use_async_postsend ?
             qp->tx_wq.prod_idx : &mvars->tx_wq.ready_head;
         constexpr uint64_t kCreditTimeoutCycles = 120ull * 2000000000ull;
@@ -301,7 +312,18 @@ __device__ static __forceinline__ uint64_t ibgda_reserve_wqe_slots_with_credit(
                 ibgda_ring_db(qp, ready_head);
             }
         }
+#ifdef DG_MEGA_MOE_QP_INFLIGHT_WQES
+        // Sliding window: wait only until this reservation fits under the
+        // cap, not for a full drain.  Clamped to ready_head so an oversized
+        // single batch (num_wqes >= cap) degrades to the original full-drain
+        // wait instead of polling an unsubmitted index.
+        uint64_t poll_target = base_wqe_idx + num_wqes - inflight_cap + 1;
+        if (poll_target > ready_head)
+            poll_target = ready_head;
+        ibgda_poll_cq(qp->tx_wq.cq, poll_target);
+#else
         ibgda_poll_cq(qp->tx_wq.cq, ready_head);
+#endif
     }
 
     base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes);
@@ -627,6 +649,92 @@ struct GetRequest {
     uint64_t raddr;
     size_t bytes;
 };
+
+// Batch the same small request group for one token per active lane.  All
+// tokens target one (src_pe, qp_id), so the warp reserves one contiguous WQE
+// range and rings one doorbell after every lane has materialized its WQEs.
+// Remote and local addresses may remain fully scattered; only the QP posting
+// operation is coalesced.
+template <uint32_t kNumRequests>
+__device__ static __forceinline__ uint64_t get_batch_warp(
+    const GetRequest (&requests)[kNumRequests], bool active,
+    int src_pe, int qp_id, int lane_id) {
+    auto qp = ibgda_get_rc(src_pe, qp_id);
+
+    uint32_t lane_num_wqes = 0;
+    #pragma unroll
+    for (uint32_t request_idx = 0; request_idx < kNumRequests; ++ request_idx) {
+        uint64_t laddr = requests[request_idx].laddr;
+        uint64_t raddr = requests[request_idx].raddr;
+        size_t bytes = active ? requests[request_idx].bytes : 0;
+        while (bytes > 0) {
+            __be32 lkey, rkey;
+            uint64_t real_raddr;
+            const auto chunk = min(
+                static_cast<uint64_t>(bytes),
+                ibgda_get_lkey_and_rkey(
+                    laddr, &lkey, raddr, src_pe, &real_raddr, &rkey,
+                    qp->dev_idx));
+            DG_DEVICE_ASSERT(chunk > 0);
+            ++ lane_num_wqes;
+            laddr += chunk;
+            raddr += chunk;
+            bytes -= chunk;
+        }
+    }
+
+    uint32_t inclusive_wqes = lane_num_wqes;
+    #pragma unroll
+    for (uint32_t offset = 1; offset < 32; offset <<= 1) {
+        const uint32_t other = __shfl_up_sync(
+            0xffffffff, inclusive_wqes, offset);
+        if (lane_id >= static_cast<int>(offset))
+            inclusive_wqes += other;
+    }
+    const uint32_t lane_wqe_offset = inclusive_wqes - lane_num_wqes;
+    const uint32_t total_wqes = __shfl_sync(
+        0xffffffff, inclusive_wqes, 31);
+
+    uint64_t base_wqe_idx = 0;
+    if (lane_id == 0 and total_wqes != 0)
+        base_wqe_idx = ibgda_reserve_wqe_slots_with_credit(qp, total_wqes);
+    base_wqe_idx = __shfl_sync(0xffffffff, base_wqe_idx, 0);
+
+    uint32_t local_wqe_idx = 0;
+    #pragma unroll
+    for (uint32_t request_idx = 0; request_idx < kNumRequests; ++ request_idx) {
+        uint64_t laddr = requests[request_idx].laddr;
+        uint64_t raddr = requests[request_idx].raddr;
+        size_t bytes = active ? requests[request_idx].bytes : 0;
+        while (bytes > 0) {
+            __be32 lkey, rkey;
+            uint64_t real_raddr;
+            const auto chunk = min(
+                static_cast<uint64_t>(bytes),
+                ibgda_get_lkey_and_rkey(
+                    laddr, &lkey, raddr, src_pe, &real_raddr, &rkey,
+                    qp->dev_idx));
+            const uint64_t wqe_idx =
+                base_wqe_idx + lane_wqe_offset + local_wqe_idx;
+            auto wqe_ptr = ibgda_get_wqe_ptr(qp, wqe_idx);
+            ibgda_write_rdma_read_wqe(
+                qp, laddr, lkey, real_raddr, rkey,
+                static_cast<uint32_t>(chunk), static_cast<uint16_t>(wqe_idx),
+                &wqe_ptr);
+            ++ local_wqe_idx;
+            laddr += chunk;
+            raddr += chunk;
+            bytes -= chunk;
+        }
+    }
+    DG_DEVICE_ASSERT(local_wqe_idx == lane_num_wqes);
+    __syncwarp();
+
+    if (lane_id == 0 and total_wqes != 0)
+        ibgda_submit_requests(qp, base_wqe_idx, total_wqes);
+    __syncwarp();
+    return base_wqe_idx + total_wqes;
+}
 
 // Reserve all READ WQEs for a small request group at once and publish them
 // with one doorbell.  The returned producer index identifies exactly this

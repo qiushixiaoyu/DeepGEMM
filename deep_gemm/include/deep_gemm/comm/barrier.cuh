@@ -3,6 +3,7 @@
 #include <cutlass/arch/barrier.h>
 
 #include <deep_gemm/ptx/ld_st.cuh>
+#include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
 
@@ -65,7 +66,10 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
                                    const uint32_t& sm_idx, const uint32_t& thread_idx,
                                    const sync_scope_t& sync_scope,
                                    const bool& sync_prologue = true,
-                                   const bool& sync_epilogue = true) {
+                                   const bool& sync_epilogue = true,
+                                   unsigned long long* profile_quiet_ns = nullptr,
+                                   unsigned long long* profile_sync_ns = nullptr,
+                                   unsigned long long* profile_ibgda_ns = nullptr) {
     DG_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
 
     // Grid sync before NVLink signaling
@@ -88,9 +92,27 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
                     ibgda::quiet(static_cast<int>(pe), static_cast<int>(i % n_qps));
             }
         }
+        if (profile_ibgda_ns != nullptr and thread_idx == 0)
+            *profile_ibgda_ns = ptx::get_globaltimer();
+        // Diagnostic A/B: the explicit per-(pe, qp) ibgda::quiet loop above
+        // already drains every verbs-path QP; this global quiet measured
+        // ~450 us/launch (63% of the b1 kernel).  Gated for a correctness
+        // review before it can become the default.
+#if !defined(DG_MEGA_MOE_SKIP_NVSHMEM_QUIET) and !defined(DG_MEGA_MOE_NO_TAG3)
         nvshmem_quiet();
+#endif
+        if (profile_quiet_ns != nullptr and thread_idx == 0)
+            *profile_quiet_ns = ptx::get_globaltimer();
+#ifndef DG_MEGA_MOE_NO_TAG3
+        // With epoch-tagged control-plane slots (and no clearing) the cleanup
+        // is purely rank-local, so this cross-rank rendezvous is unnecessary.
+        // Kernels are stream-ordered, which already separates a rank's own
+        // launches; the per-QP quiet above still protects the staging buffer.
         if (thread_idx == 0)
             nvshmem_sync_all();
+#endif
+        if (profile_sync_ns != nullptr and thread_idx == 0)
+            *profile_sync_ns = ptx::get_globaltimer();
         sync_scope();
 #else
         auto* counter_ptr = workspace.get_nvl_barrier_counter_ptr();
