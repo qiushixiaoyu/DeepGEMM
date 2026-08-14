@@ -108,9 +108,6 @@ public:
         DG_HOST_ASSERT(not no_tag3 or args.dispatch_expert_ready);
         if (no_tag3)
             internode_prefix += "#define DG_MEGA_MOE_NO_TAG3 1\n";
-        if (get_env<int>("DG_MEGA_MOE_SKIP_NVSHMEM_QUIET", 0) != 0)
-            internode_prefix +=
-                "#define DG_MEGA_MOE_SKIP_NVSHMEM_QUIET 1\n";
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE_SILENT", 0) != 0)
             internode_prefix +=
                 "#define DG_MEGA_MOE_PHASE_PROFILE_SILENT 1\n";
@@ -118,30 +115,10 @@ public:
             get_env<int>("DG_MEGA_MOE_MERGE_AB_LOADER", 0) != 0;
         const bool async_publisher =
             get_env<int>("DG_MEGA_MOE_ASYNC_PUBLISHER", 0) != 0;
-        const bool async_stage_local_rows =
-            get_env<int>("DG_MEGA_MOE_ASYNC_STAGE_LOCAL_ROWS", 0) != 0;
-        const bool async_publisher_row_doorbell =
-            get_env<int>("DG_MEGA_MOE_ASYNC_PUBLISHER_ROW_DOORBELL", 0) != 0;
         DG_HOST_ASSERT(not async_publisher or merge_ab_loader);
         DG_HOST_ASSERT(not async_publisher or args.num_ranks > kNvlPeers);
         DG_HOST_ASSERT(not async_publisher or args.combine_full_row);
         DG_HOST_ASSERT(not async_publisher or args.combine_expert_ready);
-        DG_HOST_ASSERT(not async_stage_local_rows or async_publisher);
-        DG_HOST_ASSERT(not async_publisher_row_doorbell or async_publisher);
-        const int publisher_max_active =
-            get_env<int>("DG_MEGA_MOE_PUBLISHER_MAX_ACTIVE", 0);
-        DG_HOST_ASSERT(
-            publisher_max_active >= 0 and publisher_max_active <= 1024);
-        DG_HOST_ASSERT(publisher_max_active == 0 or async_publisher);
-        const int qp_inflight_wqes =
-            get_env<int>("DG_MEGA_MOE_QP_INFLIGHT_WQES", 0);
-        DG_HOST_ASSERT(qp_inflight_wqes >= 0 and qp_inflight_wqes <= 4096);
-        DG_HOST_ASSERT(qp_inflight_wqes == 0 or async_publisher);
-        const int publisher_rate_mbps =
-            get_env<int>("DG_MEGA_MOE_PUBLISHER_RATE_MBPS", 0);
-        DG_HOST_ASSERT(
-            publisher_rate_mbps >= 0 and publisher_rate_mbps <= 60000);
-        DG_HOST_ASSERT(publisher_rate_mbps == 0 or async_publisher);
         // Congestion controls (per-dst token bucket, dst grouping) exist for
         // the multi-MB bursts of large batches.  A decode-shaped instance
         // never approaches the ECN trip point, so there they are pure
@@ -219,9 +196,6 @@ public:
         DG_HOST_ASSERT(dispatch_gateway < 3 or
                        args.num_max_tokens_per_rank <= 4096);
         const bool chain_poll_incompatible =
-            publisher_max_active != 0 or
-            async_publisher_row_doorbell or
-            async_stage_local_rows or
             get_env<int>("DG_MEGA_MOE_PHASE_PROFILE", 0) != 0;
         const bool publisher_chain_poll =
             get_env<int>("DG_MEGA_MOE_PUBLISHER_CHAIN_POLL",
@@ -234,24 +208,6 @@ public:
             internode_prefix += "#define DG_MEGA_MOE_MERGE_AB_LOADER 1\n";
         if (async_publisher)
             internode_prefix += "#define DG_MEGA_MOE_ASYNC_PUBLISHER 1\n";
-        if (async_stage_local_rows)
-            internode_prefix +=
-                "#define DG_MEGA_MOE_ASYNC_STAGE_LOCAL_ROWS 1\n";
-        if (async_publisher_row_doorbell)
-            internode_prefix +=
-                "#define DG_MEGA_MOE_ASYNC_PUBLISHER_ROW_DOORBELL 1\n";
-        if (publisher_max_active != 0)
-            internode_prefix += fmt::format(
-                "#define DG_MEGA_MOE_PUBLISHER_MAX_ACTIVE {}\n",
-                publisher_max_active);
-        if (qp_inflight_wqes != 0)
-            internode_prefix += fmt::format(
-                "#define DG_MEGA_MOE_QP_INFLIGHT_WQES {}\n",
-                qp_inflight_wqes);
-        if (publisher_rate_mbps != 0)
-            internode_prefix += fmt::format(
-                "#define DG_MEGA_MOE_PUBLISHER_RATE_MBPS {}\n",
-                publisher_rate_mbps);
         if (publisher_dst_rate_mbps != 0)
             internode_prefix += fmt::format(
                 "#define DG_MEGA_MOE_PUBLISHER_DST_RATE_MBPS {}\n",
@@ -512,7 +468,8 @@ static void sm90_fp8_mega_moe(
         not l2_arrival_counter;
     const bool use_swap_ab = should_use_swap_ab_for_mega_moe_sm90(
         num_experts_per_rank, num_tokens, num_topk,
-        config.block_m, config.num_epilogue_threads);
+        config.block_m, config.num_epilogue_threads,
+        hidden, intermediate_hidden);
 
     // Tensormap construction
     // Acts/weights: standard 2D TMA descriptors (FP8 K-major).

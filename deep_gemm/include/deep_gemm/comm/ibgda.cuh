@@ -283,17 +283,7 @@ __device__ static __forceinline__ uint64_t ibgda_reserve_wqe_slots_with_credit(
     ibgda_lock_acquire(&mvars->post_send_lock);
     uint64_t base_wqe_idx = ld_na_relaxed(&mvars->tx_wq.resv_head);
     uint64_t cq_cons_idx = ld_na_relaxed(reinterpret_cast<uint64_t*>(qp->tx_wq.cq->cons_idx));
-#ifdef DG_MEGA_MOE_QP_INFLIGHT_WQES
-    // Bounded per-QP in-flight window: every WQE carries CQ_UPDATE, so the CQ
-    // wqe_counter tracks NIC execution continuously and any index is waitable.
-    // Congestion slows CQE progress and back-pressures this producer, and a
-    // ready WQE can only ever queue behind at most this many data WQEs.
-    const uint32_t inflight_cap = min(
-        static_cast<uint32_t>(DG_MEGA_MOE_QP_INFLIGHT_WQES),
-        static_cast<uint32_t>(qp->tx_wq.nwqes));
-#else
     const uint32_t inflight_cap = qp->tx_wq.nwqes;
-#endif
     if (base_wqe_idx + num_wqes - cq_cons_idx >= inflight_cap) {
         uint64_t* ready_idx = state->use_async_postsend ?
             qp->tx_wq.prod_idx : &mvars->tx_wq.ready_head;
@@ -312,18 +302,7 @@ __device__ static __forceinline__ uint64_t ibgda_reserve_wqe_slots_with_credit(
                 ibgda_ring_db(qp, ready_head);
             }
         }
-#ifdef DG_MEGA_MOE_QP_INFLIGHT_WQES
-        // Sliding window: wait only until this reservation fits under the
-        // cap, not for a full drain.  Clamped to ready_head so an oversized
-        // single batch (num_wqes >= cap) degrades to the original full-drain
-        // wait instead of polling an unsubmitted index.
-        uint64_t poll_target = base_wqe_idx + num_wqes - inflight_cap + 1;
-        if (poll_target > ready_head)
-            poll_target = ready_head;
-        ibgda_poll_cq(qp->tx_wq.cq, poll_target);
-#else
         ibgda_poll_cq(qp->tx_wq.cq, ready_head);
-#endif
     }
 
     base_wqe_idx = ibgda_reserve_wqe_slots(qp, num_wqes);

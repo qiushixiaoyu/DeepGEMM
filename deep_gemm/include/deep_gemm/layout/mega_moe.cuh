@@ -548,6 +548,6 @@ struct Buffer {
 static constexpr uint32_t kSM90MegaMoEProfileMaxSMs = 256;
 // 31 phase slots + 3 absolute globaltimer stamps (kernel entry, counts sent,
 // count barrier released) used to separate launch skew from protocol cost.
-static constexpr uint32_t kSM90MegaMoEProfileSlots = 37;
+static constexpr uint32_t kSM90MegaMoEProfileSlots = 34;
 
 } // namespace deep_gemm::layout

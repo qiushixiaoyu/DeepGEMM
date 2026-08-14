@@ -83,11 +83,27 @@ static int get_num_experts_per_wave_for_mega_moe_sm90(
         num_ring_tokens, num_max_tokens_per_rank, num_ranks);
 }
 
+// swapAB trades a smaller BLOCK_N (128 instead of 256) for less wasted work
+// in the M dimension.  It pays off only when the GEMM is latency/occupancy
+// bound; once weight streaming dominates, halving the weight tile costs more
+// than the saved M rows.  Two conditions, both calibrated on Flash / GLM5.2 /
+// Pro (2026-08-13, `test_logs/20260813_swapab_calib`):
+//
+//   per-expert weights = 3 * hidden * intermediate bytes (FP8: L1 2HI + L2 HI)
+//     Flash 25.2 MB, GLM5.2 37.7 MB -> swapAB wins at small M
+//     Pro   66.1 MB                 -> swapAB loses at EVERY measured point
+//                                      (b1 +8.5% ... b96 +30%)
+//   tokens per expert
+//     Flash: swapAB wins at 1.5/3/6, ties at 12/24
+//     GLM:   wins at 0.5/4, ties at 2/8, loses 17% at 16
+//
+// Hence: enable only below both thresholds.  The weight bound sits between
+// GLM (12.6M) and Pro (22.0M) with >20% margin on each side; the token bound
+// sits between GLM's tie at 8 and its 17% loss at 16.
 static bool should_use_swap_ab_for_mega_moe_sm90(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
-    const int& block_m, const int& num_epilogue_threads) {
-    // swapAB is ENABLED by default (the L1 SF-pool stride bug that corrupted
-    // pool blocks >= 1 was fixed: BLOCK_M -> SF_BLOCK_M in the swapAB L1 epilogue).
+    const int& block_m, const int& num_epilogue_threads,
+    const int& hidden, const int& intermediate_hidden) {
     // Kill-switch retained: set DG_SM90_FP8_SWAP_AB=0 to force the non-swap path.
     if (get_env<int>("DG_SM90_FP8_SWAP_AB", 1) == 0)
         return false;
@@ -95,7 +111,14 @@ static bool should_use_swap_ab_for_mega_moe_sm90(
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
     const bool decode_split_n_path =
         block_m == 64 and num_epilogue_threads == 256;
-    return decode_split_n_path and expected_tokens_per_expert < 30.0f
+    // Weight-streaming-bound shapes must keep the wide BLOCK_N.
+    constexpr int64_t kSwapAbMaxWeightElems = 16ll * 1024 * 1024;
+    const bool weight_light =
+        static_cast<int64_t>(hidden) * intermediate_hidden <
+        kSwapAbMaxWeightElems;
+    constexpr float kSwapAbMaxTokensPerExpert = 10.0f;
+    return decode_split_n_path and weight_light
+           and expected_tokens_per_expert < kSwapAbMaxTokensPerExpert
            and expected_tokens_per_expert > 0.0f;
 }
 
@@ -538,7 +561,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
         (2 * intermediate_hidden) % 256 == 0 and hidden % 256 == 0;
     const bool use_swap_ab = should_use_swap_ab_for_mega_moe_sm90(
         num_experts_per_rank, num_tokens, num_topk,
-        block_m, num_epilogue_threads);
+        block_m, num_epilogue_threads, hidden, intermediate_hidden);
     int block_n = use_swap_ab ? 128
                               : (auto_split_mn ? 256 :
                                  (decode_use_block_n_256 ? 256 : 128));

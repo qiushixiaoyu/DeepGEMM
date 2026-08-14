@@ -157,27 +157,19 @@ CUTLASS_DEVICE void sm90_fp8_mega_moe_for_each_shared_block(
 //     reduction in BF16) — ported verbatim from the SM100 kernel.
 // ============================================================================
 
-#ifdef DG_MEGA_MOE_PUBLISHER_MAX_ACTIVE
-// FIFO ticket semaphore bounding the number of concurrently publishing
-// inter-node pairs, so the burst injection rate stays under the RoCE
-// DCQCN/ECN trip point.  Both counters only grow across launches; module
-// load zero-initializes them once, so no per-launch reset or cleanup epoch
-// is involved.
-__device__ static uint64_t g_publisher_limiter_ticket_head = 0;
-__device__ static uint64_t g_publisher_limiter_released = 0;
-#endif
-
-#if defined(DG_MEGA_MOE_PUBLISHER_RATE_MBPS) or \
-    defined(DG_MEGA_MOE_PUBLISHER_DST_RATE_MBPS)
+#ifdef DG_MEGA_MOE_PUBLISHER_DST_RATE_MBPS
 // Token bucket pinning a publisher injection rate below the RoCE ECN trip
 // point.  Virtual-time form: each submission pre-charges its bytes and waits
 // until wall time catches up with bytes/rate.  A rate in MB/s numerically
 // equals bytes/us, so integer division against a us clock is exact enough.
 // Counters only grow across launches; the floor clamp refills at most
-// kPublisherBurstBytes of credit after an idle gap, so a launch cannot open
-// with an unbounded burst.  The global variant uses one bucket per GPU; the
-// per-destination variant shades one bucket per dst rank so a skewed fan-in
-// only throttles senders of the hot receiver instead of every link.
+// burst_bytes of credit after an idle gap, so a launch cannot open with an
+// unbounded burst.  One bucket per destination rank, so a skewed fan-in only
+// throttles senders of the hot receiver instead of every link.
+//
+// Bounding the number of concurrent publishers instead (a ticket semaphore)
+// and bounding per-QP in-flight WQEs were both measured and rejected: neither
+// caps the *injection rate*, which is what trips ECN.
 __device__ __forceinline__ void publisher_token_bucket_wait(
     uint64_t* epoch_ptr, uint64_t* bytes_ptr,
     const uint64_t& rate_bytes_per_us, const uint64_t& burst_bytes,
@@ -214,11 +206,6 @@ __device__ __forceinline__ void publisher_token_bucket_wait(
         DG_TRAP_ONLY_DEVICE_ASSERT(
             clock64() - wait_start < kRateTimeoutCycles);
 }
-#endif
-
-#ifdef DG_MEGA_MOE_PUBLISHER_RATE_MBPS
-__device__ static uint64_t g_publisher_rate_epoch_ns = 0;
-__device__ static uint64_t g_publisher_rate_bytes = 0;
 #endif
 
 #ifdef DG_MEGA_MOE_PUBLISHER_DST_RATE_MBPS
@@ -465,11 +452,6 @@ sm90_fp8_mega_moe_impl(void* y,
         kProfileEntryGlobaltimer = 31,
         kProfileCountsSentGlobaltimer = 32,
         kProfileCountsReadyGlobaltimer = 33,
-        // Splits the inter-node cleanup barrier into its IBGDA-quiet part
-        // and its nvshmem_sync_all() part.
-        kProfileCleanupQuietGlobaltimer = 34,
-        kProfileCleanupSyncGlobaltimer = 35,
-        kProfileCleanupIbgdaGlobaltimer = 36,
     };
     enum ExpertReadyProfileSlot : uint32_t {
         kExpertProfileEpoch = 0,
@@ -1903,7 +1885,15 @@ sm90_fp8_mega_moe_impl(void* y,
 #endif
         } else {
             for (uint32_t i = sm_idx - 1; i < kNumExpertsPerRank; i += kNumSMs - 1) {
-#ifdef DG_MEGA_MOE_INTERNODE
+#if defined(DG_MEGA_MOE_INTERNODE) and defined(DG_MEGA_MOE_NO_TAG3)
+                // Without the tag-3 barrier a faster peer can already have
+                // published its NEXT epoch's count into these slots, so
+                // re-summing the raw slots here would mix two rounds and
+                // mis-size the pool-block clearing below.  Use the
+                // scheduler's cached, epoch-validated count for this round
+                // (the same value `get_pool_block_offset` is derived from).
+                const uint32_t num_recv_tokens = scheduler.get_num_tokens(i);
+#elif defined(DG_MEGA_MOE_INTERNODE)
                 // 方案c：recv_count_sum 跨节点不再写入，token 总数改为对 16 个 per-source 槽本地求和
                 // (低32位=count)。此读在下方 sync_aligned 之前完成，槽的零化在其之后，顺序有 barrier 保护。
                 uint32_t num_recv_tokens = 0;
@@ -2024,13 +2014,7 @@ sm90_fp8_mega_moe_impl(void* y,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            true, false
-#ifdef DG_MEGA_MOE_PHASE_PROFILE
-            , phase_profile + kProfileCleanupQuietGlobaltimer,
-            phase_profile + kProfileCleanupSyncGlobaltimer,
-            phase_profile + kProfileCleanupIbgdaGlobaltimer
-#endif
-        );
+            true, false);
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
         if (profile_dispatch_leader)
             phase_profile[kProfileCleanupBarrier] =
@@ -2362,15 +2346,13 @@ sm90_fp8_mega_moe_impl(void* y,
                                 }
                             }
                             if (chain_is_inter) {
-#if defined(DG_MEGA_MOE_PUBLISHER_RATE_MBPS) or \
-    defined(DG_MEGA_MOE_PUBLISHER_DST_RATE_MBPS)
+#ifdef DG_MEGA_MOE_PUBLISHER_DST_RATE_MBPS
                                 const uint32_t rate_rows = __popc(
                                     __ballot_sync(0xffffffff, row_active));
                                 const uint32_t rate_bytes =
                                     rate_rows * kHidden *
                                     static_cast<uint32_t>(
                                         sizeof(nv_bfloat16));
-#ifdef DG_MEGA_MOE_PUBLISHER_DST_RATE_MBPS
                                 if (lane_idx == 0 and rate_rows != 0)
                                     publisher_token_bucket_wait(
                                         &g_publisher_dst_rate_epoch_ns,
@@ -2381,16 +2363,6 @@ sm90_fp8_mega_moe_impl(void* y,
                                             (kNumRanks -
                                              DG_MEGA_MOE_NVL_PEERS),
                                         rate_bytes);
-#endif
-#ifdef DG_MEGA_MOE_PUBLISHER_RATE_MBPS
-                                if (lane_idx == 0 and rate_rows != 0)
-                                    publisher_token_bucket_wait(
-                                        &g_publisher_rate_epoch_ns,
-                                        &g_publisher_rate_bytes,
-                                        DG_MEGA_MOE_PUBLISHER_RATE_MBPS,
-                                        4ull << 20,
-                                        rate_bytes);
-#endif
                                 __syncwarp();
 #endif
                                 comm::ibgda::put_nbi_warp_batch_rows(
@@ -2553,29 +2525,6 @@ sm90_fp8_mega_moe_impl(void* y,
                         }
                     }
 
-#ifdef DG_MEGA_MOE_PUBLISHER_MAX_ACTIVE
-                    // Acquire only after the first M block is ready: a pair
-                    // waiting on upstream compute must not hold a slot.  The
-                    // slot is held until this pair's ready is submitted.
-                    if (m_block_idx == 0 and pair_is_inter) {
-                        if (lane_idx == 0) {
-                            const uint64_t ticket = atomicAdd(
-                                reinterpret_cast<unsigned long long*>(
-                                    &g_publisher_limiter_ticket_head), 1ull);
-                            const uint64_t limiter_wait_start = clock64();
-                            while (ptx::ld_acq_gpu(
-                                       &g_publisher_limiter_released) +
-                                   DG_MEGA_MOE_PUBLISHER_MAX_ACTIVE <=
-                                   ticket) {
-                                DG_TRAP_ONLY_DEVICE_ASSERT(
-                                    clock64() - limiter_wait_start <
-                                    kPublishTimeoutCycles);
-                            }
-                        }
-                        __syncwarp();
-                    }
-#endif
-
                     const uint32_t m_idx = pool_block_idx * BLOCK_M;
                     const uint32_t valid_m = cute::min(
                         expert_num_tokens - m_block_idx * BLOCK_M,
@@ -2594,22 +2543,6 @@ sm90_fp8_mega_moe_impl(void* y,
                                 src_metadata.rank_idx == dst_rank_idx;
                             if (row_active) {
                                 ++ lane_pair_rows;
-#ifdef DG_MEGA_MOE_ASYNC_STAGE_LOCAL_ROWS
-                                const auto staging_row =
-                                    combine_full_row_staging_buffer
-                                        .get_data_buffer(m_idx + row);
-                                const auto dst_row = combine_token_buffer
-                                    .get_rank_buffer(src_metadata.topk_idx)
-                                    .get_data_buffer(src_metadata.token_idx);
-                                req_lptr = reinterpret_cast<uint64_t>(
-                                    staging_row.get_base_ptr());
-                                req_rptr = reinterpret_cast<uint64_t>(
-                                    pair_is_inter
-                                        ? dst_row.get_base_ptr()
-                                        : sym_buffer.map(
-                                              dst_row.get_base_ptr(),
-                                              dst_rank_idx));
-#else
                                 if (pair_is_inter) {
                                     const auto staging_row =
                                         combine_full_row_staging_buffer
@@ -2624,7 +2557,6 @@ sm90_fp8_mega_moe_impl(void* y,
                                     req_lptr = reinterpret_cast<uint64_t>(
                                         staging_row.get_base_ptr());
                                 }
-#endif
                             }
                         }
 
@@ -2637,14 +2569,12 @@ sm90_fp8_mega_moe_impl(void* y,
                             const uint64_t profile_wqe_start =
                                 lane_idx == 0 ? clock64() : 0;
 #endif
-#if defined(DG_MEGA_MOE_PUBLISHER_RATE_MBPS) or \
-    defined(DG_MEGA_MOE_PUBLISHER_DST_RATE_MBPS)
+#ifdef DG_MEGA_MOE_PUBLISHER_DST_RATE_MBPS
                             const uint32_t rate_rows = __popc(
                                 __ballot_sync(0xffffffff, row_active));
                             const uint32_t rate_bytes =
                                 rate_rows * kHidden *
                                 static_cast<uint32_t>(sizeof(nv_bfloat16));
-#ifdef DG_MEGA_MOE_PUBLISHER_DST_RATE_MBPS
                             if (lane_idx == 0 and rate_rows != 0)
                                 publisher_token_bucket_wait(
                                     &g_publisher_dst_rate_epoch_ns,
@@ -2655,40 +2585,8 @@ sm90_fp8_mega_moe_impl(void* y,
                                         (kNumRanks -
                                          DG_MEGA_MOE_NVL_PEERS),
                                     rate_bytes);
-#endif
-#ifdef DG_MEGA_MOE_PUBLISHER_RATE_MBPS
-                            if (lane_idx == 0 and rate_rows != 0)
-                                publisher_token_bucket_wait(
-                                    &g_publisher_rate_epoch_ns,
-                                    &g_publisher_rate_bytes,
-                                    DG_MEGA_MOE_PUBLISHER_RATE_MBPS,
-                                    4ull << 20,
-                                    rate_bytes);
-#endif
                             __syncwarp();
 #endif
-#ifdef DG_MEGA_MOE_ASYNC_PUBLISHER_ROW_DOORBELL
-                            // Diagnostic A/B: preserve pair ownership but
-                            // submit one row per reserve/doorbell, matching
-                            // the old publisher cadence.  All lanes still
-                            // cooperate to materialize one registered row.
-                            uint32_t pending_rows =
-                                __ballot_sync(0xffffffff, row_active);
-                            while (pending_rows != 0) {
-                                const int owner_lane = __ffs(pending_rows) - 1;
-                                const auto row_rptr = __shfl_sync(
-                                    0xffffffff, req_rptr, owner_lane);
-                                const auto row_lptr = __shfl_sync(
-                                    0xffffffff, req_lptr, owner_lane);
-                                comm::ibgda::put_nbi_warp(
-                                    row_rptr, row_lptr,
-                                    kHidden * sizeof(nv_bfloat16),
-                                    static_cast<int>(dst_rank_idx),
-                                    static_cast<int>(local_expert_idx),
-                                    static_cast<int>(lane_idx));
-                                pending_rows &= pending_rows - 1;
-                            }
-#else
                             comm::ibgda::put_nbi_warp_batch_rows(
                                 req_rptr, req_lptr,
                                 kHidden * sizeof(nv_bfloat16),
@@ -2696,21 +2594,15 @@ sm90_fp8_mega_moe_impl(void* y,
                                 static_cast<int>(dst_rank_idx),
                                 static_cast<int>(local_expert_idx),
                                 static_cast<int>(lane_idx));
-#endif
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
                             if (lane_idx == 0) {
                                 profile_publisher_wqe_cycles +=
                                     clock64() - profile_wqe_start;
                                 if (batch_active_rows != 0) {
-#ifdef DG_MEGA_MOE_ASYNC_PUBLISHER_ROW_DOORBELL
-                                    profile_submit_count += batch_active_rows;
-                                    profile_max_batch_rows = 1;
-#else
                                     ++ profile_submit_count;
                                     profile_max_batch_rows = cute::max(
                                         profile_max_batch_rows,
                                         batch_active_rows);
-#endif
                                 }
                                 atomicAdd(
                                     phase_profile +
@@ -2720,37 +2612,6 @@ sm90_fp8_mega_moe_impl(void* y,
                             }
 #endif
                         }
-#ifdef DG_MEGA_MOE_ASYNC_STAGE_LOCAL_ROWS
-                        else {
-                            // Keep the experimental local path structurally
-                            // identical to the RDMA path: math warps only
-                            // publish a complete row into staging, and the
-                            // pair owner copies it to the destination HBM.
-                            // One active lane describes one row; the full warp
-                            // then performs a coalesced NVLink copy.
-                            uint32_t pending_rows =
-                                __ballot_sync(0xffffffff, row_active);
-                            constexpr uint32_t kNumRowVecs =
-                                kHidden * sizeof(nv_bfloat16) / sizeof(uint4);
-                            while (pending_rows != 0) {
-                                const int owner_lane = __ffs(pending_rows) - 1;
-                                const auto row_src_addr = __shfl_sync(
-                                    0xffffffff, req_lptr, owner_lane);
-                                const auto row_dst_addr = __shfl_sync(
-                                    0xffffffff, req_rptr, owner_lane);
-                                const auto row_src = reinterpret_cast<const uint4*>(
-                                    row_src_addr);
-                                auto row_dst = reinterpret_cast<uint4*>(
-                                    row_dst_addr);
-                                for (uint32_t vec_idx = lane_idx;
-                                     vec_idx < kNumRowVecs;
-                                     vec_idx += 32)
-                                    row_dst[vec_idx] = row_src[vec_idx];
-                                __syncwarp();
-                                pending_rows &= pending_rows - 1;
-                            }
-                        }
-#endif
                     }
                 }
 
@@ -2793,14 +2654,6 @@ sm90_fp8_mega_moe_impl(void* y,
                     }
                 }
                 __syncwarp();
-#ifdef DG_MEGA_MOE_PUBLISHER_MAX_ACTIVE
-                // Matches the m_block_idx == 0 acquire above exactly once
-                // per non-empty inter-node pair.
-                if (pair_is_inter and lane_idx == 0)
-                    atomicAdd(
-                        reinterpret_cast<unsigned long long*>(
-                            &g_publisher_limiter_released), 1ull);
-#endif
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
                 if (lane_idx == 0) {
                     atomicMax(
@@ -4269,12 +4122,7 @@ sm90_fp8_mega_moe_impl(void* y,
                         const bool row_is_inter =
                             dst_rank_idx / DG_MEGA_MOE_NVL_PEERS !=
                             sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS;
-                        bool row_uses_staging = row_is_inter;
-#ifdef DG_MEGA_MOE_ASYNC_STAGE_LOCAL_ROWS
-                        row_uses_staging = true;
-#endif
-
-                        if (row_uses_staging) {
+                        if (row_is_inter) {
                             const auto staging_row = combine_full_row_staging_buffer
                                 .get_data_buffer(m_idx + m_idx_in_block);
                             auto staging_ptr = math::advance_ptr<ScatterVec>(
