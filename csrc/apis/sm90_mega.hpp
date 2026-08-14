@@ -82,6 +82,27 @@ static bool sm90_mega_moe_combine_uses_full_row() {
     return get_sm90_mega_moe_combine_impl() != SM90MegaMoECombineImpl::Legacy;
 }
 
+// FP4 kill switch.  The FP8 kernel splits its protocol selection across
+// `DG_MEGA_MOE_{DISPATCH,COMBINE}_IMPL` for historical reasons; FP4 only ever
+// needs "old or new", so one switch covers dispatch and combine together and
+// keeps the JIT configuration space from multiplying.
+//
+// Latched on first use for the same reason as the selectors above: the
+// symmetric buffer layout depends on the answer, so a live SymmBuffer must not
+// be resized behind the kernel by changing the environment between calls.
+//
+// Defaults to the legacy protocol while the new one is still being ported;
+// flip once dispatch/combine/loader are all in place and verified.
+static bool sm90_fp4_uses_legacy_protocol() {
+    static const auto legacy =
+        get_env<int>("DG_SM90_FP4_LEGACY_PROTOCOL", 1) != 0;
+    return legacy;
+}
+
+static bool sm90_fp4_combine_uses_full_row() {
+    return not sm90_fp4_uses_legacy_protocol();
+}
+
 static int get_token_alignment_for_sm90_mega_moe() {
     return layout::kLCMCandidateBlockM;
 }
@@ -268,7 +289,15 @@ get_symm_buffer_size_for_sm90_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
-    const bool& use_fp8_dispatch, const std::string& activation) {
+    const bool& use_fp8_dispatch, const std::string& activation,
+    // Whether the caller's combine stages whole rows.  The FP8 and FP4 kernels
+    // decide this from separate switches, so each kernel entry passes its own
+    // answer to get an exact requirement.  The allocation path (which does not
+    // know which kernel will run on the buffer) leaves this defaulted and gets
+    // the union: sizing for either protocol can never under-allocate, and the
+    // two only disagree while A/B-ing one kernel against the other.
+    const bool& combine_uses_full_row = sm90_mega_moe_combine_uses_full_row() or
+                                        sm90_fp4_combine_uses_full_row()) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(use_fp8_dispatch);
     DG_HOST_ASSERT(activation == "swiglu");
@@ -339,7 +368,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
         combine_token_buffer.get_end_ptr());
 
     void* symm_buffer_end = dispatch_staging_buffer.get_end_ptr();
-    if (sm90_mega_moe_combine_uses_full_row()) {
+    if (combine_uses_full_row) {
         const auto combine_full_row_arrival_buffer = layout::Buffer(
             layout::Data(sizeof(uint32_t), false), 1,
             workspace.num_max_pool_blocks, symm_buffer_end);
@@ -512,7 +541,8 @@ static void fp8_mega_moe_impl(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        true, activation);
+        true, activation,
+        sm90_mega_moe_combine_uses_full_row());
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
@@ -645,11 +675,18 @@ static void fp8_fp4_mega_moe_sm90(
 
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
+    // The legacy protocol has no RDMA path at all: every remote access goes
+    // through `SymBuffer::map()`, plain offset arithmetic that is only valid
+    // inside one NVLink domain.  Cross-node runs therefore require the new
+    // protocol (DG_SM90_FP4_LEGACY_PROTOCOL=0), which routes cross-node
+    // traffic over IBGDA verbs.
+    DG_HOST_ASSERT(not sm90_fp4_uses_legacy_protocol() or num_ranks <= 8);
     const auto [num_required_bytes, slice] = get_symm_buffer_size_for_sm90_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        true, activation);
+        true, activation,
+        sm90_fp4_combine_uses_full_row());
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
@@ -662,8 +699,32 @@ static void fp8_fp4_mega_moe_sm90(
     DG_HOST_ASSERT(get_env<int>("DG_USE_FP4_ACTS") == 0);
     DG_HOST_ASSERT(get_env<int>("DG_USE_FP8_COMBINE") == 0);
 
-    const auto fp4_defaults = get_fp4_sm90_api_defaults(
+    auto fp4_defaults = get_fp4_sm90_api_defaults(
         num_experts_per_rank, num_tokens, num_topk, intermediate_hidden);
+    // The merged loader frees warp 1, so it must no longer be counted as an
+    // FP4 decode assistant -- otherwise the decode-done arrival count would
+    // include a warp that never arrives.
+    if (get_env<int>("DG_MEGA_MOE_MERGE_AB_LOADER", 0) != 0)
+        fp4_defaults.first_decode_assist_warp =
+            std::max(fp4_defaults.first_decode_assist_warp, 2);
+    // Debug-only override for bisecting first-assist-warp interactions; -1
+    // keeps the heuristic value.  TODO(fp4-rdma): drop after step 3 lands.
+    if (const int fa = get_env<int>("DG_SM90_FP4_FIRST_DECODE_ASSIST_WARP", -1); fa >= 0)
+        fp4_defaults.first_decode_assist_warp = fa;
+    // Inter-node protocol selection, mirroring the FP8 entry: expert-ready
+    // dispatch and full-row/expert-ready combine only ever activate past one
+    // NVLink domain.  Single-node keeps the legacy count-sum handshake, so
+    // the kill switch and these flags change nothing at <= 8 ranks.  FP4 uses
+    // one switch for the whole protocol bundle instead of FP8's two selectors.
+    const bool fp4_internode = num_ranks > 8;
+    const bool fp4_new_protocol =
+        not sm90_fp4_uses_legacy_protocol() and fp4_internode;
+    const bool fp4_async_publisher = fp4_new_protocol and
+        get_env<int>("DG_MEGA_MOE_ASYNC_PUBLISHER", 1) != 0;
+    if (fp4_internode) {
+        const auto num_rc_per_pe = get_env<int>("NVSHMEM_IBGDA_NUM_RC_PER_PE", 0);
+        DG_HOST_ASSERT(num_rc_per_pe >= num_experts_per_rank);
+    }
     sm90_fp8_fp4_mega_moe(y,
                           l1_acts, l1_acts_sf,
                           l2_acts, l2_acts_sf,
@@ -685,7 +746,18 @@ static void fp8_fp4_mega_moe_sm90(
                           fp4_defaults.l2_arrival_counter,
                           fp4_defaults.ss_nsplit,
                           fp4_defaults.swap_ab,
-                          fp4_defaults.swap_ab_fast_amax);
+                          fp4_defaults.swap_ab_fast_amax,
+                          /*dispatch_expert_ready=*/fp4_new_protocol,
+                          /*lazy_expert_count=*/false,
+                          // The full-row/expert-ready combine bundle only has
+                          // a publisher-driven publication path in this kernel
+                          // (FP8's last-CTA inline full-row variant was not
+                          // ported), so all three flags travel together:
+                          // DG_MEGA_MOE_ASYNC_PUBLISHER=0 falls back to the
+                          // inline-publish combine for A/B comparison.
+                          /*combine_full_row=*/fp4_async_publisher,
+                          /*combine_expert_ready=*/fp4_async_publisher,
+                          /*async_publisher=*/fp4_async_publisher);
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();

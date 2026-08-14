@@ -79,6 +79,16 @@ public:
         // swapAB path: use decoded weight as WGMMA-M and tokens as WGMMA-N.
         bool use_swap_ab;
         bool use_swap_ab_fast_amax;
+        // Inter-node protocol selectors (see the FP8 runtime).  The API layer
+        // only sets these together with `num_ranks > 8`; single-node launches
+        // keep all four false and compile the same kernel as before.
+        bool dispatch_expert_ready;
+        bool lazy_expert_count;
+        bool combine_full_row;
+        bool combine_expert_ready;
+        // Plan-B async publisher: the last non-epilogue warp ships staged
+        // full rows.  Requires the expert-ready combine bundle above.
+        bool async_publisher;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -104,7 +114,40 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+        // Inter-node build: ranks span more than one NVLink domain.  Inject
+        // the same macros as the FP8 runtime so barrier.cuh (and the ported
+        // dispatch/combine branches) take the NVSHMEM remote path.  The
+        // `nvshmem` mention in the comment also makes the JIT compiler
+        // device-link libnvshmem_device.
+        constexpr int kNvlPeers = 8;
+        // Protocol flags are inter-node-only by construction (API layer gates
+        // them on `num_ranks > 8`); a violation here means the API glue broke.
+        DG_HOST_ASSERT(not (args.dispatch_expert_ready or args.combine_full_row or
+                            args.combine_expert_ready) or args.num_ranks > kNvlPeers);
+        std::string internode_prefix;
+        // Merged A/B loader frees loader warp 1 (the async publisher's future
+        // home).  Independent of inter-node: single-node runs can A/B it.
+        if (get_env<int>("DG_MEGA_MOE_MERGE_AB_LOADER", 0) != 0)
+            internode_prefix += "#define DG_MEGA_MOE_MERGE_AB_LOADER 1\n";
+        if (args.num_ranks > kNvlPeers) {
+            internode_prefix += fmt::format(
+                "// inter-node mega-moe: uses nvshmem device functions\n"
+                "#define DG_MEGA_MOE_INTERNODE\n"
+                "#define DG_MEGA_MOE_NVL_PEERS {}\n", kNvlPeers);
+            // Removes the tag-3 cross-rank barrier.  NOTE: NO_TAG3 strips the
+            // cross-rank rendezvous from EVERY inter-node nvlink_barrier tag,
+            // including tag-2 (before combine reduce).  FP8 tolerates that
+            // because its cross-node combine is expert-ready; this kernel
+            // still runs the legacy combine with inline publish, which needs
+            // tag-2 to be a real barrier.  Default OFF until the expert-ready
+            // combine port lands, then follow the FP8 default.
+            const bool no_tag3 =
+                get_env<int>("DG_MEGA_MOE_NO_TAG3", 0) != 0;
+            DG_HOST_ASSERT(not no_tag3 or args.dispatch_expert_ready);
+            if (no_tag3)
+                internode_prefix += "#define DG_MEGA_MOE_NO_TAG3 1\n";
+        }
+        return internode_prefix + fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_fp4_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -132,6 +175,8 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
+        {}, {}, {}, {},
         {}
     >);
 }};
@@ -157,7 +202,12 @@ static void __instantiate_kernel() {{
     args.use_l2_arrival_counter ? "true" : "false",
     args.use_ss_nsplit ? "true" : "false",
     args.use_swap_ab ? "true" : "false",
-    args.use_swap_ab_fast_amax ? "true" : "false");
+    args.use_swap_ab_fast_amax ? "true" : "false",
+    args.dispatch_expert_ready ? "true" : "false",
+    args.lazy_expert_count ? "true" : "false",
+    args.combine_full_row ? "true" : "false",
+    args.combine_expert_ready ? "true" : "false",
+    args.async_publisher ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -202,8 +252,15 @@ static void sm90_fp8_fp4_mega_moe(
     const bool& use_l2_arrival_counter = false,
     const bool& use_ss_nsplit = false,
     const bool& use_swap_ab = false,
-    const bool& use_swap_ab_fast_amax = false
+    const bool& use_swap_ab_fast_amax = false,
+    const bool& dispatch_expert_ready = false,
+    const bool& lazy_expert_count = false,
+    const bool& combine_full_row = false,
+    const bool& combine_expert_ready = false,
+    const bool& async_publisher = false
 ) {
+    DG_HOST_ASSERT(not async_publisher or
+                   (combine_full_row and combine_expert_ready));
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
@@ -324,6 +381,11 @@ static void sm90_fp8_fp4_mega_moe(
         .use_ss_nsplit = use_ss_nsplit,
         .use_swap_ab = use_swap_ab,
         .use_swap_ab_fast_amax = use_swap_ab_fast_amax,
+        .dispatch_expert_ready = dispatch_expert_ready,
+        .lazy_expert_count = lazy_expert_count,
+        .combine_full_row = combine_full_row,
+        .combine_expert_ready = combine_expert_ready,
+        .async_publisher = async_publisher,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

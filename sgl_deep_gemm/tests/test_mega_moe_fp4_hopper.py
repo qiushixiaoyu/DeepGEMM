@@ -1271,7 +1271,7 @@ def _layer4_edges(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
 
 
 def _layer5_dsv4_shape(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
-    assert num_ranks == 8, 'DSV4 shape test expects 8 ranks'
+    assert num_ranks in (8, 16), 'DSV4 shape test expects 8 or 16 ranks'
     return [('L5.dsv4_h4096_ih2048_e256_k6', dict(
         num_max_tokens_per_rank=128, num_tokens=64,
         hidden=4096, intermediate_hidden=2048,
@@ -1281,7 +1281,7 @@ def _layer5_dsv4_shape(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
 
 
 def _layer6_dsv4_checkpoint(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
-    assert num_ranks == 8, 'DSV4 checkpoint test expects 8 ranks'
+    assert num_ranks in (8, 16), 'DSV4 checkpoint test expects 8 or 16 ranks'
     model_path = os.getenv('DSV4_FP4_MODEL_PATH')
     if not model_path:
         dist_print(
@@ -1309,7 +1309,7 @@ def _layer7_dsv4_2wg(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
     # math warpgroup's FP4 decode OFF on the 2-WG path (decode is offloaded
     # to the assist warps and written to the shared decoded-B smem tile, so the
     # numerics must be identical to the math-on path).
-    assert num_ranks == 8, 'DSV4 2-WG shape test expects 8 ranks'
+    assert num_ranks in (8, 16), 'DSV4 2-WG shape test expects 8 or 16 ranks'
     return [('L7.dsv4_2wg_nt512_h4096_ih2048_e256_k6', dict(
         num_max_tokens_per_rank=512, num_tokens=512,
         hidden=4096, intermediate_hidden=2048,
@@ -1325,30 +1325,34 @@ def _layer8_pro_smoke(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
             hidden=7168, intermediate_hidden=3072,
             num_experts=384, num_topk=6,
             activation_clamp=10.0,
+            reference_chunk=16,
         )),
         ('L8.pro_b128_1wg_h7168_ih3072_e384_k6', dict(
             num_max_tokens_per_rank=128, num_tokens=128,
             hidden=7168, intermediate_hidden=3072,
             num_experts=384, num_topk=6,
             activation_clamp=10.0,
+            reference_chunk=16,
         )),
         ('L8.pro_b256_1wg_h7168_ih3072_e384_k6', dict(
             num_max_tokens_per_rank=256, num_tokens=256,
             hidden=7168, intermediate_hidden=3072,
             num_experts=384, num_topk=6,
             activation_clamp=10.0,
+            reference_chunk=16,
         )),
         ('L8.pro_b512_2wg_h7168_ih3072_e384_k6', dict(
             num_max_tokens_per_rank=512, num_tokens=512,
             hidden=7168, intermediate_hidden=3072,
             num_experts=384, num_topk=6,
             activation_clamp=10.0,
+            reference_chunk=16,
         )),
     ]
 
 
 def _layer9_swapab_small_batch(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
-    assert num_ranks == 8, 'swapAB small-batch test expects 8 ranks'
+    assert num_ranks in (8, 16), 'swapAB small-batch test expects 8 or 16 ranks'
     common = dict(
         num_max_tokens_per_rank=128,
         num_topk=6,
@@ -2094,7 +2098,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         try:
             _run_scenario(name, cfg, rank_idx, num_ranks, group, diff_tol)
         except AssertionError as ex:
-            dist_print(f'  [{name}] FAIL: {ex}', once_in_node=True)
+            import traceback
+            dist_print(f'  [{name}] FAIL: {ex}\n{traceback.format_exc()}',
+                       once_in_node=True)
             failures.append(name)
             if args.fail_fast:
                 break
