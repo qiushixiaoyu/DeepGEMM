@@ -42,9 +42,12 @@ public:
     struct Args {
         // Templated arguments
         int num_max_tokens_per_rank;
+        int requested_num_max_tokens_per_rank;
         int hidden, intermediate_hidden;
         int num_experts, num_topk;
         int num_ranks;
+        int num_l1_ring_tokens, num_l1_sf_storage_tokens;
+        int num_l2_ring_tokens, num_l2_sf_storage_tokens;
         float activation_clamp;
         bool fast_math;
         // Read the four packed FP4 words for one K/32 group with a
@@ -79,16 +82,6 @@ public:
         // swapAB path: use decoded weight as WGMMA-M and tokens as WGMMA-N.
         bool use_swap_ab;
         bool use_swap_ab_fast_amax;
-        // Inter-node protocol selectors (see the FP8 runtime).  The API layer
-        // only sets these together with `num_ranks > 8`; single-node launches
-        // keep all four false and compile the same kernel as before.
-        bool dispatch_expert_ready;
-        bool lazy_expert_count;
-        bool combine_full_row;
-        bool combine_expert_ready;
-        // Plan-B async publisher: the last non-epilogue warp ships staged
-        // full rows.  Requires the expert-ready combine bundle above.
-        bool async_publisher;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -120,33 +113,47 @@ public:
         // `nvshmem` mention in the comment also makes the JIT compiler
         // device-link libnvshmem_device.
         constexpr int kNvlPeers = 8;
-        // Protocol flags are inter-node-only by construction (API layer gates
-        // them on `num_ranks > 8`); a violation here means the API glue broke.
-        DG_HOST_ASSERT(not (args.dispatch_expert_ready or args.combine_full_row or
-                            args.combine_expert_ready) or args.num_ranks > kNvlPeers);
-        std::string internode_prefix;
-        // Merged A/B loader frees loader warp 1 (the async publisher's future
-        // home).  Independent of inter-node: single-node runs can A/B it.
-        if (get_env<int>("DG_MEGA_MOE_MERGE_AB_LOADER", 0) != 0)
-            internode_prefix += "#define DG_MEGA_MOE_MERGE_AB_LOADER 1\n";
+        // The shared implementation header now always parses the combine-ring
+        // type, whose IBGDA helper includes NVSHMEM device headers even when a
+        // <=8-rank specialization compiles every remote branch away.  Keep the
+        // marker unconditional so the JIT compiler supplies those include and
+        // device-link flags for single-node FP4 as well.
+        std::string internode_prefix =
+            "// sm90 fp4 mega-moe protocol revision 3\n"
+            "// sm90 fp4 mega-moe support uses nvshmem device helpers\n";
         if (args.num_ranks > kNvlPeers) {
             internode_prefix += fmt::format(
                 "// inter-node mega-moe: uses nvshmem device functions\n"
                 "#define DG_MEGA_MOE_INTERNODE\n"
                 "#define DG_MEGA_MOE_NVL_PEERS {}\n", kNvlPeers);
-            // Removes the tag-3 cross-rank barrier.  NOTE: NO_TAG3 strips the
-            // cross-rank rendezvous from EVERY inter-node nvlink_barrier tag,
-            // including tag-2 (before combine reduce).  FP8 tolerates that
-            // because its cross-node combine is expert-ready; this kernel
-            // still runs the legacy combine with inline publish, which needs
-            // tag-2 to be a real barrier.  Default OFF until the expert-ready
-            // combine port lands, then follow the FP8 default.
-            const bool no_tag3 =
-                get_env<int>("DG_MEGA_MOE_NO_TAG3", 0) != 0;
-            DG_HOST_ASSERT(not no_tag3 or args.dispatch_expert_ready);
-            if (no_tag3)
-                internode_prefix += "#define DG_MEGA_MOE_NO_TAG3 1\n";
+            const int dispatch_gateway =
+                args.requested_num_max_tokens_per_rank <=
+                    layout::kGatewayDenseMaxRequestedTokens ? 4 : 3;
+            if (dispatch_gateway == 3)
+                internode_prefix +=
+                    "#define DG_MEGA_MOE_DISPATCH_GATEWAY_PACKED 1\n";
+            else
+                internode_prefix +=
+                    "#define DG_MEGA_MOE_DISPATCH_GATEWAY_DENSE_V3 1\n";
         }
+        if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE", 0) != 0)
+            internode_prefix += "#define DG_MEGA_MOE_PHASE_PROFILE 1\n";
+        if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE_SILENT", 0) != 0)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_PHASE_PROFILE_SILENT 1\n";
+        const int actual_pool_tokens = layout::get_num_max_pool_tokens(
+            args.num_ranks, args.num_tokens, args.num_topk,
+            args.num_experts / args.num_ranks);
+        const bool l1_ring_active =
+            args.num_l1_ring_tokens < args.config.num_max_pool_tokens and
+            actual_pool_tokens > args.num_l1_ring_tokens;
+        const bool l2_ring_active =
+            args.num_l2_ring_tokens < args.config.num_max_pool_tokens and
+            actual_pool_tokens > args.num_l2_ring_tokens;
+        if (l1_ring_active)
+            internode_prefix += "#define DG_MEGA_MOE_L1_RING_ACTIVE 1\n";
+        if (l2_ring_active)
+            internode_prefix += "#define DG_MEGA_MOE_L2_RING_ACTIVE 1\n";
         return internode_prefix + fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_fp4_mega_moe.cuh>
 
@@ -160,24 +167,13 @@ static void __instantiate_kernel() {{
         {},
         {}, {}, {},
         {},
-        {},
+        {}, {}, {}, {}, {},
         {},
         {}, {}, {},
         {}, {},
-        {},
-        {},
-        {},
-        {},
-        {},
-        {},
-        {},
-        {},
-        {},
-        {},
-        {},
-        {},
+        {}, {},
         {}, {}, {}, {},
-        {}
+        {}, {}, {}, {}, {}, {}
     >);
 }};
 )",
@@ -187,7 +183,15 @@ static void __instantiate_kernel() {{
     args.config.num_experts_per_wave,
     args.config.block_m, args.config.block_n, args.config.block_k,
     args.config.num_max_pool_tokens,
-    args.config.num_padded_sf_pool_tokens,
+    args.num_l1_ring_tokens,
+    args.num_l1_sf_storage_tokens,
+    args.num_l2_ring_tokens,
+    args.num_l2_sf_storage_tokens,
+    args.num_ranks > kNvlPeers ?
+        layout::get_num_sm90_combine_ring_tokens(
+            args.num_ranks, args.num_max_tokens_per_rank, args.num_topk,
+            args.num_experts / args.num_ranks) :
+        args.config.num_max_pool_tokens,
     args.config.num_stages,
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
@@ -202,12 +206,7 @@ static void __instantiate_kernel() {{
     args.use_l2_arrival_counter ? "true" : "false",
     args.use_ss_nsplit ? "true" : "false",
     args.use_swap_ab ? "true" : "false",
-    args.use_swap_ab_fast_amax ? "true" : "false",
-    args.dispatch_expert_ready ? "true" : "false",
-    args.lazy_expert_count ? "true" : "false",
-    args.combine_full_row ? "true" : "false",
-    args.combine_expert_ready ? "true" : "false",
-    args.async_publisher ? "true" : "false");
+    args.use_swap_ab_fast_amax ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -238,6 +237,7 @@ static void sm90_fp8_fp4_mega_moe(
     const std::optional<torch::Tensor> cumulative_local_expert_recv_stats,
     const std::vector<int64_t>& sym_buffer_ptrs,
     const int& rank_idx, const int& num_max_tokens_per_rank,
+    const int& requested_num_max_tokens_per_rank,
     const int& num_experts_per_rank,
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
@@ -252,18 +252,27 @@ static void sm90_fp8_fp4_mega_moe(
     const bool& use_l2_arrival_counter = false,
     const bool& use_ss_nsplit = false,
     const bool& use_swap_ab = false,
-    const bool& use_swap_ab_fast_amax = false,
-    const bool& dispatch_expert_ready = false,
-    const bool& lazy_expert_count = false,
-    const bool& combine_full_row = false,
-    const bool& combine_expert_ready = false,
-    const bool& async_publisher = false
+    const bool& use_swap_ab_fast_amax = false
 ) {
-    DG_HOST_ASSERT(not async_publisher or
-                   (combine_full_row and combine_expert_ready));
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
-    const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
+    const auto num_l1_ring_tokens = static_cast<int>(l1_acts.size(0));
+    const auto num_l1_sf_storage_tokens =
+        static_cast<int>(l1_acts_sf.size(0));
+    const auto num_l2_storage_tokens = static_cast<int>(l2_acts.size(0));
+    const auto num_l2_sf_storage_tokens =
+        static_cast<int>(l2_acts_sf.size(0));
+    const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
+        num_ranks, num_max_tokens_per_rank, num_topk,
+        num_experts_per_rank);
+    const bool l2_ring_enabled =
+        num_l2_storage_tokens < num_max_pool_tokens;
+    constexpr int kSharedScratchRows = 128;
+    const int num_l2_ring_tokens = l2_ring_enabled ?
+        num_l2_storage_tokens - kSharedScratchRows :
+        num_max_pool_tokens;
+    const int num_compute_ring_tokens = std::min(
+        num_l1_ring_tokens, num_l2_ring_tokens);
 
     // Sanity: SFB tensors must be uint32 (UE8M0 packed) and weight tensors
     // must use byte-addressable packed FP4 storage (1 byte = 2 nibbles).
@@ -277,9 +286,10 @@ static void sm90_fp8_fp4_mega_moe(
     const auto config = get_mega_moe_config_sm90_fp4(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk,
-        hidden, intermediate_hidden, num_padded_sf_pool_tokens,
+        hidden, intermediate_hidden, num_l1_sf_storage_tokens,
         use_early_b_decode, use_decode_done_mbarrier,
-        use_swap_ab, use_swap_ab_fast_amax);
+        use_swap_ab, use_swap_ab_fast_amax,
+        num_compute_ring_tokens);
 
     // Tensormap construction
     constexpr int kGranK         = 128;  // L1 acts SF granularity (per-128 K)
@@ -287,12 +297,12 @@ static void sm90_fp8_fp4_mega_moe(
 
     // Acts: FP8 e4m3, identical to FP8 path
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
-                                                     hidden, config.num_max_pool_tokens,
+                                                     hidden, num_l1_ring_tokens,
                                                      config.block_k, config.block_m,
                                                      static_cast<int>(l1_acts.stride(-2)),
                                                      config.swizzle_acts_mode);
     const auto tensor_map_l1_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
-                                                        config.num_padded_sf_pool_tokens, hidden,
+                                                        num_l1_sf_storage_tokens, hidden,
                                                         config.block_m, kGranK,
                                                         1, 0);
 
@@ -337,18 +347,18 @@ static void sm90_fp8_fp4_mega_moe(
     const int tma_l1_out_box_n = split_n_combines_l1_store ? (config.block_n / 2) : wg_l1_out_block_n;
     const int tma_l1_out_box_m = split_n_combines_l1_store ? config.block_m : l1_output_box_m;
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
-                                                       intermediate_hidden, config.num_max_pool_tokens,
+                                                       intermediate_hidden, num_l2_storage_tokens,
                                                        tma_l1_out_box_n, tma_l1_out_box_m,
                                                        static_cast<int>(l2_acts.stride(-2)),
                                                        0);
 
     const auto tensor_map_l2_acts = make_tma_2d_desc(l2_acts,
-                                                     intermediate_hidden, config.num_max_pool_tokens,
+                                                     intermediate_hidden, num_l2_storage_tokens,
                                                      config.block_k, config.block_m,
                                                      static_cast<int>(l2_acts.stride(-2)),
                                                      config.swizzle_acts_mode);
     const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
-                                                        config.num_padded_sf_pool_tokens, intermediate_hidden,
+                                                        num_l2_sf_storage_tokens, intermediate_hidden,
                                                         config.block_m, kL2ActsSFGranK,
                                                         1, 0);
     const auto tensor_map_l2_weights = make_tma_2d_desc(l2_weights_bytes,
@@ -366,9 +376,15 @@ static void sm90_fp8_fp4_mega_moe(
     const auto num_sms = device_runtime->get_num_sms();
     const SM90FP8FP4MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
+        .requested_num_max_tokens_per_rank =
+            requested_num_max_tokens_per_rank,
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
         .num_experts = num_experts, .num_topk = num_topk,
         .num_ranks = num_ranks,
+        .num_l1_ring_tokens = num_l1_ring_tokens,
+        .num_l1_sf_storage_tokens = num_l1_sf_storage_tokens,
+        .num_l2_ring_tokens = num_l2_ring_tokens,
+        .num_l2_sf_storage_tokens = num_l2_sf_storage_tokens,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
         .use_wide_load_decode = use_wide_load_decode,
@@ -381,11 +397,6 @@ static void sm90_fp8_fp4_mega_moe(
         .use_ss_nsplit = use_ss_nsplit,
         .use_swap_ab = use_swap_ab,
         .use_swap_ab_fast_amax = use_swap_ab_fast_amax,
-        .dispatch_expert_ready = dispatch_expert_ready,
-        .lazy_expert_count = lazy_expert_count,
-        .combine_full_row = combine_full_row,
-        .combine_expert_ready = combine_expert_ready,
-        .async_publisher = async_publisher,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

@@ -451,7 +451,7 @@ __device__ static __forceinline__ void put_inline(T* rptr, const T& value, int d
 // QP.  The notification must be reserved after all earlier data WQEs and must
 // not overwrite an in-flight ring slot when a long expert fan-in wraps the QP.
 template <typename T>
-__device__ static __forceinline__ void put_inline_with_credit(
+__device__ static __forceinline__ uint64_t put_inline_with_credit(
     T* rptr, const T& value, int dst_pe, int qp_id) {
     static_assert(sizeof(T) == 4 or sizeof(T) == 8 or sizeof(T) == 16,
                   "Unsupported inline size");
@@ -468,6 +468,9 @@ __device__ static __forceinline__ void put_inline_with_credit(
         static_cast<uint16_t>(base_wqe_idx), &wqe_ptr);
 
     ibgda_submit_requests(qp, base_wqe_idx, 1);
+    // Completion indices use the producer-head convention consumed by
+    // wait_until(): one WQE reserved at base B completes at index B + 1.
+    return base_wqe_idx + 1;
 }
 
 // Warp-cooperative registered HBM WRITE.  A row that crosses registration
@@ -523,10 +526,80 @@ __device__ static __forceinline__ void put_nbi_warp(
     __syncwarp();
 }
 
+struct PutRequest {
+    uint64_t raddr;
+    uint64_t laddr;
+    size_t bytes;
+};
+
+// Reserve and publish a small group of registered-HBM WRITEs with one
+// doorbell.  Registration-boundary fragments are included in the same WQE
+// range, and the returned producer index can be used for exact, per-slot
+// source-lifetime protection instead of a whole-QP quiet.
+template <uint32_t kNumRequests>
+__device__ static __forceinline__ uint64_t put_nbi_warp_group(
+    const PutRequest (&requests)[kNumRequests],
+    int dst_pe, int qp_id, int lane_id) {
+    auto qp = ibgda_get_rc(dst_pe, qp_id);
+
+    uint32_t num_wqes = 0;
+    __be32 my_lkey = 0;
+    uint64_t my_laddr = 0;
+    __be32 my_rkey = 0;
+    uint64_t my_raddr = 0;
+    uint64_t my_chunk_size = 0;
+
+    #pragma unroll
+    for (uint32_t request_idx = 0; request_idx < kNumRequests;
+         ++ request_idx) {
+        uint64_t laddr = requests[request_idx].laddr;
+        uint64_t raddr = requests[request_idx].raddr;
+        uint64_t remaining_bytes = requests[request_idx].bytes;
+        while (remaining_bytes > 0) {
+            DG_DEVICE_ASSERT(num_wqes < 32);
+            if (lane_id == static_cast<int>(num_wqes)) {
+                my_chunk_size = min(
+                    remaining_bytes,
+                    ibgda_get_lkey_and_rkey(
+                        my_laddr = laddr, &my_lkey,
+                        raddr, dst_pe, &my_raddr, &my_rkey, qp->dev_idx));
+            }
+            const uint64_t chunk_size = __shfl_sync(
+                0xffffffff, my_chunk_size, static_cast<int>(num_wqes));
+            DG_DEVICE_ASSERT(chunk_size > 0);
+            laddr += chunk_size;
+            raddr += chunk_size;
+            remaining_bytes -= chunk_size;
+            ++ num_wqes;
+        }
+    }
+    DG_DEVICE_ASSERT(num_wqes > 0);
+
+    uint64_t base_wqe_idx = 0;
+    if (lane_id == 0)
+        base_wqe_idx = ibgda_reserve_wqe_slots_with_credit(qp, num_wqes);
+    base_wqe_idx = __shfl_sync(0xffffffff, base_wqe_idx, 0);
+
+    if (lane_id < static_cast<int>(num_wqes)) {
+        const uint64_t wqe_idx = base_wqe_idx + lane_id;
+        auto wqe_ptr = ibgda_get_wqe_ptr(qp, wqe_idx);
+        ibgda_write_rdma_write_wqe(
+            qp, my_laddr, my_lkey, my_raddr, my_rkey,
+            static_cast<uint32_t>(my_chunk_size),
+            static_cast<uint16_t>(wqe_idx), &wqe_ptr);
+    }
+    __syncwarp();
+
+    if (lane_id == 0)
+        ibgda_submit_requests(qp, base_wqe_idx, num_wqes);
+    __syncwarp();
+    return base_wqe_idx + num_wqes;
+}
+
 // Batch one row request per active lane onto a shared (dst_pe, qp_id).  Each
 // lane constructs all registration-boundary fragments for its row, while lane
 // 0 reserves the combined WQE range and rings one doorbell for the full batch.
-__device__ static __forceinline__ void put_nbi_warp_batch_rows(
+__device__ static __forceinline__ uint64_t put_nbi_warp_batch_rows(
     uint64_t req_rptr, uint64_t req_lptr, size_t bytes, bool active,
     int dst_pe, int qp_id, int lane_id) {
     auto qp = ibgda_get_rc(dst_pe, qp_id);
@@ -597,6 +670,11 @@ __device__ static __forceinline__ void put_nbi_warp_batch_rows(
     if (lane_id == 0 and total_wqes != 0)
         ibgda_submit_requests(qp, base_wqe_idx, total_wqes);
     __syncwarp();
+    // Zero is an unambiguous "no doorbell" sentinel: every non-empty
+    // reservation completes at the producer-head index base + count >= 1.
+    // Callers that want one in-flight submit per QP can wait for this exact
+    // batch without snapshotting (and potentially over-waiting) the QP head.
+    return total_wqes == 0 ? 0 : base_wqe_idx + total_wqes;
 }
 
 // 单线程 RDMA READ(非阻塞发起)：laddr 本地目的(须在对称堆内)，raddr 本地对称地址
@@ -784,11 +862,42 @@ __device__ static __forceinline__ void ibgda_poll_cq(nvshmemi_ibgda_device_cq_t*
     memory_fence_cta();
     if (ld_na_relaxed(reinterpret_cast<uint64_t*>(cq->cons_idx)) >= idx)
         return;
+
+    // Match NVSHMEM's IBGDA poll protocol.  A reserved target can be much
+    // newer than the software consumer while earlier WQE builders are still
+    // filling a gap.  Interpreting the modulo-16-bit CQE before this target
+    // has actually been posted is ambiguous across wraparound and can
+    // over-advance cons_idx, prematurely recycling live WQE slots.
+    while (ld_na_relaxed(reinterpret_cast<uint64_t*>(cq->prod_idx)) < idx) {
+        if (ld_na_relaxed(reinterpret_cast<uint64_t*>(cq->cons_idx)) >= idx) {
+            memory_fence_cta();
+            return;
+        }
+    }
+    memory_fence_cta();
+
     uint16_t wqe_counter;
     do {
         wqe_counter = HtoBE16(ld_na_relaxed(&cqe64->wqe_counter));
+        // Another waiter on the shared CQ may have consumed a later CQE
+        // while this warp was polling.  In that case our completion is
+        // already covered even if the CQE slot has since wrapped to a value
+        // that is ambiguous relative to `idx`.
+        if (ld_na_relaxed(reinterpret_cast<uint64_t*>(cq->cons_idx)) >= idx) {
+            memory_fence_cta();
+            return;
+        }
     } while ((static_cast<uint16_t>(static_cast<uint16_t>(idx) - wqe_counter - static_cast<uint16_t>(2)) < ncqes));
-    atomicMax(reinterpret_cast<unsigned long long*>(cq->cons_idx), static_cast<unsigned long long>(idx));
+
+    // Publish only the exact target this waiter proved complete.  Dispatch
+    // has multiple warps sharing QP(source, expert), so reconstructing a
+    // later 64-bit head from the modulo-16-bit CQE is not safe even though
+    // idx itself is now known to have been posted.  Scatter uses a distinct
+    // phase-local QP range and polls every data doorbell, so exact-target
+    // publication also keeps its software consumer current.
+    atomicMax(
+        reinterpret_cast<unsigned long long*>(cq->cons_idx),
+        static_cast<unsigned long long>(idx));
     memory_fence_cta();
 }
 

@@ -89,18 +89,12 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
                     ibgda::quiet(static_cast<int>(pe), static_cast<int>(i % n_qps));
             }
         }
-#ifndef DG_MEGA_MOE_NO_TAG3
         // The explicit per-(pe, qp) ibgda::quiet loop above already drains
         // every verbs-path QP; this global quiet only backstops the non-verbs
         // paths, and measured ~450 us/launch (63% of the b1 kernel).
         nvshmem_quiet();
-        // With epoch-tagged control-plane slots (and no clearing) the cleanup
-        // is purely rank-local, so this cross-rank rendezvous is unnecessary.
-        // Kernels are stream-ordered, which already separates a rank's own
-        // launches; the per-QP quiet above still protects the staging buffer.
         if (thread_idx == 0)
             nvshmem_sync_all();
-#endif
         sync_scope();
 #else
         auto* counter_ptr = workspace.get_nvl_barrier_counter_ptr();

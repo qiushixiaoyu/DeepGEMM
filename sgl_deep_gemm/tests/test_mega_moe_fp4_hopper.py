@@ -1211,19 +1211,25 @@ def _run_scenario(
                f'(tol={scenario_diff_tol:.2f}) {"OK" if ok else "FAIL"}',
                once_in_node=True)
     if not ok:
+        # Plain prints only: dist_print carries a collective barrier, and this
+        # branch is per-rank conditional -- calling it here desynchronizes the
+        # barrier sequence across ranks and deadlocks the run.
         for label, tensor in (('fused', y_fused), ('ref', y_ref)):
             tensor_f = tensor.float()
-            dist_print(
-                f'    {label}: abs_max={tensor_f.abs().max().item():.6g} '
+            print(
+                f'    [r{rank_idx}] {label}: abs_max={tensor_f.abs().max().item():.6g} '
                 f'mean={tensor_f.mean().item():.6g} '
                 f'nonzero={(tensor_f != 0).sum().item()}/{tensor_f.numel()} '
                 f'finite={torch.isfinite(tensor_f).all().item()}',
-                once_in_node=True,
+                flush=True,
             )
-    assert ok, f'{name}: diff={max_diff} >= tol={scenario_diff_tol}'
-
     buffer.destroy()
     dist.barrier()
+    # Raise only after every rank has passed the same barrier count, so a
+    # per-rank failure surfaces as FAIL instead of a cross-rank deadlock (the
+    # caller's except path must also stay collective-free before the next
+    # scenario's rendezvous).
+    assert ok, f'{name}: diff={max_diff} >= tol={scenario_diff_tol}'
 
 
 # ----------------------------------------------------------------------------
@@ -1460,7 +1466,6 @@ def _run_benchmark(local_rank: int, num_local_ranks: int, args: argparse.Namespa
     x_fp8, x_sf = per_token_cast_to_fp8(
         x_bf16, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False
     )
-
     l1_fp4 = None
     l2_fp4 = None
     transformed_l1 = None
@@ -2099,8 +2104,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             _run_scenario(name, cfg, rank_idx, num_ranks, group, diff_tol)
         except AssertionError as ex:
             import traceback
-            dist_print(f'  [{name}] FAIL: {ex}\n{traceback.format_exc()}',
-                       once_in_node=True)
+            # Plain print: only failing ranks reach here, so a dist_print
+            # (which embeds a collective barrier) would desynchronize ranks.
+            print(f'  [r{rank_idx}] [{name}] FAIL: {ex}\n{traceback.format_exc()}',
+                  flush=True)
             failures.append(name)
             if args.fail_fast:
                 break

@@ -289,12 +289,20 @@ class SM90SymmBuffer:
                  num_max_tokens_per_rank: int, num_topk: int,
                  hidden: int, intermediate_hidden: int,
                  use_fp8_dispatch: bool = True,
-                 activation: str = 'swiglu'):
+                 activation: str = 'swiglu',
+                 requested_num_max_tokens_per_rank: Optional[int] = None):
         import torch.distributed._symmetric_memory as symm_mem
 
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
+        if requested_num_max_tokens_per_rank is None:
+            requested_num_max_tokens_per_rank = num_max_tokens_per_rank
+        assert 0 < requested_num_max_tokens_per_rank <= num_max_tokens_per_rank
+        # Keep the user-visible capacity in addition to the 384-token-aligned
+        # storage capacity.  The SM90 metadata gateway uses the former to
+        # choose dense (<= 256) versus packed wire format exactly.
+        self.requested_num_max_tokens_per_rank = requested_num_max_tokens_per_rank
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
@@ -338,12 +346,15 @@ def get_symm_buffer_for_sm90_mega_moe(group,
                                       activation: str = 'swiglu') -> SM90SymmBuffer:
     from .utils.math import align
 
-    num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+    requested_num_max_tokens_per_rank = num_max_tokens_per_rank
+    num_max_tokens_per_rank = align(
+        num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
     return SM90SymmBuffer(
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        use_fp8_dispatch, activation
+        use_fp8_dispatch, activation,
+        requested_num_max_tokens_per_rank=requested_num_max_tokens_per_rank
     )
 
 
@@ -459,6 +470,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.requested_num_max_tokens_per_rank,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
         activation, activation_clamp,
@@ -485,45 +497,7 @@ def fp8_mega_moe(y: torch.Tensor,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,
-        sym_buffer.num_experts, sym_buffer.num_topk,
-        recipe,
-        activation, activation_clamp,
-        fast_math
-    )
-
-
-def fp8_mega_moe_with_shared(
-        y: torch.Tensor,
-        l1_weights: Tuple[torch.Tensor, torch.Tensor],
-        l2_weights: Tuple[torch.Tensor, torch.Tensor],
-        shared_l1_weights: Tuple[torch.Tensor, torch.Tensor],
-        shared_l2_weights: Tuple[torch.Tensor, torch.Tensor],
-        sym_buffer: SM90SymmBuffer,
-        cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
-        recipe: Tuple[int, int, int] = (128, 128, 128),
-        activation: str = 'swiglu',
-        activation_clamp: Optional[float] = None,
-        fast_math: bool = True):
-    """Run routed and one always-local shared expert in one MegaMoE kernel.
-
-    Shared weights use the same transformed SM90 FP8 layout as routed weights,
-    with a leading expert dimension of one.  The fused path is decode-only and
-    requires the current token count to fit in the selected ``block_m``.
-    """
-    (l1_weights_data, l1_weights_sf) = l1_weights
-    (l2_weights_data, l2_weights_sf) = l2_weights
-    (shared_l1_weights_data, shared_l1_weights_sf) = shared_l1_weights
-    (shared_l2_weights_data, shared_l2_weights_sf) = shared_l2_weights
-    _C.fp8_mega_moe_with_shared(
-        y,
-        l1_weights_data, l1_weights_sf,
-        l2_weights_data, l2_weights_sf,
-        shared_l1_weights_data, shared_l1_weights_sf,
-        shared_l2_weights_data, shared_l2_weights_sf,
-        cumulative_local_expert_recv_stats,
-        sym_buffer.buffer,
-        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
-        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.requested_num_max_tokens_per_rank,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
         activation, activation_clamp,

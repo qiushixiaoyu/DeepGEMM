@@ -18,11 +18,6 @@ path, with the compute path changed to SM90 FP8:
   FP8 grouped GEMM -> masked SwiGLU + FP8 quant -> masked FP8 grouped GEMM ->
   ``Buffer.low_latency_combine`` (which applies topk weights internally). This
   is the canonical decode path used in production EP serving.
-* fused shared vs normal (optional, ``--fused-shared-normal-ab``): compares a
-  MegaMoE kernel that also computes one local shared expert against the normal
-  DeepEP routed pipeline plus the same standalone shared MLP. The normal path
-  overlaps the shared MLP on a second CUDA stream and includes the final wait
-  and BF16 add in its end-to-end timing.
 * fused-only sweep (optional, ``--fused-only-sweep``): replaces the old
   standalone SM90 benchmark harness. It sweeps token counts, measures
   only the fused SM90 kernel, and keeps the ``--ncu-profile-only`` /
@@ -402,7 +397,6 @@ def _run_accuracy_scenario(
     masked_ratio = cfg.get("masked_ratio", 0.0)
     activation_clamp = cfg.get("activation_clamp", 10.0)
     fast_math = cfg.get("fast_math", True)
-    fuse_shared = cfg.get("fuse_shared", False)
     num_repeats = cfg.get("num_repeats", 1)
 
     assert num_experts % num_ranks == 0, (
@@ -433,17 +427,6 @@ def _run_accuracy_scenario(
         dtype=torch.bfloat16,
         device="cuda",
     ) * 0.05
-    if fuse_shared:
-        shared_l1_weights_bf16 = torch.randn(
-            (1, intermediate_hidden * 2, hidden),
-            dtype=torch.bfloat16,
-            device="cuda",
-        ) * 0.05
-        shared_l2_weights_bf16 = torch.randn(
-            (1, hidden, intermediate_hidden),
-            dtype=torch.bfloat16,
-            device="cuda",
-        ) * 0.05
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device="cuda")
     topk_weights, topk_idx = torch.topk(
         scores, num_topk, dim=-1, largest=True, sorted=False
@@ -458,54 +441,10 @@ def _run_accuracy_scenario(
     )
     l1_weights = _quantize_grouped_fp8_block_128_128(l1_weights_bf16)
     l2_weights = _quantize_grouped_fp8_block_128_128(l2_weights_bf16)
-    if fuse_shared:
-        shared_l1_weights = _quantize_grouped_fp8_block_128_128(
-            shared_l1_weights_bf16
-        )
-        shared_l2_weights = _quantize_grouped_fp8_block_128_128(
-            shared_l2_weights_bf16
-        )
-
     trace("weight_transform")
     transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe_sm90(
         l1_weights, l2_weights
     )
-
-    fuse_shared_normal_ab = bool(args.fused_shared_normal_ab)
-    if fuse_shared_normal_ab:
-        if not hasattr(deep_gemm, "fp8_mega_moe_with_shared"):
-            raise RuntimeError(
-                "--fused-shared-normal-ab requires fp8_mega_moe_with_shared"
-            )
-        # One replicated TP1 shared expert, matching the current SGLang fusion
-        # envelope. The fused and normal paths consume the same quantized data.
-        shared_l1_weights_bf16 = torch.randn(
-            (1, intermediate_hidden * 2, hidden),
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        shared_l2_weights_bf16 = torch.randn(
-            (1, hidden, intermediate_hidden),
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        shared_l1_weights = _quantize_grouped_fp8_block_128_128(
-            shared_l1_weights_bf16
-        )
-        shared_l2_weights = _quantize_grouped_fp8_block_128_128(
-            shared_l2_weights_bf16
-        )
-        transformed_shared_l1, transformed_shared_l2 = (
-            deep_gemm.transform_weights_for_mega_moe_sm90(
-                shared_l1_weights, shared_l2_weights
-            )
-        )
-    if fuse_shared:
-        transformed_shared_l1, transformed_shared_l2 = (
-            deep_gemm.transform_weights_for_mega_moe_sm90(
-                shared_l1_weights, shared_l2_weights
-            )
-        )
 
     trace("alloc_symm_buffer")
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
@@ -526,25 +465,13 @@ def _run_accuracy_scenario(
 
     y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
     trace(f"launch_fused_x{num_repeats}")
-    mega_moe_fn = (
-        deep_gemm.fp8_mega_moe_with_shared
-        if fuse_shared
-        else deep_gemm.fp8_mega_moe
-    )
-    shared_args = (
-        (transformed_shared_l1, transformed_shared_l2)
-        if fuse_shared
-        else ()
-    )
     for _ in range(num_repeats):
         # Deliberately reuse the same symmetric buffer without zeroing or
-        # reallocating it.  The fused shared phase borrows the tail pool block,
-        # so repeated calls catch stale staging/arrival state immediately.
-        mega_moe_fn(
+        # reallocating it, catching stale staging/arrival state immediately.
+        deep_gemm.fp8_mega_moe(
             y_fused,
             transformed_l1,
             transformed_l2,
-            *shared_args,
             buffer,
             cumulative_local_expert_recv_stats=cum_stats,
             recipe=(128, 128, 128),
@@ -575,34 +502,50 @@ def _run_accuracy_scenario(
         intermediate_hidden,
         activation_clamp,
     )
-    if fuse_shared:
-        x_local = _dequant_per_token_per_128_k(x_fp8[0], x_fp8[1])
-        shared_l1_w = _dequant_block_128_128(
-            shared_l1_weights[0][0], shared_l1_weights[1][0]
-        )
-        shared_hidden = torch.matmul(x_local, shared_l1_w.transpose(0, 1))
-        shared_hidden = _swiglu_fp32(shared_hidden, activation_clamp)
-        shared_view = shared_hidden.view(
-            num_tokens, intermediate_hidden // FUSED_L2_ACT_SF_GRAN,
-            FUSED_L2_ACT_SF_GRAN,
-        )
-        shared_sf = (
-            shared_view.abs().amax(dim=-1).clamp(1e-4) / FP8_E4M3_MAX
-        )
-        shared_q = (
-            shared_view / shared_sf.unsqueeze(-1)
-        ).to(torch.float8_e4m3fn).float()
-        shared_l2_input = (
-            shared_q * shared_sf.unsqueeze(-1)
-        ).view(num_tokens, intermediate_hidden)
-        shared_l2_w = _dequant_block_128_128(
-            shared_l2_weights[0][0], shared_l2_weights[1][0]
-        )
-        shared_y = torch.matmul(
-            shared_l2_input, shared_l2_w.transpose(0, 1)
-        ).to(torch.bfloat16)
-        y_ref = (y_ref.float() + shared_y.float()).to(torch.bfloat16)
-
+    if int(os.environ.get("DG_FP8_DUMP_BAD", "0")):
+        with torch.no_grad():
+            nvl = 8
+            tok_err = (y_fused.float() - y_ref.float()).abs().amax(dim=1)
+            ref_scale = y_ref.float().abs().amax(dim=1).clamp_min(1e-6)
+            rel = tok_err / ref_scale
+            bad = rel > 0.1
+            nbad = int(bad.sum())
+            epr = max(1, num_experts // num_ranks)
+            my_node = rank_idx // nvl
+            num_nodes = max(1, num_ranks // nvl)
+            if nbad:
+                bad_idx = bad.nonzero(as_tuple=True)[0]
+                expert_nodes = (topk_idx[bad_idx].long() // epr) // nvl
+                hist = [int((expert_nodes == n).sum()) for n in range(num_nodes)]
+                good_idx = (~bad).nonzero(as_tuple=True)[0]
+                ghist = (
+                    [int(((topk_idx[good_idx].long() // epr) // nvl == n).sum()) for n in range(num_nodes)]
+                    if len(good_idx) else [0] * num_nodes
+                )
+                allz = int((y_fused[bad_idx].abs().amax(dim=1) == 0).sum())
+                print(
+                    f"[BAD r{rank_idx} n{my_node}] {name}: bad={nbad}/{y_fused.shape[0]}"
+                    f" allzero={allz} bad_expert_node_hist={hist} good_hist={ghist}"
+                    f" recv_stats={cum_stats.tolist()}",
+                    flush=True,
+                )
+                # 判别：坏行是"错位"(等于别的 token 的参考行)还是"损坏/部分和"
+                nz_bad = [int(t) for t in bad_idx if float(y_fused[t].abs().amax()) > 0][:4]
+                yr = y_ref.float()
+                for t in nz_bad:
+                    yf_t = y_fused[t].float()
+                    d = (yr - yf_t.unsqueeze(0)).abs().amax(dim=1)
+                    t2 = int(d.argmin())
+                    # 部分和检测：yf ≈ ref 的某个子集? 打印比值特征
+                    ratio = float((yf_t.abs().sum() / yr[t].abs().sum().clamp_min(1e-6)))
+                    print(
+                        f"[ROW r{rank_idx}] t={t} best_match_ref_row={t2}"
+                        f" match_err={float(d[t2]):.4f} self_err={float(d[t]):.4f}"
+                        f" l1_ratio_vs_self_ref={ratio:.3f}",
+                        flush=True,
+                    )
+            else:
+                print(f"[BAD r{rank_idx} n{my_node}] {name}: clean", flush=True)
     diff = calc_diff(y_fused, y_ref)
     ok = diff < diff_tol
     dist_print(
@@ -632,46 +575,7 @@ def _accuracy_layer1_smoke(
     num_ranks: int,
 ) -> List[Tuple[str, Dict[str, Any]]]:
     base = dict(_ACCURACY_SMOKE, num_experts=8 * num_ranks)
-    return [
-        ("L1.smoke", dict(base)),
-        ("L1.shared_fusion", dict(base, fuse_shared=True)),
-        (
-            "L1.shared_fusion_reuse_x20",
-            dict(base, num_tokens=32, fuse_shared=True, num_repeats=20),
-        ),
-    ]
-
-
-def _accuracy_layer6_shared_production_shapes(
-    num_ranks: int,
-) -> List[Tuple[str, Dict[str, Any]]]:
-    """Compile and check the three production H/I/E/top-k combinations.
-
-    Keep this layer at one token per rank: the exact PyTorch reference gathers
-    routed weights from every rank and is intentionally correctness-oriented,
-    not a production-shape performance implementation.
-    """
-    shapes = [
-        ("flash", 4096, 2048, 256, 6),
-        ("pro", 7168, 3072, 384, 6),
-        ("glm", 6144, 2048, 256, 8),
-    ]
-    return [
-        (
-            f"L6.shared_{label}.t1",
-            dict(
-                num_max_tokens_per_rank=64,
-                num_tokens=1,
-                hidden=hidden,
-                intermediate_hidden=intermediate_hidden,
-                num_experts=num_experts,
-                num_topk=num_topk,
-                fuse_shared=True,
-            ),
-        )
-        for label, hidden, intermediate_hidden, num_experts, num_topk in shapes
-        if num_experts % num_ranks == 0
-    ]
+    return [("L1.smoke", dict(base))]
 
 
 def _accuracy_layer2_heuristic_branches(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
@@ -783,10 +687,22 @@ def _run_accuracy_tests(local_rank: int, num_local_ranks: int, args: argparse.Na
         layers += _accuracy_layer4_edges(num_ranks)
     if 5 in args.layers:
         layers += _accuracy_layer5_stress(num_ranks, args.num_correctness_tests or 8)
-    if 6 in args.layers:
-        layers += _accuracy_layer6_shared_production_shapes(num_ranks)
     if args.filter:
         layers = [(name, cfg) for name, cfg in layers if args.filter in name]
+    if args.accuracy_num_max_tokens_per_rank:
+        overridden_layers = []
+        for name, cfg in layers:
+            cfg = dict(cfg)
+            actual_tokens = cfg.get("num_tokens", cfg["num_max_tokens_per_rank"])
+            assert args.accuracy_num_max_tokens_per_rank >= actual_tokens
+            cfg["num_max_tokens_per_rank"] = args.accuracy_num_max_tokens_per_rank
+            overridden_layers.append(
+                (
+                    f"{name}.max{args.accuracy_num_max_tokens_per_rank}",
+                    cfg,
+                )
+            )
+        layers = overridden_layers
 
     dist_print(
         f"SM90 MegaMoE accuracy plan: {len(layers)} scenarios across "
@@ -938,7 +854,13 @@ def _make_deep_ep_low_latency_buffer(
     num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(
         num_max_dispatch_tokens_per_rank, hidden, group.size(), num_experts
     )
-    return deep_ep.Buffer(
+    # DeepEP writes its exact per-expert QP count back to the process
+    # environment while constructing the buffer.  In the shared MegaMoE
+    # benchmark process NVSHMEM has already been initialized with a larger QP
+    # pool (expert QPs plus the metadata gateway QP), so keep that configured
+    # pool visible to the subsequent MegaMoE host-side validation.
+    saved_num_rc_per_pe = os.environ.get("NVSHMEM_IBGDA_NUM_RC_PER_PE")
+    buffer = deep_ep.Buffer(
         group,
         num_nvl_bytes=0,
         num_rdma_bytes=num_rdma_bytes,
@@ -947,6 +869,9 @@ def _make_deep_ep_low_latency_buffer(
         allow_nvlink_for_low_latency_mode=True,
         explicitly_destroy=True,
     )
+    if saved_num_rc_per_pe is not None:
+        os.environ["NVSHMEM_IBGDA_NUM_RC_PER_PE"] = saved_num_rc_per_pe
+    return buffer
 
 
 # ----------------------------------------------------------------------------
@@ -1181,29 +1106,6 @@ def _run_fused_only_config(
     transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe_sm90(
         l1_weights, l2_weights
     )
-    if args.fused_shared_ab:
-        shared_l1_weights = _quantize_grouped_fp8_block_128_128(
-            torch.randn(
-                (1, intermediate_hidden * 2, hidden),
-                dtype=torch.bfloat16,
-                device="cuda",
-            )
-            * 0.05
-        )
-        shared_l2_weights = _quantize_grouped_fp8_block_128_128(
-            torch.randn(
-                (1, hidden, intermediate_hidden),
-                dtype=torch.bfloat16,
-                device="cuda",
-            )
-            * 0.05
-        )
-        transformed_shared_l1, transformed_shared_l2 = (
-            deep_gemm.transform_weights_for_mega_moe_sm90(
-                shared_l1_weights, shared_l2_weights
-            )
-        )
-
     cum_stats = torch.zeros((num_experts_per_rank,), dtype=torch.int, device="cuda")
     y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
     clamp_arg = args.activation_clamp if math.isfinite(args.activation_clamp) else None
@@ -1226,26 +1128,6 @@ def _run_fused_only_config(
         )
         return y_fused
 
-    def run_fused_shared():
-        buffer.x[:num_tokens].copy_(x_fp8[0])
-        buffer.x_sf[:num_tokens].copy_(x_fp8[1])
-        buffer.topk_idx[:num_tokens].copy_(topk_idx)
-        buffer.topk_weights[:num_tokens].copy_(topk_weights)
-        deep_gemm.fp8_mega_moe_with_shared(
-            y_fused,
-            transformed_l1,
-            transformed_l2,
-            transformed_shared_l1,
-            transformed_shared_l2,
-            buffer,
-            cumulative_local_expert_recv_stats=cum_stats,
-            recipe=(128, 128, 128),
-            activation="swiglu",
-            activation_clamp=clamp_arg,
-            fast_math=bool(args.fast_math),
-        )
-        return y_fused
-
     if args.ncu_profile_only:
         dist_print(
             f"[NCU] tokens={num_tokens} hidden={hidden} ih={intermediate_hidden}",
@@ -1258,8 +1140,6 @@ def _run_fused_only_config(
         return
 
     run_fused()
-    if args.fused_shared_ab:
-        run_fused_shared()
     dist.barrier()
     t_fused = bench_kineto(
         run_fused,
@@ -1268,27 +1148,6 @@ def _run_fused_only_config(
         num_tests=args.num_bench_tests,
         suppress_kineto_output=True,
     )
-    t_fused_shared = (
-        bench_kineto(
-            run_fused_shared,
-            SM90_KERNEL_NAME,
-            barrier=lambda: dist.barrier(),
-            num_tests=args.num_bench_tests,
-            suppress_kineto_output=True,
-        )
-        if args.fused_shared_ab
-        else None
-    )
-    if t_fused_shared is not None:
-        # Distributed latency is determined by the slowest rank.  Reduce both
-        # variants independently so the A/B line reports the true 16-rank
-        # critical path rather than only each node's local rank zero.
-        global_times = torch.tensor(
-            [t_fused, t_fused_shared], dtype=torch.float64, device="cuda"
-        )
-        dist.all_reduce(global_times, op=dist.ReduceOp.MAX, group=group)
-        t_fused_global, t_fused_shared_global = global_times.tolist()
-
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
     gathered_topk_idx[
         (gathered_topk_idx < rank_idx * num_experts_per_rank)
@@ -1321,16 +1180,6 @@ def _run_fused_only_config(
         f"{tflops:6.1f} TFLOPS  {hbm_gbs:6.0f} GB/s  (rank{rank_idx})",
         once_in_node=True,
     )
-    if t_fused_shared is not None:
-        dist_print(
-            f" shared_ab_global tokens={num_tokens:4d}  "
-            f"routed={t_fused_global * 1e6:7.1f} us  "
-            f"fused_shared={t_fused_shared_global * 1e6:7.1f} us  "
-            f"delta={(t_fused_shared_global - t_fused_global) * 1e6:+7.1f} us  "
-            f"ratio={t_fused_shared_global / t_fused_global:5.3f}x",
-            once_in_node=True,
-        )
-
     dist.barrier()
     buffer.destroy()
 
@@ -1538,32 +1387,17 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         sym_buffer.topk_idx[:num_tokens].copy_(topk_idx)
         sym_buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
-        if fuse_shared_normal_ab:
-            deep_gemm.fp8_mega_moe_with_shared(
-                y_fused,
-                transformed_l1,
-                transformed_l2,
-                transformed_shared_l1,
-                transformed_shared_l2,
-                sym_buffer,
-                cumulative_local_expert_recv_stats=cum_stats_fused,
-                recipe=(128, 128, 128),
-                activation="swiglu",
-                activation_clamp=clamp_arg,
-                fast_math=bool(args.fast_math),
-            )
-        else:
-            deep_gemm.fp8_mega_moe(
-                y_fused,
-                transformed_l1,
-                transformed_l2,
-                sym_buffer,
-                cumulative_local_expert_recv_stats=cum_stats_fused,
-                recipe=(128, 128, 128),
-                activation="swiglu",
-                activation_clamp=clamp_arg,
-                fast_math=bool(args.fast_math),
-            )
+        deep_gemm.fp8_mega_moe(
+            y_fused,
+            transformed_l1,
+            transformed_l2,
+            sym_buffer,
+            cumulative_local_expert_recv_stats=cum_stats_fused,
+            recipe=(128, 128, 128),
+            activation="swiglu",
+            activation_clamp=clamp_arg,
+            fast_math=bool(args.fast_math),
+        )
         return y_fused
 
     # ---- Print config ----
@@ -1684,65 +1518,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         # DeepEP combine: gather each token's topk expert outputs back to source rank.
         return ep_buffer.combine(l2_y, handle=handle)[0]
 
-    # Standalone TP1 FP8 shared expert for the fair normal-mode comparison.
-    # It mirrors the two ordinary FP8 linears and fused SwiGLU/quantize used by
-    # SGLang's shared MLP, rather than treating the shared expert as routed.
-    if fuse_shared_normal_ab:
-        shared_l1_weights_single = (
-            shared_l1_weights[0][0],
-            shared_l1_weights[1][0],
-        )
-        shared_l2_weights_single = (
-            shared_l2_weights[0][0],
-            shared_l2_weights[1][0],
-        )
-        shared_l1_y = torch.empty(
-            (num_tokens, intermediate_hidden * 2),
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        shared_y = torch.empty(
-            (num_tokens, hidden), dtype=torch.bfloat16, device="cuda"
-        )
-        shared_stream = torch.cuda.Stream()
-
-    def run_shared_expert_standalone():
-        deep_gemm.fp8_gemm_nt(
-            x_fp8,
-            shared_l1_weights_single,
-            shared_l1_y,
-            recipe=(1, 128, 128),
-            disable_ue8m0_cast=True,
-        )
-        shared_l1_fp8 = swiglu_apply_weight_to_fp8_triton(
-            x=shared_l1_y,
-            topk_weights=None,
-            clamp_value=clamp_arg,
-            num_per_channels=BASELINE_L2_ACT_SF_GRAN,
-            use_ue8m0_scale=True,
-        )
-        deep_gemm.fp8_gemm_nt(
-            shared_l1_fp8,
-            shared_l2_weights_single,
-            shared_y,
-            recipe=(1, 128, 128),
-            disable_ue8m0_cast=True,
-        )
-        return shared_y
-
-    def run_baseline_with_shared():
-        # Keep DeepEP normal on the caller stream. The replicated shared MLP
-        # runs concurrently, then the caller waits and performs the one final
-        # BF16 add before the end timing event.
-        current_stream = torch.cuda.current_stream()
-        shared_stream.wait_stream(current_stream)
-        with torch.cuda.stream(shared_stream):
-            shared_output = run_shared_expert_standalone()
-        routed_output = run_baseline()
-        current_stream.wait_stream(shared_stream)
-        routed_output.add_(shared_output)
-        return routed_output
-
     # ----------------------------------------------------------------
     # Low-latency baseline body. Mirrors the sglang
     # ``_DeepEPDispatcherImplLowLatency`` pipeline:
@@ -1845,25 +1620,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         )
         return combined_x
 
-    def run_baseline_low_latency_with_shared():
-        current_stream = torch.cuda.current_stream()
-        shared_stream.wait_stream(current_stream)
-        with torch.cuda.stream(shared_stream):
-            shared_output = run_shared_expert_standalone()
-        routed_output = run_baseline_low_latency()
-        current_stream.wait_stream(shared_stream)
-        routed_output.add_(shared_output)
-        return routed_output
-
     # ---- Run once to check fused and optional baseline paths ----
     y = run_fused()
     assert y.shape == (num_tokens, hidden) and y.dtype == torch.bfloat16, (
         f"unexpected fused output shape/dtype: shape={y.shape}, dtype={y.dtype}"
     )
     if ep_buffer is not None:
-        out_b = (
-            run_baseline_with_shared() if fuse_shared_normal_ab else run_baseline()
-        )
+        out_b = run_baseline()
         assert out_b.shape == (num_tokens, hidden) and out_b.dtype == torch.bfloat16, (
             f"unexpected baseline output shape/dtype: shape={out_b.shape}, dtype={out_b.dtype}"
         )
@@ -1879,22 +1642,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 f"mean_abs/mean_ref={diff.mean().div(denom).item():.6e}",
                 once_in_node=True,
             )
-            if fuse_shared_normal_ab:
-                normalized_diff = calc_diff(y, out_b)
-                dist_print(
-                    f" > calc_diff={normalized_diff:.6f}", once_in_node=True
-                )
-                assert normalized_diff < args.diff_tol, (
-                    f"fused shared vs normal+shared diff={normalized_diff:.6f} "
-                    f"exceeds tolerance {args.diff_tol}"
-                )
             dist_print(once_in_node=True)
     if ll_buffer is not None:
-        out_ll = (
-            run_baseline_low_latency_with_shared()
-            if fuse_shared_normal_ab
-            else run_baseline_low_latency()
-        )
+        out_ll = run_baseline_low_latency()
         assert out_ll.shape == (num_tokens, hidden) and out_ll.dtype == torch.bfloat16, (
             f"unexpected LL baseline output shape/dtype: shape={out_ll.shape}, dtype={out_ll.dtype}"
         )
@@ -1910,15 +1660,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 f"mean_abs/mean_ref={diff.mean().div(denom).item():.6e}",
                 once_in_node=True,
             )
-            if fuse_shared_normal_ab:
-                normalized_diff = calc_diff(y, out_ll)
-                dist_print(
-                    f" > calc_diff={normalized_diff:.6f}", once_in_node=True
-                )
-                assert normalized_diff < args.diff_tol, (
-                    f"fused shared vs low-latency+shared "
-                    f"diff={normalized_diff:.6f} exceeds tolerance {args.diff_tol}"
-                )
             dist_print(once_in_node=True)
 
     # ---- Count tokens routed to this rank and touched local experts ----
@@ -1951,7 +1692,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # Baseline: use CUDA event median timing for consistency across SM90 setups.
     t_baseline = (
         _bench_cuda_events(
-            run_baseline_with_shared if fuse_shared_normal_ab else run_baseline,
+            run_baseline,
             num_warmup=args.num_warmup,
             num_repeat=args.num_repeat,
             l2_flush_gb=args.l2_flush_gb,
@@ -1962,11 +1703,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # Low-latency baseline timing (same CUDA-event median methodology).
     t_baseline_ll = (
         _bench_cuda_events(
-            (
-                run_baseline_low_latency_with_shared
-                if fuse_shared_normal_ab
-                else run_baseline_low_latency
-            ),
+            run_baseline_low_latency,
             num_warmup=args.num_warmup,
             num_repeat=args.num_repeat,
             l2_flush_gb=args.l2_flush_gb,
@@ -1974,19 +1711,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         if ll_buffer is not None
         else 0.0
     )
-
-    if fuse_shared_normal_ab:
-        global_times = torch.tensor(
-            [t_fused, t_baseline, t_baseline_ll],
-            dtype=torch.float64,
-            device="cuda",
-        )
-        dist.all_reduce(global_times, op=dist.ReduceOp.MAX)
-        (
-            t_fused_shared_global,
-            t_normal_shared_global,
-            t_ll_shared_global,
-        ) = global_times.tolist()
 
     def safe_div(a, b):
         return float("nan") if b == 0 else a / b
@@ -2102,7 +1826,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         speedup = safe_div(t_baseline, t_fused)
         dist_print(
             fmt_perf_line(
-                "[base+sh]" if fuse_shared_normal_ab else "[baseline]",
+                "[baseline]",
                 t_baseline,
                 tflops_baseline,
                 hbm_gbs_baseline,
@@ -2121,7 +1845,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         speedup_ll = safe_div(t_baseline_ll, t_fused)
         dist_print(
             fmt_perf_line(
-                "[ll+sh]" if fuse_shared_normal_ab else "[ll_base]",
+                "[ll_base]",
                 t_baseline_ll,
                 tflops_baseline_ll,
                 hbm_gbs_baseline_ll,
@@ -2131,25 +1855,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         )
     elif run_ll_baseline_enabled:
         dist_print(" > [ll_base] (deep_ep unavailable)", once_in_node=True)
-
-    if fuse_shared_normal_ab and ep_buffer is not None:
-        dist_print(
-            " shared_normal_global "
-            f"tokens={num_tokens:4d}  "
-            f"mega_fused_shared={t_fused_shared_global * 1e6:8.1f} us  "
-            f"normal_shared={t_normal_shared_global * 1e6:8.1f} us  "
-            f"normal_speedup={safe_div(t_normal_shared_global, t_fused_shared_global):6.3f}x",
-            once_in_node=True,
-        )
-    if fuse_shared_normal_ab and ll_buffer is not None:
-        dist_print(
-            " shared_ll_global "
-            f"tokens={num_tokens:4d}  "
-            f"mega_fused_shared={t_fused_shared_global * 1e6:8.1f} us  "
-            f"ll_shared={t_ll_shared_global * 1e6:8.1f} us  "
-            f"ll_speedup={safe_div(t_ll_shared_global, t_fused_shared_global):6.3f}x",
-            once_in_node=True,
-        )
 
     # ---- Cleanup ----
     dist.barrier()
@@ -2182,11 +1887,6 @@ if __name__ == "__main__":
         help="Run the fused-only token sweep benchmark mode",
     )
     parser.add_argument(
-        "--fused-shared-ab",
-        action="store_true",
-        help="In fused-only sweep mode, compare routed-only and shared-fused kernels",
-    )
-    parser.add_argument(
         "--accuracy",
         action="store_true",
         help="Run the layered SM90 accuracy suite instead of benchmark modes",
@@ -2204,6 +1904,15 @@ if __name__ == "__main__":
     # Model shape.
     # SM90 fused kernel requires intermediate_hidden <= 4096.
     parser.add_argument("--num-max-tokens-per-rank", type=int, default=8192)
+    parser.add_argument(
+        "--accuracy-num-max-tokens-per-rank",
+        type=int,
+        default=0,
+        help=(
+            "Override only the allocation limit for --accuracy while keeping "
+            "each scenario's actual token count unchanged"
+        ),
+    )
     parser.add_argument(
         "--num-tokens",
         type=int,
@@ -2276,16 +1985,6 @@ if __name__ == "__main__":
         "--run-baseline",
         action="store_true",
         help="Enable the DeepEP+grouped-FP8 baseline; disabled by default",
-    )
-    parser.add_argument(
-        "--fused-shared-baseline-ab",
-        "--fused-shared-normal-ab",
-        dest="fused_shared_normal_ab",
-        action="store_true",
-        help=(
-            "Compare fused MegaMoE+one shared expert against DeepEP baselines "
-            "plus the same standalone shared expert overlapped on a second stream"
-        ),
     )
     parser.add_argument(
         "--run-low-latency-baseline",

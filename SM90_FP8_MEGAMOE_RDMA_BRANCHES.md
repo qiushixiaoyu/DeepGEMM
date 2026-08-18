@@ -1,6 +1,64 @@
 # SM90 FP8 MegaMOE RDMA 分支与优化记录
 
-更新时间：2026-08-07
+更新时间：2026-08-18
+
+## 2026-08-18 固定生产路径
+
+本节覆盖下文所有“当前状态”描述；旧内容仅作为历史实验记录。
+
+- scheduler 只保留 eager count，lazy producer/cache/prefix-wait 实现及
+  `DG_MEGA_MOE_SCHEDULER_COUNT_IMPL` 已删除。专家按本地 expert ID 固定顺序
+  调度；load/remote-load/wave/staged-remote、decode active-expert 和 dispatch
+  follow-schedule 等实验实现及其全部环境变量/编译宏均已删除。
+- 跨节点 dispatch/combine 固定使用 per-expert ready。workspace cleanup
+  结束后只做本 rank 的 grid sync，不再执行 tag3 跨 rank barrier。
+  `DG_MEGA_MOE_DISPATCH_IMPL`、`DG_MEGA_MOE_COMBINE_IMPL` 及其 host/JIT/kernel
+  选择参数均已删除；跨机由拓扑固定为 expert-ready，单机固定为原生 NVLink
+  协议，不再将后者暴露为 legacy 模式。
+- dispatch metadata 不再支持直发 A/B：调用方请求的 `max_token <= 256`
+  时固定使用 dense V3 整发，否则固定使用 packed 压缩；
+  `DG_MEGA_MOE_DISPATCH_GATEWAY` 已删除。
+- merged A/B loader 固定开启；跨节点 publisher 固定为 async、按目的 rank
+  分组并 chain-poll CQ。inline RDMA publisher、串行 publisher fallback、
+  token-bucket 限速及其相关环境变量均已删除。
+- combine ready 的 mask/notify 固定使用 warp 并行实现，每个 CTA 的 publisher
+  warp 都参与其 `(dst rank, expert)` 工作分片；
+  `DG_MEGA_MOE_COMBINE_PARALLEL_READY` 已删除。该宏在删除前已经没有 kernel
+  引用，仅是 JIT 侧的失效残留。
+- L1、L2、combine staging 固定使用 bounded ring 容量策略，不再接受三个
+  `*_STAGE_RING` 环境变量。小容量下 ring 容量可能等于 full-pool，这是容量
+  策略的自然结果，不是关闭 ring。
+- rank-major pool 和 rank-major pair task 实现已删除。
+- gateway metadata 的 producer 不再支持限定活跃 SM；
+  `DG_MEGA_MOE_GATEWAY_ACTIVE_METADATA_SMS` 及对应分支已删除，固定由全部 SM
+  分摊 expert metadata，并以全部 CTA 到达作为 direction 完成条件。
+- FP8 swap-A/B 不再提供 kill switch；`DG_SM90_FP8_SWAP_AB` 已删除，只保留
+  `should_use_swap_ab_for_mega_moe_sm90()` 按 shape 自动选择。
+- SM90 FP8 MegaMOE 内融合共享专家的实验功能已删除，包括
+  `SGLANG_MEGA_MOE_FUSE_SHARED_EXPERT`、专用 Python/C++/TVM FFI API、kernel
+  模板分支及为共享专家保留的 L2 scratch。共享专家恢复走 SGLang 原有的
+  独立计算/stream overlap 路径；其他 MoE 后端的通用共享专家功能不受影响。
+- FP8 merged A/B loader 固定为唯一实现，旧双 loader 路径和
+  `DG_MEGA_MOE_MERGE_AB_LOADER` 编译宏均已删除。FP4 的同名实验分支本轮保留。
+
+保留下来的 `DG_MEGA_MOE_DISPATCH_GATEWAY_{PACKED,DENSE_V3}` 只是在 JIT
+生成源码时写入的内部编译标记，不再读取同名环境变量。async publisher
+直接绑定 inter-node 拓扑，不再有独立编译开关或运行时 A/B。
+
+### 两个按 shape 自动选择的内部优化
+
+- `split_phase_hot_path` 不改变任务和同步协议；scheduler 仍按原顺序取 block，
+  但把 L1/L2 分派给两个 phase 在编译期已知的 callback。这样 phase 判断只留在
+  外层分派点，编译器可消掉各自重计算体里的分支并专门化地址计算。当前仅对
+  `BLOCK_M=128`、`BLOCK_N=256` 且 `hidden>=7168` 的宽 shape 开启。
+- L2 arrival counter 用“完成一个 L1 producer 就加一，达到期望数量后启动 L2”
+  替代通用路径的 64-bit 到达 bitmask 和部分 full-CTA 同步。它只在 producer
+  数量和拓扑已经验证的 `128x256/512-epilogue-thread` 路径，以及 batch
+  4～128 的 `64x256/256-epilogue-thread` decode 路径开启；其他 shape
+  继续使用通用同步。
+
+这两项都是由已选出的 kernel shape 自动派生的内部编译特化，不读取环境变量，
+也不是保留给用户的 A/B 分支。
 
 ## 2026-08-07 当前状态补充
 
@@ -41,7 +99,7 @@ COMM5/COMM6 上开启 profiler 的 full-remote t64 精度通过，最大归一�
 
 `7bae60048` 将 ready 进一步拆成 mask、atomic、system fence、notify、CTA sync 五段，并增加 `put_nbi_warp_batch_rows`：同一 warp 的 active lane 各负责一行，经 WQE-count prefix sum 后由 lane 0 一次 reserve、一次 doorbell。combine 继续使用 `QP(dst_rank, local_expert)`，不增加 `quiet`，公开接口不变。profile buffer从 22 增至 27 个 slot，每 rank 增加 10 KiB。
 
-五段基线显示串行 ready notify 占 ready 的约 76%～80%。`cf99dde67` 因此将 mask 形成与 ready notify 改为一个 warp 并行；lane 0 仍独占 per-expert atomic、最终 producer 判定和 system fence，ready WQE 与先前 data WQE 仍在同一 RC QP 上保持顺序。`DG_MEGA_MOE_COMBINE_PARALLEL_READY` 默认开启，设置为 0 可回到串行实现。
+五段基线显示串行 ready notify 占 ready 的约 76%～80%。`cf99dde67` 因此将 mask 形成与 ready notify 改为一个 warp 并行；lane 0 仍独占 per-expert atomic、最终 producer 判定和 system fence，ready WQE 与先前 data WQE 仍在同一 RC QP 上保持顺序。当时曾通过 `DG_MEGA_MOE_COMBINE_PARALLEL_READY` 提供串行 A/B；该开关和串行路径现已删除，详见文首固定生产路径。
 
 最终组合“parallel ready + batch doorbell”在 COMM5/COMM6 上通过 full-remote t64、同一 SymmBuffer t256 A/B 交替 100 次和 QP depth 4096 下 full-remote t8192，最大归一化 diff `0.0006`，无 NaN/nonfinite。parallel ready 使三模型 b64/b256 的 ready 段下降 56.7%～73.6%，notify 下降 77.7%～86.4%。batch doorbell 在 parallel-ready 基线上使 Flash/GLM b256 的 WQE 段下降 39.7%/42.8%；最终端到端相对原始逐行+串行 ready 分别改善 9.8%/13.1%。
 

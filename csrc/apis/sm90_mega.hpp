@@ -18,91 +18,6 @@
 
 namespace deep_gemm::mega {
 
-enum class SM90MegaMoECombineImpl {
-    Legacy,
-    FullRowSync,
-    ExpertReady,
-};
-
-enum class SM90MegaMoEDispatchImpl {
-    Legacy,
-    ExpertReady,
-};
-
-enum class SM90MegaMoESchedulerCountImpl {
-    Eager,
-    Lazy,
-};
-
-// Keep the legacy path available for A/B and cache the selection for the
-// lifetime of a SymmBuffer, matching the combine selector's behavior.
-static SM90MegaMoEDispatchImpl get_sm90_mega_moe_dispatch_impl() {
-    static const auto impl = []() {
-        const auto value = get_env<std::string>(
-            "DG_MEGA_MOE_DISPATCH_IMPL", std::string("legacy"));
-        DG_HOST_ASSERT(value == "legacy" or value == "expert_ready");
-        return value == "expert_ready" ?
-            SM90MegaMoEDispatchImpl::ExpertReady : SM90MegaMoEDispatchImpl::Legacy;
-    }();
-    return impl;
-}
-
-// Keep eager as the default and as an A/B reference.  Lazy count scheduling
-// relies on the per-expert epoch/count marker provided by expert-ready
-// dispatch, so the API validates that pairing before launch.
-static SM90MegaMoESchedulerCountImpl get_sm90_mega_moe_scheduler_count_impl() {
-    static const auto impl = []() {
-        const auto value = get_env<std::string>(
-            "DG_MEGA_MOE_SCHEDULER_COUNT_IMPL", std::string("eager"));
-        DG_HOST_ASSERT(value == "eager" or value == "lazy");
-        return value == "lazy" ?
-            SM90MegaMoESchedulerCountImpl::Lazy : SM90MegaMoESchedulerCountImpl::Eager;
-    }();
-    return impl;
-}
-
-// Cache the mode on first use so a live SymmBuffer cannot be resized behind
-// the kernel by changing the environment between calls.
-static SM90MegaMoECombineImpl get_sm90_mega_moe_combine_impl() {
-    static const auto impl = []() {
-        const auto value = get_env<std::string>(
-            "DG_MEGA_MOE_COMBINE_IMPL", std::string("legacy"));
-        DG_HOST_ASSERT(
-            value == "legacy" or value == "full_row_sync" or
-            value == "expert_ready");
-        if (value == "expert_ready")
-            return SM90MegaMoECombineImpl::ExpertReady;
-        return value == "full_row_sync" ?
-            SM90MegaMoECombineImpl::FullRowSync : SM90MegaMoECombineImpl::Legacy;
-    }();
-    return impl;
-}
-
-static bool sm90_mega_moe_combine_uses_full_row() {
-    return get_sm90_mega_moe_combine_impl() != SM90MegaMoECombineImpl::Legacy;
-}
-
-// FP4 kill switch.  The FP8 kernel splits its protocol selection across
-// `DG_MEGA_MOE_{DISPATCH,COMBINE}_IMPL` for historical reasons; FP4 only ever
-// needs "old or new", so one switch covers dispatch and combine together and
-// keeps the JIT configuration space from multiplying.
-//
-// Latched on first use for the same reason as the selectors above: the
-// symmetric buffer layout depends on the answer, so a live SymmBuffer must not
-// be resized behind the kernel by changing the environment between calls.
-//
-// Defaults to the legacy protocol while the new one is still being ported;
-// flip once dispatch/combine/loader are all in place and verified.
-static bool sm90_fp4_uses_legacy_protocol() {
-    static const auto legacy =
-        get_env<int>("DG_SM90_FP4_LEGACY_PROTOCOL", 1) != 0;
-    return legacy;
-}
-
-static bool sm90_fp4_combine_uses_full_row() {
-    return not sm90_fp4_uses_legacy_protocol();
-}
-
 static int get_token_alignment_for_sm90_mega_moe() {
     return layout::kLCMCandidateBlockM;
 }
@@ -163,7 +78,7 @@ struct FP4SM90APIDefaults {
 
 static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
-    const int& intermediate_hidden) {
+    const int& hidden, const int& intermediate_hidden) {
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
     // Shape bands exclude kernel tile/thread constraints; JIT heuristics add those as kernel bands.
@@ -259,15 +174,20 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
           expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f) or
          (fp4_pro_shape and
           expected_tokens_per_expert >= 0.25f and expected_tokens_per_expert < 0.375f));
-    // swapAB on/off kill-switch (default ON). Set DG_SM90_FP4_SWAP_AB=0 to force
-    // the non-swap path for A/B accuracy comparison.
-    const bool swap_ab_env_enabled = get_env<int>("DG_SM90_FP4_SWAP_AB", 1) != 0;
+    // Weight traffic matters in addition to tokens/expert.  In particular,
+    // KimiK3 and DeepSeekV4Pro share intermediate=3072 but differ by 2x in
+    // hidden*intermediate.  Keep the calibrated 16M-element boundary used by
+    // the FP8 path so the two shapes no longer collapse into one swapAB band.
+    constexpr int64_t kSwapAbMaxWeightElems = 16ll * 1024 * 1024;
+    const bool weight_light =
+        static_cast<int64_t>(hidden) * intermediate_hidden <
+        kSwapAbMaxWeightElems;
     const bool default_swap_ab =
-        swap_ab_env_enabled and
+        weight_light and
         (fp4_flash_shape or fp4_pro_shape) and
         expected_tokens_per_expert > 0.0f and expected_tokens_per_expert <= 24.0f;
     const bool default_swap_ab_fast_amax =
-        swap_ab_env_enabled and
+        weight_light and
         fp4_pro_shape and
         expected_tokens_per_expert >= 12.0f and expected_tokens_per_expert <= 24.0f;
     return {
@@ -285,19 +205,15 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
 }
 
 static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
-get_symm_buffer_size_for_sm90_mega_moe(
+get_symm_buffer_size_for_sm90_mega_moe_impl(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const bool& use_fp8_dispatch, const std::string& activation,
-    // Whether the caller's combine stages whole rows.  The FP8 and FP4 kernels
-    // decide this from separate switches, so each kernel entry passes its own
-    // answer to get an exact requirement.  The allocation path (which does not
-    // know which kernel will run on the buffer) leaves this defaulted and gets
-    // the union: sizing for either protocol can never under-allocate, and the
-    // two only disagree while A/B-ing one kernel against the other.
-    const bool& combine_uses_full_row = sm90_mega_moe_combine_uses_full_row() or
-                                        sm90_fp4_combine_uses_full_row()) {
+    const bool& combine_uses_full_row,
+    const bool& combine_uses_expert_ring,
+    const bool& l1_uses_ring,
+    const bool& l2_uses_ring) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(use_fp8_dispatch);
     DG_HOST_ASSERT(activation == "swiglu");
@@ -335,29 +251,62 @@ get_symm_buffer_size_for_sm90_mega_moe(
         input_topk_idx_buffer.get_end_ptr());
 
     const auto num_max_pool_tokens = static_cast<int>(workspace.num_max_pool_tokens);
-    int num_max_padded_sf_pool_tokens = 0;
-    for (int block_m: layout::kCandidateBlockM) {
-        num_max_padded_sf_pool_tokens = std::max(
-            num_max_padded_sf_pool_tokens,
-            layout::get_num_sf_ring_tokens(num_max_pool_tokens, block_m)
-        );
-    }
+    const auto num_compute_ring_tokens = static_cast<int>(
+        layout::get_num_sm90_compute_ring_tokens(
+            num_ranks, num_max_tokens_per_rank, num_topk,
+            num_experts / num_ranks));
+    // Below the transition threshold the smooth-capacity policy intentionally
+    // returns the full pool.  Treat that as "ring disabled".
+    const bool effective_l1_ring =
+        l1_uses_ring and num_compute_ring_tokens < num_max_pool_tokens;
+    const bool effective_l2_ring =
+        l2_uses_ring and num_compute_ring_tokens < num_max_pool_tokens;
+    const auto num_l1_ring_tokens = effective_l1_ring ?
+        num_compute_ring_tokens : num_max_pool_tokens;
+    const auto num_l2_ring_tokens = effective_l2_ring ?
+        num_compute_ring_tokens : num_max_pool_tokens;
+    const auto num_combine_staging_tokens = combine_uses_expert_ring ?
+        static_cast<int>(layout::get_num_sm90_combine_ring_tokens(
+            num_ranks, num_max_tokens_per_rank, num_topk,
+            num_experts / num_ranks)) :
+        num_max_pool_tokens;
+    // Both SM90 FP8 and FP4 MegaMoE recipes use BLOCK_M={64,128}.  Sizing
+    // against the common BLOCK_M=8 candidate inflated each SF pool to 16x
+    // payload rows; two SF rows per payload row is the exact worst case.
+    const auto num_max_padded_sf_pool_tokens = static_cast<int>(
+        layout::get_num_sm90_compute_sf_ring_tokens(
+            num_max_pool_tokens));
+    const auto num_l1_padded_sf_ring_tokens = effective_l1_ring ?
+        static_cast<int>(layout::get_num_sm90_compute_sf_ring_tokens(
+            num_l1_ring_tokens)) : num_max_padded_sf_pool_tokens;
+    // A compact L2 ring reserves one 128-row scratch/guard block after the
+    // reusable payload region.  The JIT kernel slices and indexes this block
+    // explicitly, so host sizing must include it for both token and FP8 SF
+    // storage.  It is a constant-size addition, not a return to full-pool SF
+    // sizing.
+    constexpr int kSM90L2RingScratchTokens = 128;
+    const auto num_l2_storage_tokens = num_l2_ring_tokens +
+        (effective_l2_ring ? kSM90L2RingScratchTokens : 0);
+    const auto num_l2_padded_sf_ring_tokens = effective_l2_ring ?
+        static_cast<int>(layout::get_num_sm90_compute_sf_ring_tokens(
+            num_l2_ring_tokens)) + kSM90L2RingScratchTokens :
+        num_max_padded_sf_pool_tokens;
 
     const auto l1_token_buffer = layout::Buffer(
-        fp8_token_layout, 1, num_max_pool_tokens,
+        fp8_token_layout, 1, num_l1_ring_tokens,
         input_topk_weights_buffer.get_end_ptr());
     const auto l1_sf_buffer = layout::Buffer(
-        fp8_sf_layout, 1, num_max_padded_sf_pool_tokens,
+        fp8_sf_layout, 1, num_l1_padded_sf_ring_tokens,
         l1_token_buffer.get_end_ptr());
     const auto l1_topk_weights_buffer = layout::Buffer(
-        l1_topk_weights_layout, 1, num_max_pool_tokens,
+        l1_topk_weights_layout, 1, num_l1_ring_tokens,
         l1_sf_buffer.get_end_ptr());
 
     const auto l2_token_buffer = layout::Buffer(
-        fp8_intermediate_token_layout, 1, num_max_pool_tokens,
+        fp8_intermediate_token_layout, 1, num_l2_storage_tokens,
         l1_topk_weights_buffer.get_end_ptr());
     const auto l2_sf_buffer = layout::Buffer(
-        fp8_intermediate_sf_layout, 1, num_max_padded_sf_pool_tokens,
+        fp8_intermediate_sf_layout, 1, num_l2_padded_sf_ring_tokens,
         l2_token_buffer.get_end_ptr());
 
     const auto combine_token_buffer = layout::Buffer(
@@ -376,7 +325,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
             reinterpret_cast<uint64_t>(combine_full_row_arrival_buffer.get_end_ptr()),
             static_cast<uint64_t>(128)));
         const auto combine_full_row_staging_buffer = layout::Buffer(
-            bf16_token_layout, 1, num_max_pool_tokens,
+            bf16_token_layout, 1, num_combine_staging_tokens,
             combine_full_row_staging_base);
         symm_buffer_end = combine_full_row_staging_buffer.get_end_ptr();
     }
@@ -406,39 +355,59 @@ get_symm_buffer_size_for_sm90_mega_moe(
             torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
         auto l1_acts = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l1_token_buffer.base)),
-            {num_max_pool_tokens, hidden},
+            {num_l1_ring_tokens, hidden},
             torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
         auto l1_acts_sf = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l1_sf_buffer.base)),
-            {num_max_padded_sf_pool_tokens, hidden / 128},
-            {1, num_max_padded_sf_pool_tokens},
+            {num_l1_padded_sf_ring_tokens, hidden / 128},
+            {1, num_l1_padded_sf_ring_tokens},
             torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
         auto l2_acts = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l2_token_buffer.base)),
-            {num_max_pool_tokens, intermediate_hidden},
+            {num_l2_storage_tokens, intermediate_hidden},
             torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
         auto l2_acts_sf = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l2_sf_buffer.base)),
-            {num_max_padded_sf_pool_tokens, intermediate_hidden / sm90_l2_act_sf_gran_k},
-            {1, num_max_padded_sf_pool_tokens},
+            {num_l2_padded_sf_ring_tokens, intermediate_hidden / sm90_l2_act_sf_gran_k},
+            {1, num_l2_padded_sf_ring_tokens},
             torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
         return std::make_tuple(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
     };
     return {reinterpret_cast<int64_t>(symm_buffer_end), slice_input_buffers};
 }
 
+// Public sizing API stays unchanged.  It returns the union required by the
+// fixed FP8 inter-node protocol and the selected FP4 protocol family.
+static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
+get_symm_buffer_size_for_sm90_mega_moe(
+    const int& num_ranks, const int& num_experts,
+    const int& num_max_tokens_per_rank, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden,
+    const bool& use_fp8_dispatch, const std::string& activation) {
+    const bool fp8_full_row = num_ranks > 8;
+    const bool fp8_ring = fp8_full_row;
+    const bool fp4_full_row = num_ranks > 8;
+    const bool fp4_ring = fp4_full_row;
+    const bool full_row = fp8_full_row or fp4_full_row;
+    const bool every_full_row_path_uses_ring =
+        (not fp8_full_row or fp8_ring) and
+        (not fp4_full_row or fp4_ring);
+    return get_symm_buffer_size_for_sm90_mega_moe_impl(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden, use_fp8_dispatch, activation,
+        full_row, full_row and every_full_row_path_uses_ring,
+        true, true);
+}
+
 static void fp8_mega_moe_impl(
     const torch::Tensor& y,
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
     const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
-    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>&
-        shared_l1_weights_tuple,
-    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>&
-        shared_l2_weights_tuple,
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
     const torch::Tensor& sym_buffer,
     const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
     const int& num_max_tokens_per_rank,
+    const int& requested_num_max_tokens_per_rank,
     const int& num_experts, const int& num_topk,
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
@@ -447,25 +416,14 @@ static void fp8_mega_moe_impl(
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
-    const bool fuse_shared_expert =
-        shared_l1_weights_tuple.has_value() and
-        shared_l2_weights_tuple.has_value();
-    DG_HOST_ASSERT(
-        shared_l1_weights_tuple.has_value() ==
-        shared_l2_weights_tuple.has_value());
-    const auto& shared_l1_weights = fuse_shared_expert
-        ? std::get<0>(*shared_l1_weights_tuple) : l1_weights;
-    const auto& shared_l1_weights_sf = fuse_shared_expert
-        ? std::get<1>(*shared_l1_weights_tuple) : l1_weights_sf;
-    const auto& shared_l2_weights = fuse_shared_expert
-        ? std::get<0>(*shared_l2_weights_tuple) : l2_weights;
-    const auto& shared_l2_weights_sf = fuse_shared_expert
-        ? std::get<1>(*shared_l2_weights_tuple) : l2_weights_sf;
 
     const auto arch_major = device_runtime->get_arch_major();
     DG_HOST_ASSERT(arch_major == 9);
 
     const auto num_tokens = static_cast<int>(y.size(0));
+    DG_HOST_ASSERT(requested_num_max_tokens_per_rank > 0);
+    DG_HOST_ASSERT(
+        requested_num_max_tokens_per_rank <= num_max_tokens_per_rank);
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 128 and rn == 128 and rk == 128);
     DG_HOST_ASSERT(activation == "swiglu");
@@ -494,29 +452,6 @@ static void fp8_mega_moe_impl(
     check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
                     num_experts_per_rank, false, true, torch::kFloat);
 
-    if (fuse_shared_expert) {
-        DG_HOST_ASSERT(get_major_type_ab(shared_l1_weights) == cute::UMMA::Major::K);
-        DG_HOST_ASSERT(get_major_type_ab(shared_l2_weights) == cute::UMMA::Major::K);
-        DG_HOST_ASSERT(shared_l1_weights.scalar_type() == torch::kFloat8_e4m3fn);
-        DG_HOST_ASSERT(shared_l2_weights.scalar_type() == torch::kFloat8_e4m3fn);
-        const auto [num_shared_l1, shared_intermediate_hidden_2, shared_hidden] =
-            get_shape<3>(shared_l1_weights);
-        const auto [num_shared_l2, shared_hidden_, shared_intermediate_hidden] =
-            get_shape<3>(shared_l2_weights);
-        DG_HOST_ASSERT(num_shared_l1 == 1 and num_shared_l2 == 1);
-        DG_HOST_ASSERT(shared_hidden == hidden and shared_hidden_ == hidden);
-        DG_HOST_ASSERT(shared_intermediate_hidden == intermediate_hidden);
-        DG_HOST_ASSERT(shared_intermediate_hidden_2 == 2 * intermediate_hidden);
-        DG_HOST_ASSERT(shared_l1_weights.is_contiguous() and
-                       shared_l2_weights.is_contiguous());
-        check_sf_layout(
-            shared_l1_weights_sf, intermediate_hidden * 2, hidden,
-            kGranMN, kGranK, 1, false, true, torch::kFloat);
-        check_sf_layout(
-            shared_l2_weights_sf, hidden, intermediate_hidden,
-            kGranMN, kGranK, 1, false, true, torch::kFloat);
-    }
-
     if (cumulative_local_expert_recv_stats.has_value()) {
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
@@ -525,49 +460,46 @@ static void fp8_mega_moe_impl(
 
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
-    const auto combine_impl = get_sm90_mega_moe_combine_impl();
-    const auto dispatch_impl = get_sm90_mega_moe_dispatch_impl();
-    const auto scheduler_count_impl = get_sm90_mega_moe_scheduler_count_impl();
-    if (scheduler_count_impl == SM90MegaMoESchedulerCountImpl::Lazy) {
-        DG_HOST_ASSERT(dispatch_impl == SM90MegaMoEDispatchImpl::ExpertReady);
-        DG_HOST_ASSERT(num_ranks > 8);
-    }
-    if ((combine_impl != SM90MegaMoECombineImpl::Legacy or
-         dispatch_impl != SM90MegaMoEDispatchImpl::Legacy) and num_ranks > 8) {
+    const bool internode = num_ranks > 8;
+    if (internode) {
+        DG_HOST_ASSERT(
+            num_ranks % static_cast<int>(layout::kGatewayNvlPeers) == 0);
         const auto num_rc_per_pe = get_env<int>("NVSHMEM_IBGDA_NUM_RC_PER_PE", 0);
-        DG_HOST_ASSERT(num_rc_per_pe >= num_experts_per_rank);
+        // Expert QPs occupy [0, E); automatic packed/dense gateway metadata
+        // always uses the spare QP E.
+        DG_HOST_ASSERT(num_rc_per_pe >= num_experts_per_rank + 1);
     }
-    const auto [num_required_bytes, slice] = get_symm_buffer_size_for_sm90_mega_moe(
+    const auto [num_required_bytes, slice] = get_symm_buffer_size_for_sm90_mega_moe_impl(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         true, activation,
-        sm90_mega_moe_combine_uses_full_row());
+        internode, internode, true, true);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
     const auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
+    // Inputs are populated by the Python pre-dispatch helper.  Keep them in
+    // the common slice for API/layout compatibility, but the fused kernel only
+    // needs the compute pools here.
+    (void)x;
+    (void)x_sf;
+    (void)topk_idx;
+    (void)topk_weights;
 
     sm90_fp8_mega_moe(y,
                      l1_acts, l1_acts_sf,
                      l2_acts, l2_acts_sf,
                      l1_weights, l2_weights,
                      l1_weights_sf, l2_weights_sf,
-                     x, x_sf,
-                     shared_l1_weights, shared_l1_weights_sf,
-                     shared_l2_weights, shared_l2_weights_sf,
-                     fuse_shared_expert,
                      cumulative_local_expert_recv_stats,
                      sym_buffer_ptrs,
                      rank_idx, num_max_tokens_per_rank,
+                     requested_num_max_tokens_per_rank,
                      num_experts_per_rank,
                      num_tokens, num_topk,
                      hidden, intermediate_hidden,
-                     activation_clamp, fast_math,
-                     dispatch_impl == SM90MegaMoEDispatchImpl::ExpertReady and num_ranks > 8,
-                     scheduler_count_impl == SM90MegaMoESchedulerCountImpl::Lazy,
-                     combine_impl != SM90MegaMoECombineImpl::Legacy and num_ranks > 8,
-                     combine_impl == SM90MegaMoECombineImpl::ExpertReady and num_ranks > 8);
+                     activation_clamp, fast_math);
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
@@ -581,6 +513,7 @@ static void fp8_mega_moe(
     const torch::Tensor& sym_buffer,
     const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
     const int& num_max_tokens_per_rank,
+    const int& requested_num_max_tokens_per_rank,
     const int& num_experts, const int& num_topk,
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
@@ -589,35 +522,10 @@ static void fp8_mega_moe(
 ) {
     fp8_mega_moe_impl(
         y, l1_weights_tuple, l2_weights_tuple,
-        std::nullopt, std::nullopt,
         cumulative_local_expert_recv_stats,
         sym_buffer, sym_buffer_ptrs, rank_idx,
-        num_max_tokens_per_rank, num_experts, num_topk,
-        recipe, activation, activation_clamp_opt, fast_math);
-}
-
-static void fp8_mega_moe_with_shared(
-    const torch::Tensor& y,
-    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
-    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
-    const std::tuple<torch::Tensor, torch::Tensor>& shared_l1_weights_tuple,
-    const std::tuple<torch::Tensor, torch::Tensor>& shared_l2_weights_tuple,
-    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
-    const torch::Tensor& sym_buffer,
-    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
-    const int& num_max_tokens_per_rank,
-    const int& num_experts, const int& num_topk,
-    const std::tuple<int, int, int>& recipe,
-    const std::string& activation,
-    const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
-) {
-    fp8_mega_moe_impl(
-        y, l1_weights_tuple, l2_weights_tuple,
-        shared_l1_weights_tuple, shared_l2_weights_tuple,
-        cumulative_local_expert_recv_stats,
-        sym_buffer, sym_buffer_ptrs, rank_idx,
-        num_max_tokens_per_rank, num_experts, num_topk,
+        num_max_tokens_per_rank, requested_num_max_tokens_per_rank,
+        num_experts, num_topk,
         recipe, activation, activation_clamp_opt, fast_math);
 }
 
@@ -629,6 +537,7 @@ static void fp8_fp4_mega_moe_sm90(
     const torch::Tensor& sym_buffer,
     const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
     const int& num_max_tokens_per_rank,
+    const int& requested_num_max_tokens_per_rank,
     const int& num_experts, const int& num_topk,
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
@@ -642,6 +551,9 @@ static void fp8_fp4_mega_moe_sm90(
     DG_HOST_ASSERT(arch_major == 9);
 
     const auto num_tokens = static_cast<int>(y.size(0));
+    DG_HOST_ASSERT(requested_num_max_tokens_per_rank > 0);
+    DG_HOST_ASSERT(
+        requested_num_max_tokens_per_rank <= num_max_tokens_per_rank);
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
     DG_HOST_ASSERT(activation == "swiglu");
@@ -675,18 +587,13 @@ static void fp8_fp4_mega_moe_sm90(
 
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
-    // The legacy protocol has no RDMA path at all: every remote access goes
-    // through `SymBuffer::map()`, plain offset arithmetic that is only valid
-    // inside one NVLink domain.  Cross-node runs therefore require the new
-    // protocol (DG_SM90_FP4_LEGACY_PROTOCOL=0), which routes cross-node
-    // traffic over IBGDA verbs.
-    DG_HOST_ASSERT(not sm90_fp4_uses_legacy_protocol() or num_ranks <= 8);
-    const auto [num_required_bytes, slice] = get_symm_buffer_size_for_sm90_mega_moe(
+    const bool fp4_internode = num_ranks > 8;
+    const auto [num_required_bytes, slice] = get_symm_buffer_size_for_sm90_mega_moe_impl(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         true, activation,
-        sm90_fp4_combine_uses_full_row());
+        fp4_internode, fp4_internode, true, true);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
@@ -700,30 +607,20 @@ static void fp8_fp4_mega_moe_sm90(
     DG_HOST_ASSERT(get_env<int>("DG_USE_FP8_COMBINE") == 0);
 
     auto fp4_defaults = get_fp4_sm90_api_defaults(
-        num_experts_per_rank, num_tokens, num_topk, intermediate_hidden);
+        num_experts_per_rank, num_tokens, num_topk,
+        hidden, intermediate_hidden);
     // The merged loader frees warp 1, so it must no longer be counted as an
     // FP4 decode assistant -- otherwise the decode-done arrival count would
     // include a warp that never arrives.
-    if (get_env<int>("DG_MEGA_MOE_MERGE_AB_LOADER", 0) != 0)
-        fp4_defaults.first_decode_assist_warp =
-            std::max(fp4_defaults.first_decode_assist_warp, 2);
-    // Debug-only override for bisecting first-assist-warp interactions; -1
-    // keeps the heuristic value.  TODO(fp4-rdma): drop after step 3 lands.
-    if (const int fa = get_env<int>("DG_SM90_FP4_FIRST_DECODE_ASSIST_WARP", -1); fa >= 0)
-        fp4_defaults.first_decode_assist_warp = fa;
-    // Inter-node protocol selection, mirroring the FP8 entry: expert-ready
-    // dispatch and full-row/expert-ready combine only ever activate past one
-    // NVLink domain.  Single-node keeps the legacy count-sum handshake, so
-    // the kill switch and these flags change nothing at <= 8 ranks.  FP4 uses
-    // one switch for the whole protocol bundle instead of FP8's two selectors.
-    const bool fp4_internode = num_ranks > 8;
-    const bool fp4_new_protocol =
-        not sm90_fp4_uses_legacy_protocol() and fp4_internode;
-    const bool fp4_async_publisher = fp4_new_protocol and
-        get_env<int>("DG_MEGA_MOE_ASYNC_PUBLISHER", 1) != 0;
+    fp4_defaults.first_decode_assist_warp =
+        std::max(fp4_defaults.first_decode_assist_warp, 2);
+    // The protocol is shape-fixed: inter-node launches use expert-ready
+    // dispatch, full-row async combine and one extra gateway QP; single-node
+    // launches retain the NVLink count-sum data path.
     if (fp4_internode) {
         const auto num_rc_per_pe = get_env<int>("NVSHMEM_IBGDA_NUM_RC_PER_PE", 0);
-        DG_HOST_ASSERT(num_rc_per_pe >= num_experts_per_rank);
+        // Expert QPs occupy [0, E); packed/dense gateway metadata uses E.
+        DG_HOST_ASSERT(num_rc_per_pe >= num_experts_per_rank + 1);
     }
     sm90_fp8_fp4_mega_moe(y,
                           l1_acts, l1_acts_sf,
@@ -733,6 +630,7 @@ static void fp8_fp4_mega_moe_sm90(
                           cumulative_local_expert_recv_stats,
                           sym_buffer_ptrs,
                           rank_idx, num_max_tokens_per_rank,
+                          requested_num_max_tokens_per_rank,
                           num_experts_per_rank,
                           num_tokens, num_topk,
                           hidden, intermediate_hidden,
@@ -746,18 +644,7 @@ static void fp8_fp4_mega_moe_sm90(
                           fp4_defaults.l2_arrival_counter,
                           fp4_defaults.ss_nsplit,
                           fp4_defaults.swap_ab,
-                          fp4_defaults.swap_ab_fast_amax,
-                          /*dispatch_expert_ready=*/fp4_new_protocol,
-                          /*lazy_expert_count=*/false,
-                          // The full-row/expert-ready combine bundle only has
-                          // a publisher-driven publication path in this kernel
-                          // (FP8's last-CTA inline full-row variant was not
-                          // ported), so all three flags travel together:
-                          // DG_MEGA_MOE_ASYNC_PUBLISHER=0 falls back to the
-                          // inline-publish combine for A/B comparison.
-                          /*combine_full_row=*/fp4_async_publisher,
-                          /*combine_expert_ready=*/fp4_async_publisher,
-                          /*async_publisher=*/fp4_async_publisher);
+                          fp4_defaults.swap_ab_fast_amax);
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
@@ -769,7 +656,6 @@ static void register_sm90_apis(pybind11::module_& m) {
     m.def("get_symm_buffer_size_for_sm90_mega_moe", &get_symm_buffer_size_for_sm90_mega_moe);
     m.def("fp8_fp4_mega_moe_sm90", &fp8_fp4_mega_moe_sm90);
     m.def("fp8_mega_moe", &fp8_mega_moe);
-    m.def("fp8_mega_moe_with_shared", &fp8_mega_moe_with_shared);
 #endif
 }
 

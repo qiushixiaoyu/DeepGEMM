@@ -67,6 +67,24 @@ static int get_num_experts_per_wave_for_mega_moe_sm90(
     const int& num_ring_tokens, const int& num_max_tokens_per_rank, const int& num_ranks) {
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
+    const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
+        num_ranks, num_max_tokens_per_rank, num_topk,
+        num_experts_per_rank);
+    // A compact physical pool may be reused only after the current expert
+    // wave finishes L2.  Let the common ring-aware heuristic cap the wave so
+    // its worst-case routed rows fit; otherwise a later L1 block in the same
+    // wave could wait for L2 work that the scheduler cannot start yet.
+    //
+    // Size this bound from the current launch's token count, not the buffer's
+    // configured maximum.  The physical ring is allocated from the maximum,
+    // but a small request whose entire routed working set fits must retain the
+    // original full-expert wave instead of being throttled as if every slot in
+    // the SymmBuffer were active.
+    if (num_ring_tokens < num_max_pool_tokens)
+        return get_num_experts_per_wave_for_mega_moe(
+            num_experts_per_rank, num_tokens, num_topk,
+            intermediate_hidden, block_m, block_n, num_sms,
+            num_ring_tokens, align(num_tokens, block_m), num_ranks);
     if (expected_tokens_per_expert < 1.0f or expected_tokens_per_expert > 4.0f)
         return num_experts_per_rank;
 
@@ -104,9 +122,6 @@ static bool should_use_swap_ab_for_mega_moe_sm90(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
     const int& block_m, const int& num_epilogue_threads,
     const int& hidden, const int& intermediate_hidden) {
-    // Kill-switch retained: set DG_SM90_FP8_SWAP_AB=0 to force the non-swap path.
-    if (get_env<int>("DG_SM90_FP8_SWAP_AB", 1) == 0)
-        return false;
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
     const bool decode_split_n_path =
@@ -304,6 +319,21 @@ static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
         block_m == 64 and block_n == 128;
     const bool fp4_flash_shape = intermediate_hidden <= 2048;
     const bool fp4_pro_shape = intermediate_hidden >= 3072;
+    const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
+        num_ranks, num_max_tokens_per_rank, num_topk,
+        num_experts_per_rank);
+    // The tuned FP4 wave table predates compact compute pools.  Cap every
+    // table result with the common ring-aware heuristic so a complete L1 wave
+    // fits before L2 must retire and recycle any physical slot.  Use the
+    // current launch size for this bound; the ring is sized from the buffer
+    // maximum, but inactive SymmBuffer capacity must not throttle decode.
+    const int ring_safe_num_experts_per_wave =
+        num_ring_tokens < num_max_pool_tokens ?
+            get_num_experts_per_wave_for_mega_moe(
+                num_experts_per_rank, num_tokens, num_topk,
+                intermediate_hidden, block_m, block_n, num_sms,
+                num_ring_tokens, align(num_tokens, block_m), num_ranks) :
+            num_experts_per_rank;
     int fp4_num_experts_per_wave = 0;
     if (fp4_small_block_n_kernel and fp4_flash_shape) {
         static constexpr FP4SM90WaveRule flash_wave_rules[] = {
@@ -322,7 +352,8 @@ static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
                 static_cast<int>(sizeof(flash_wave_rules) / sizeof(flash_wave_rules[0])),
                 expected_tokens_per_expert, num_experts_per_rank,
                 fp4_num_experts_per_wave)) {
-            return fp4_num_experts_per_wave;
+            return std::min(fp4_num_experts_per_wave,
+                            ring_safe_num_experts_per_wave);
         }
     }
     if (fp4_small_block_n_kernel and fp4_pro_shape) {
@@ -345,11 +376,12 @@ static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
                 static_cast<int>(sizeof(pro_wave_rules) / sizeof(pro_wave_rules[0])),
                 expected_tokens_per_expert, num_experts_per_rank,
                 fp4_num_experts_per_wave)) {
-            return fp4_num_experts_per_wave;
+            return std::min(fp4_num_experts_per_wave,
+                            ring_safe_num_experts_per_wave);
         }
     }
     if (expected_tokens_per_expert < 1.0f or expected_tokens_per_expert > 4.0f) {
-        return num_experts_per_rank;
+        return ring_safe_num_experts_per_wave;
     }
     return get_num_experts_per_wave_for_mega_moe(
         num_experts_per_rank, num_tokens, num_topk,
@@ -444,7 +476,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const bool& use_early_b_decode = false,
     const bool& use_decode_done_mbarrier = false,
     const bool& use_swap_ab = false,
-    const bool& use_swap_ab_fast_amax = false) {
+    const bool& use_swap_ab_fast_amax = false,
+    const int& num_compute_ring_tokens = -1) {
     const auto [block_m, num_epilogue_threads] = get_block_config_for_mega_moe_sm90_fp4(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens);
     const int block_k = 128;
@@ -480,7 +513,9 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90_fp4(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms,
-        num_max_pool_tokens, num_max_tokens_per_rank, num_ranks);
+        num_compute_ring_tokens < 0 ? num_max_pool_tokens :
+            std::min(num_max_pool_tokens, num_compute_ring_tokens),
+        num_max_tokens_per_rank, num_ranks);
 
     const bool fp4_small_block_n_kernel =
         block_m == 64 and block_n == 128;
@@ -546,7 +581,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     const int& num_ranks, const int& num_experts, const int& num_experts_per_rank,
     const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
-    const int& num_padded_sf_pool_tokens) {
+    const int& num_padded_sf_pool_tokens,
+    const int& num_compute_ring_tokens) {
     const auto [block_m, num_epilogue_threads] = get_block_config_for_mega_moe_sm90(
         num_ranks, num_experts, num_topk, num_tokens);
     const float expected_tokens_per_expert =
@@ -576,7 +612,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms,
-        num_max_pool_tokens, num_max_tokens_per_rank, num_ranks);
+        num_compute_ring_tokens, num_max_tokens_per_rank, num_ranks);
 
     const bool reduce_decode_threads = num_epilogue_threads == 128;
     const bool decode_split_n =
