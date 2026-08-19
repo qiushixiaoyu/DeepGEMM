@@ -2204,7 +2204,14 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 if constexpr (kL2ArrivalCounter) {
                     const auto ptr = reinterpret_cast<const uint32_t*>(
                         workspace.get_l2_arrival_mask_ptr(pool_block_idx));
-                    const uint32_t expected = kNumL1BlockNs * kNumEpilogueWarpgroups;
+                    // A short final M block may not run every split-M WG.  The
+                    // old fixed kNumEpilogueWarpgroups expectation waited for
+                    // an inactive WG forever.  Split-N WGs remain active as a
+                    // group, so count active M slices times the N split.
+                    const uint32_t num_active_m_wgs = math::ceil_div(
+                        scheduler.template get_valid_m<false>(), WG_BLOCK_M);
+                    const uint32_t expected =
+                        kNumL1BlockNs * num_active_m_wgs * kWarpgroupSplitN;
                     while (ptx::ld_acq(ptr) != expected);
                 } else {
                     const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
@@ -3227,11 +3234,16 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             // In split-N mode, `wg_m_offset` is 0 for all WGs (they share the same M
             // rows), so this skip is effectively per-block, not per-WG.
             if (wg_m_offset >= valid_m) {
-                // Trigger any combine/sync logic minimally
-                if (block_phase == sched::BlockPhase::Linear1)
+                // Counter-mode L1 publication has no CTA-wide rendezvous: an
+                // inactive split-M WG contributes neither data nor a count.
+                // L2 still uses the tail rendezvous below, so its inactive WG
+                // must match the active WG here.
+                if constexpr (kL2ArrivalCounter) {
+                    if (block_phase == sched::BlockPhase::Linear2)
+                        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                } else {
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                else
-                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                }
                 return;
             }
 

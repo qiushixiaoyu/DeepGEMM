@@ -169,11 +169,15 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
         fp4_middle_decode_lookahead_mbarrier_shape_band or
         fp4_middle_bigband_mbarrier_shape_band or
         fp4_2wg_decode_offload_shape_band;
+    // At high tokens/expert the stable M128xN128 tile uses two split-M
+    // producer WGs.  Counter publication lets each active WG release its own
+    // fragment without an epilogue-wide rendezvous on every L1 N block.
     const bool default_l2_arrival_counter =
         ((fp4_flash_shape and
           expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f) or
          (fp4_pro_shape and
-          expected_tokens_per_expert >= 0.25f and expected_tokens_per_expert < 0.375f));
+          expected_tokens_per_expert >= 0.25f and expected_tokens_per_expert < 0.375f) or
+         fp4_2wg_decode_offload_shape_band);
     // Weight traffic matters in addition to tokens/expert.  In particular,
     // KimiK3 and DeepSeekV4Pro share intermediate=3072 but differ by 2x in
     // hidden*intermediate.  Keep the calibrated 16M-element boundary used by
