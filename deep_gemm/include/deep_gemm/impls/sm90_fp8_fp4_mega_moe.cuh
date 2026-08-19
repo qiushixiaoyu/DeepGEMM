@@ -405,7 +405,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // =====================================================================
     DG_STATIC_ASSERT(kNumDispatchThreads == 64 or kNumDispatchThreads == 128,
                      "Dispatch supports 2 or 4 warps");
-    DG_STATIC_ASSERT(kNumNonEpilogueThreads >= 128 and kNumNonEpilogueThreads % 64 == 0,
+    DG_STATIC_ASSERT(kNumNonEpilogueThreads >= 64 and kNumNonEpilogueThreads % 64 == 0,
                      "Invalid number of GEMM TMA/decode-assist warps");
     DG_STATIC_ASSERT((kNumDispatchThreads + kNumNonEpilogueThreads) % 128 == 0,
                      "Math warps must start on a warpgroup boundary");
