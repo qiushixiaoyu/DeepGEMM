@@ -2425,7 +2425,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             combine_full_row_arrival_buffer
                                 .get_data_buffer(pool_block_idx)
                                 .get_base_ptr<uint32_t>();
-                        if ((ptx::ld_acq_sys(arrival_ptr) &
+                        if ((ptx::ld_acq(arrival_ptr) &
                              kCombineFullRowPublishReadyBit) == 0)
                             break;
                         if constexpr (kCombineStageRing) {
@@ -3895,7 +3895,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                         (n_idx + wg_n_offset) * sizeof(nv_bfloat16) +
                                             lane_in_row * sizeof(uint4));
                                     *staging_ptr = packed;
-                                    if (lane_in_row == 0)
+                                    if (lane_in_row == 0 and
+                                        not kCombineExpertReady)
                                         atomicExch(smem_expert_count, 1u);
                                 } else {
                                     *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
@@ -3931,7 +3932,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                         (n_idx + wg_n_offset) * sizeof(nv_bfloat16) +
                                             lane_in_row * sizeof(uint2));
                                     *staging_ptr = packed;
-                                    if (lane_in_row == 0)
+                                    if (lane_in_row == 0 and
+                                        not kCombineExpertReady)
                                         atomicExch(smem_expert_count, 1u);
                                 } else {
                                     *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
@@ -3952,9 +3954,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_INTERNODE)
                 if constexpr (kCombineFullRow) {
                     // Publish this N-block only after every warpgroup completed
-                    // its fragments.  The system-scope acq_rel RMW makes the
-                    // final CTA acquire all earlier producers; the last N-block
-                    // hands the block to the publisher via a release marker.
+                    // its fragments. GPU-scope acq_rel RMWs are sufficient for
+                    // the local producer/publisher hand-off. The last producer
+                    // retains a system-scope release so the staged payload is
+                    // visible to the RNIC before the publisher rings a doorbell.
                     // The scatter section executes per warpgroup (split-N: two
                     // WGs own halves of this block's columns; split-M: rows),
                     // so a CTA-wide sync here can deadlock against a WG still
@@ -3969,7 +3972,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         const auto arrival_ptr = combine_full_row_arrival_buffer
                             .get_data_buffer(m_idx / BLOCK_M)
                             .get_base_ptr<uint32_t>();
-                        const auto old = ptx::atomic_add_acq_rel_sys(arrival_ptr, 1);
+                        const auto old = ptx::atomic_add_acq_rel_gpu(arrival_ptr, 1);
                         // Split-N always needs every column warpgroup.
                         // Split-M only runs the M warpgroups covered by this
                         // block's valid rows: the early-return path above
