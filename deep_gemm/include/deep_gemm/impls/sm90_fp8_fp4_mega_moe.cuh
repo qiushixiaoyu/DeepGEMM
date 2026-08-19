@@ -359,7 +359,8 @@ template <
     bool kL2ArrivalCounter,
     bool kFP4SwapAB,
     bool kFP4SwapABFastAmax>
-__device__ __noinline__ void sm90_fp8_fp4_mega_moe_loader(
+__device__ __noinline__ __local_maxnreg__(96) void
+sm90_fp8_fp4_mega_moe_loader(
     const SM90FP4MegaMoELoaderContext* __restrict__ context) {
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using a_dtype_t = cutlass::float_e4m3_t;
