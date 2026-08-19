@@ -2204,7 +2204,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 if constexpr (kL2ArrivalCounter) {
                     const auto ptr = reinterpret_cast<const uint32_t*>(
                         workspace.get_l2_arrival_mask_ptr(pool_block_idx));
-                    const uint32_t expected = kNumL1BlockNs * kNumEpilogueWarpgroups;
+                    // Split-M tail blocks may not run every math warpgroup;
+                    // only wait for the producers that own valid rows.
+                    const uint32_t active_m_wgs = math::ceil_div(
+                        scheduler.template get_valid_m<false>(), WG_BLOCK_M);
+                    const uint32_t expected =
+                        kNumL1BlockNs * active_m_wgs * kWarpgroupSplitN;
                     while (ptx::ld_acq(ptr) != expected);
                 } else {
                     const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
