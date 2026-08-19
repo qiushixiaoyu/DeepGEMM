@@ -330,12 +330,17 @@ static void sm90_fp8_fp4_mega_moe(
     // gating must match the kernel-side `kSplitNWarpgroups` predicate, which
     // requires WG_BLOCK_N >= 64 (so the FP8MMASelector remains valid).
     const int num_epilogue_warpgroups_h = config.num_epilogue_threads / 128;
+    const bool split_mn_warpgroups =
+        config.block_m == 128 and config.block_n == 256 and
+        num_epilogue_warpgroups_h == 4;
     const bool split_n_warpgroups =
         config.block_m == 64 and num_epilogue_warpgroups_h > 1 and
         config.block_n % num_epilogue_warpgroups_h == 0 and
         (config.block_n / num_epilogue_warpgroups_h) >= 64;
-    const int wg_split_m = split_n_warpgroups ? 1 : num_epilogue_warpgroups_h;
-    const int wg_split_n = split_n_warpgroups ? num_epilogue_warpgroups_h : 1;
+    const int wg_split_m = split_mn_warpgroups ? 2 :
+        (split_n_warpgroups ? 1 : num_epilogue_warpgroups_h);
+    const int wg_split_n = split_mn_warpgroups ? 2 :
+        (split_n_warpgroups ? num_epilogue_warpgroups_h : 1);
     DG_HOST_ASSERT(wg_split_m * wg_split_n == num_epilogue_warpgroups_h);
     const int wg_block_m = config.block_m / wg_split_m;
     const int wg_block_n = config.block_n / wg_split_n;
@@ -343,7 +348,8 @@ static void sm90_fp8_fp4_mega_moe(
     const int l1_output_box_m = wg_block_m;
     // Split-N with 32 post-SwiGLU cols per WG uses one combined 64-col TMA
     // store from WG0, matching the 64-col L2 activation-scale group.
-    const bool split_n_combines_l1_store = split_n_warpgroups and wg_l1_out_block_n < 64;
+    const bool split_n_combines_l1_store =
+        wg_split_n > 1 and wg_l1_out_block_n < 64;
     const int tma_l1_out_box_n = split_n_combines_l1_store ? (config.block_n / 2) : wg_l1_out_block_n;
     const int tma_l1_out_box_m = split_n_combines_l1_store ? config.block_m : l1_output_box_m;
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,

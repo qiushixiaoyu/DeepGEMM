@@ -483,7 +483,15 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const int block_k = 128;
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-    const int block_n = 128;
+    // Large-token FP4 shapes are dominated by the number of scheduler/TMA/
+    // epilogue tasks rather than by the software decode itself.  Cover twice
+    // the N range with a 2x2 math-WG tile once a typical expert has at least
+    // half of a BLOCK_M tile.  Each WG still owns an M64xN128 WGMMA tile; the
+    // larger CTA tile only shares A across the two N halves and B across the
+    // two M halves.
+    const bool fp4_large_2d_tile_shape_band =
+        block_m == 128 and expected_tokens_per_expert >= 64.0f;
+    const int block_n = fp4_large_2d_tile_shape_band ? 256 : 128;
     int fp4_num_epilogue_warpgroups = num_epilogue_threads / 128;
     const bool fp4_flash_shape = intermediate_hidden <= 2048;
     const bool fp4_pro_shape = intermediate_hidden >= 3072;
@@ -494,11 +502,15 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const bool fp4_split_n_shape_band =
         fp4_flash_or_pro_shape and
         expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 64.0f;
-    if (fp4_split_n_eligible and fp4_split_n_shape_band) {
+    if (fp4_large_2d_tile_shape_band) {
+        fp4_num_epilogue_warpgroups = 4;
+    } else if (fp4_split_n_eligible and fp4_split_n_shape_band) {
         fp4_num_epilogue_warpgroups = 2;
     }
     DG_HOST_ASSERT(fp4_num_epilogue_warpgroups >= 1);
-    DG_HOST_ASSERT((block_m / fp4_num_epilogue_warpgroups == 64) or
+    DG_HOST_ASSERT((block_m == 128 and block_n == 256 and
+                    fp4_num_epilogue_warpgroups == 4) or
+                   (block_m / fp4_num_epilogue_warpgroups == 64) or
                    (block_m == 64 and fp4_num_epilogue_warpgroups > 1 and
                     block_n % fp4_num_epilogue_warpgroups == 0 and
                     (block_n / fp4_num_epilogue_warpgroups) >= 64));
@@ -524,8 +536,11 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const bool fp4_2wg_decode_offload_kernel_band =
         block_m == 128 and block_n == 128 and
         fp4_num_epilogue_threads == 256 and expected_tokens_per_expert >= 64.0f;
+    const bool fp4_large_2d_tile_kernel_band =
+        block_m == 128 and block_n == 256 and
+        fp4_num_epilogue_threads == 512;
     const bool fp4_decode_assist_thread_kernel_band =
-        fp4_2wg_decode_offload_kernel_band or
+        fp4_2wg_decode_offload_kernel_band or fp4_large_2d_tile_kernel_band or
         (fp4_small_block_n_kernel and
          expected_tokens_per_expert > 0.0f and expected_tokens_per_expert <= 24.0f);
     const int default_num_dispatch_threads =
