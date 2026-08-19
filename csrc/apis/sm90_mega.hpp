@@ -157,7 +157,8 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
           !fp4_pro_two_tokens_per_expert_shape_band and
           !fp4_flash_two_tokens_per_expert_shape_band and
           !fp4_flash_decode_lookahead_shape_band) or
-         fp4_2wg_decode_offload_shape_band);
+         (fp4_2wg_decode_offload_shape_band and
+          expected_tokens_per_expert >= 1024.0f));
     const bool fp4_middle_decode_lookahead_mbarrier_shape_band =
         fp4_middle_shape and fp4_decode_lookahead_shape_band;
     const bool fp4_middle_bigband_mbarrier_shape_band =
@@ -169,9 +170,11 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
         fp4_middle_decode_lookahead_mbarrier_shape_band or
         fp4_middle_bigband_mbarrier_shape_band or
         fp4_2wg_decode_offload_shape_band;
-    // Large split-M tiles have one independent L1 producer per active M
-    // warpgroup.  Counter publication avoids the bitmask path's extra
-    // epilogue-wide synchronization for every N tile.
+    // Large one-expert-per-wave split-M tiles have one independent L1
+    // producer per active M warpgroup.  Counter publication avoids the
+    // bitmask path's extra epilogue-wide synchronization for every N tile.
+    // Keep multi-expert waves on the established bitmask protocol because
+    // their counter-slot reuse has a tighter reset/publication lifetime.
     const bool default_l2_arrival_counter =
         ((fp4_flash_shape and
           expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f) or

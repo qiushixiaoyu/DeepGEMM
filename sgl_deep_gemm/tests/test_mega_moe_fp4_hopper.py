@@ -449,7 +449,7 @@ def legacy_api_features(
         or fp4_pro_mid_decode_assist_band
         or fp4_pro_large_decode_assist_batch
         or fp4_bigband_lookahead_band
-        or fp4_2wg_decode_offload_band
+        or (fp4_2wg_decode_offload_band and e >= 1024.0)
     )
     default_skip_loader_decode_assist = (
         (0.0 < e < 0.375)
@@ -555,7 +555,7 @@ def table_api_features(
         or fp4_pro_mid_decode_assist_shape_band
         or fp4_pro_large_decode_assist_shape_band
         or fp4_bigband_lookahead_shape_band
-        or fp4_2wg_decode_offload_shape_band
+        or (fp4_2wg_decode_offload_shape_band and e >= 1024.0)
     )
     default_math_wg_decode = (
         fp4_shared_decode_assist_shape_band
@@ -1353,6 +1353,16 @@ def _layer8_pro_smoke(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
             num_max_tokens_per_rank=512, num_tokens=512,
             hidden=7168, intermediate_hidden=3072,
             num_experts=384, num_topk=6,
+            activation_clamp=10.0,
+            reference_chunk=16,
+        )),
+        # One local expert and top-2 routing give 1024 expected tokens/expert
+        # without requiring a multi-thousand-token reference.  This isolates
+        # the large-batch one-expert-per-wave arrival-counter protocol.
+        ('L8.pro_counter_1epw_h7168_ih3072_e16_k2', dict(
+            num_max_tokens_per_rank=512, num_tokens=512,
+            hidden=7168, intermediate_hidden=3072,
+            num_experts=16, num_topk=2,
             activation_clamp=10.0,
             reference_chunk=16,
         )),
