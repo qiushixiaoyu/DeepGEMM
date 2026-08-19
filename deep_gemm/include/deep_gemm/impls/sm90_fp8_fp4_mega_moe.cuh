@@ -1238,10 +1238,13 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         return barrier_start_ptr + kNumDispatchWarps + kNumStages + kNumDecodeFullBarriers + kNumDecodeDoneBarriers + kNumStages + i;
     });
 #ifdef DG_MEGA_MOE_FP4_LOADER_CONTEXT
+    constexpr uint32_t kLoaderContextBarrierSlots =
+        kNumDispatchWarps + kNumStages + kNumDecodeFullBarriers +
+        kNumDecodeDoneBarriers + kNumStages + kNumEpilogueWarps * 2;
+    constexpr uint32_t kLoaderContextAlignedBarrierSlots =
+        math::constexpr_align(kLoaderContextBarrierSlots, 2u);
     auto loader_context = reinterpret_cast<SM90FP4MegaMoELoaderContext*>(
-        barrier_start_ptr + kNumDispatchWarps + kNumStages +
-        kNumDecodeFullBarriers + kNumDecodeDoneBarriers + kNumStages +
-        kNumEpilogueWarps * 2);
+        barrier_start_ptr + kLoaderContextAlignedBarrierSlots);
 #endif
 
     // =====================================================================
