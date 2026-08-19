@@ -706,6 +706,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // TMA store after both WGs reduce amax, matching the 64-column SF block.
     constexpr bool kSplitNCombinesL1Store = kSplitNWarpgroups and (WG_L1_OUT_BLOCK_N < 64);
     constexpr bool kSplitNSharesSF = kSplitNWarpgroups and (WG_L1_OUT_BLOCK_N < kL2ActsSFGranK);
+    // On the large split-M tile, only one leader warp per math warpgroup
+    // needs to rendezvous before the single L1-ready bit is published.  The
+    // other epilogue warps can proceed directly to the existing tail barrier.
+    constexpr bool kUseL1PublishLeaderRendezvous =
+        BLOCK_M == 128 and kWarpgroupSplitM == kNumEpilogueWarpgroups and
+        kNumEpilogueWarpgroups > 1 and not kL2ArrivalCounter;
     DG_STATIC_ASSERT(not kSplitNSharesSF or kSplitNWarpgroups,
                      "share-SF only meaningful under split-N");
     DG_STATIC_ASSERT(not kSplitNSharesSF or (kWarpgroupSplitN == 2),
@@ -996,6 +1002,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kDispatchWithEpilogueBarrierIdx  = 1;
     constexpr uint32_t kEpilogueFullBarrierIdx          = 2;
     constexpr uint32_t kEpilogueWGBarrierStartIdx       = 3;
+    constexpr uint32_t kL1PublishLeaderBarrierIdx       =
+        kEpilogueWGBarrierStartIdx + kNumEpilogueWarpgroups;
     constexpr uint32_t kSchedulerCountCacheBarrierIdx   = 14;
     constexpr uint32_t kFP4DecodeBarrierIdx             = 15;
 #ifdef DG_MEGA_MOE_INTERNODE
@@ -1008,6 +1016,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         kNumAsyncPublisherThreads;
     DG_STATIC_ASSERT(kEpilogueWGBarrierStartIdx + kNumEpilogueWarpgroups <= kSchedulerCountCacheBarrierIdx,
                      "Epilogue WG barriers overlap scheduler-count cache barrier");
+    DG_STATIC_ASSERT(kL1PublishLeaderBarrierIdx < kSchedulerCountCacheBarrierIdx,
+                     "L1 publish leader barrier overlaps scheduler-count cache barrier");
     const uint32_t* cached_recv_counts = smem_expert_count;
     auto cache_expert_recv_counts = [&]() {
         // The inter-node scheduler reads count/manifest from the same
@@ -3228,10 +3238,13 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             // rows), so this skip is effectively per-block, not per-WG.
             if (wg_m_offset >= valid_m) {
                 // Trigger any combine/sync logic minimally
-                if (block_phase == sched::BlockPhase::Linear1)
-                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                else
-                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                if constexpr (kUseL1PublishLeaderRendezvous) {
+                    if (block_phase == sched::BlockPhase::Linear1 and warp_idx_in_wg == 0)
+                        ptx::sync_aligned(
+                            kNumEpilogueWarpgroups * 32,
+                            kL1PublishLeaderBarrierIdx);
+                }
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 return;
             }
 
@@ -3715,11 +3728,24 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             reinterpret_cast<uint32_t*>(workspace.get_l2_arrival_mask_ptr(pool_block_idx)), 1);
                     }
                 } else {
-                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                    if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                        ptx::red_or_rel_gpu(
-                            workspace.get_l2_arrival_mask_ptr(pool_block_idx),
-                            1ull << n_block_idx);
+                    if constexpr (kUseL1PublishLeaderRendezvous) {
+                        if (warp_idx_in_wg == 0) {
+                            ptx::sync_aligned(
+                                kNumEpilogueWarpgroups * 32,
+                                kL1PublishLeaderBarrierIdx);
+                            if (epilogue_wg_idx == 0 and cute::elect_one_sync()) {
+                                ptx::red_or_rel_gpu(
+                                    workspace.get_l2_arrival_mask_ptr(pool_block_idx),
+                                    1ull << n_block_idx);
+                            }
+                        }
+                    } else {
+                        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                        if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                            ptx::red_or_rel_gpu(
+                                workspace.get_l2_arrival_mask_ptr(pool_block_idx),
+                                1ull << n_block_idx);
+                        }
                     }
                 }
                 __syncwarp();
