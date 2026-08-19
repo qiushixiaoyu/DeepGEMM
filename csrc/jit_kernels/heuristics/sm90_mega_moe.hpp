@@ -548,9 +548,13 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
          fp4_decode_assist_thread_kernel_band) ? 64 : 128;
     const int num_dispatch_threads = default_num_dispatch_threads;
     DG_HOST_ASSERT(num_dispatch_threads == 64 or num_dispatch_threads == 128);
+    // The 704-thread variant keeps three dedicated decode-assist warps after
+    // the loader warp.  It raises the launch-bounds register ceiling relative
+    // to the 768-thread tile without making a math warpgroup decode B.
     const int default_num_non_epilogue_threads =
-        fp4_split_n_decode_thread_kernel_band ? 320 :
-        (fp4_decode_assist_thread_kernel_band ? 192 : 128);
+        fp4_large_2d_tile_kernel_band ? 128 :
+        (fp4_split_n_decode_thread_kernel_band ? 320 :
+         (fp4_decode_assist_thread_kernel_band ? 192 : 128));
     const int num_non_epilogue_threads = default_num_non_epilogue_threads;
     DG_HOST_ASSERT(num_non_epilogue_threads >= 128 and
                    num_non_epilogue_threads % 64 == 0);

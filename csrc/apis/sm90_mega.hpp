@@ -190,10 +190,13 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
         weight_light and
         fp4_pro_shape and
         expected_tokens_per_expert >= 12.0f and expected_tokens_per_expert <= 24.0f;
+    // The large-token 2x2 tile uses four non-epilogue warps: warp 0 loads,
+    // and warps 1-3 decode.  Keep math warpgroups compute-only.
     return {
         math_wg_participates_in_decode,
         math_wg_participates_in_decode ? 4 : 0,
-        default_skip_loader_decode_assist ? 2 : 0,
+        fp4_2wg_decode_offload_shape_band ? 1 :
+            (default_skip_loader_decode_assist ? 2 : 0),
         default_wide_load_decode,
         default_ss_early_b_decode,
         default_decode_done_mbarrier,
