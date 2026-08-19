@@ -420,17 +420,25 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int smem_cd_base = std::max(smem_cd_l1, smem_cd_l2);
     const int smem_cd = align(std::max(smem_cd_base, smem_cd_swap_l1), kSmemAlignment);
 
+    const bool fp4_split_mn_eligible =
+        block_m == 128 and block_n == 128 and
+        num_epilogue_warpgroups == 4;
     const bool fp4_split_n_eligible =
         block_m == 64 and num_epilogue_warpgroups > 1 and
         block_n % num_epilogue_warpgroups == 0 and
         (block_n / num_epilogue_warpgroups) >= 64;
+    const int wg_split_n = fp4_split_mn_eligible ? 2 :
+        (fp4_split_n_eligible ? num_epilogue_warpgroups : 1);
     const int kL2ActsSFGranK = block_n == 64 ? 32 : 64;
-    const int wg_l1_out_block_n = fp4_split_n_eligible
-        ? (block_n / num_epilogue_warpgroups) / 2
+    const int wg_l1_out_block_n = wg_split_n > 1
+        ? (block_n / wg_split_n) / 2
         : 0;
     const bool split_n_shares_sf =
-        fp4_split_n_eligible and wg_l1_out_block_n < kL2ActsSFGranK;
-    const int fp4_split_n_amax_scratch_slots = 32 * 2 * 2;
+        wg_split_n > 1 and wg_l1_out_block_n < kL2ActsSFGranK;
+    // One scratch pair represents two M rows; each N partition contributes
+    // two row values (r0/r1).
+    const int fp4_split_n_amax_scratch_slots =
+        (block_m / 2) * wg_split_n * 2;
     const int smem_amax_scratch = split_n_shares_sf
         ? align(fp4_split_n_amax_scratch_slots * static_cast<int>(sizeof(uint32_t)),
                 kSmemAlignment)
@@ -484,6 +492,13 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
     const int block_n = 128;
+    // At large token counts the 128x128 FP4 tile occupies one SM but only
+    // exposes two M64xN128 math warpgroups.  Split the same physical tile into
+    // a 2x2 grid of M64xN64 WGs: this doubles WGMMA issue parallelism without
+    // increasing packed/decoded-B shared memory or using the spill-heavy N256
+    // tile.
+    const bool fp4_4wg_quadrant_shape_band =
+        block_m == 128 and expected_tokens_per_expert >= 64.0f;
     int fp4_num_epilogue_warpgroups = num_epilogue_threads / 128;
     const bool fp4_flash_shape = intermediate_hidden <= 2048;
     const bool fp4_pro_shape = intermediate_hidden >= 3072;
@@ -494,11 +509,15 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const bool fp4_split_n_shape_band =
         fp4_flash_or_pro_shape and
         expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 64.0f;
-    if (fp4_split_n_eligible and fp4_split_n_shape_band) {
+    if (fp4_4wg_quadrant_shape_band) {
+        fp4_num_epilogue_warpgroups = 4;
+    } else if (fp4_split_n_eligible and fp4_split_n_shape_band) {
         fp4_num_epilogue_warpgroups = 2;
     }
     DG_HOST_ASSERT(fp4_num_epilogue_warpgroups >= 1);
-    DG_HOST_ASSERT((block_m / fp4_num_epilogue_warpgroups == 64) or
+    DG_HOST_ASSERT((block_m == 128 and block_n == 128 and
+                    fp4_num_epilogue_warpgroups == 4) or
+                   (block_m / fp4_num_epilogue_warpgroups == 64) or
                    (block_m == 64 and fp4_num_epilogue_warpgroups > 1 and
                     block_n % fp4_num_epilogue_warpgroups == 0 and
                     (block_n / fp4_num_epilogue_warpgroups) >= 64));
@@ -524,8 +543,11 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const bool fp4_2wg_decode_offload_kernel_band =
         block_m == 128 and block_n == 128 and
         fp4_num_epilogue_threads == 256 and expected_tokens_per_expert >= 64.0f;
+    const bool fp4_4wg_quadrant_kernel_band =
+        block_m == 128 and block_n == 128 and
+        fp4_num_epilogue_threads == 512 and expected_tokens_per_expert >= 64.0f;
     const bool fp4_decode_assist_thread_kernel_band =
-        fp4_2wg_decode_offload_kernel_band or
+        fp4_2wg_decode_offload_kernel_band or fp4_4wg_quadrant_kernel_band or
         (fp4_small_block_n_kernel and
          expected_tokens_per_expert > 0.0f and expected_tokens_per_expert <= 24.0f);
     const int default_num_dispatch_threads =

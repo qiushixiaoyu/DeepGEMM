@@ -653,21 +653,23 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // packs 2 nibbles (low nibble = lower-K element, high nibble = upper-K),
     // matching DSV4's TMA-friendly layout.
     using b_packed_dtype_t = int8_t;
-    // FP4 SS split-N infrastructure: when BLOCK_M=64 and BLOCK_N is a
-    // multiple of 128, the host heuristics may request
-    // `kNumEpilogueWarpgroups == BLOCK_N / 128 > 1` math warpgroups. In that
-    // mode every WG shares the same BLOCK_M rows and partitions the N
-    // columns, so each WG owns WG_BLOCK_N = BLOCK_N / num_wg columns. The
-    // packed-B / SFB / decoded-B SMEM tiles still cover the full LOAD_BLOCK_N
-    // because FP4 decode is shared across WGs (see comment on smem_b below);
-    // split-N only manifests in WGMMA descriptors and the L1/L2 epilogue.
+    // Large-token FP4 uses four math WGs in a 2x2 grid over the same M128xN128
+    // physical tile.  Each WG owns M64xN64, keeping its final plus transient
+    // accumulator footprint small enough to avoid the N256 experiment's
+    // local-memory spills.  The existing M64 split-N path remains unchanged.
+    constexpr bool kSplitMNWarpgroups =
+        BLOCK_M == 128 and BLOCK_N == 128 and
+        kNumEpilogueWarpgroups == 4;
     constexpr bool kSplitNWarpgroups =
         BLOCK_M == 64 and
         kNumEpilogueWarpgroups > 1 and
         BLOCK_N % kNumEpilogueWarpgroups == 0 and
         (BLOCK_N / kNumEpilogueWarpgroups) >= 64;
-    constexpr uint32_t kWarpgroupSplitM = kSplitNWarpgroups ? 1u : kNumEpilogueWarpgroups;
-    constexpr uint32_t kWarpgroupSplitN = kSplitNWarpgroups ? kNumEpilogueWarpgroups : 1u;
+    constexpr uint32_t kWarpgroupSplitM = kSplitMNWarpgroups ? 2u :
+        (kSplitNWarpgroups ? 1u : kNumEpilogueWarpgroups);
+    constexpr uint32_t kWarpgroupSplitN = kSplitMNWarpgroups ? 2u :
+        (kSplitNWarpgroups ? kNumEpilogueWarpgroups : 1u);
+    constexpr bool kHasNSplit = kWarpgroupSplitN > 1;
     constexpr uint32_t WG_BLOCK_M = BLOCK_M / kWarpgroupSplitM;
     constexpr uint32_t WG_BLOCK_N = BLOCK_N / kWarpgroupSplitN;
     constexpr bool kSwapABEligible =
@@ -704,9 +706,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // In the split-N=2, BLOCK_N=128 path each WG produces only
     // WG_L1_OUT_BLOCK_N post-SwiGLU columns. WG0 issues one combined 64-column
     // TMA store after both WGs reduce amax, matching the 64-column SF block.
-    constexpr bool kSplitNCombinesL1Store = kSplitNWarpgroups and (WG_L1_OUT_BLOCK_N < 64);
-    constexpr bool kSplitNSharesSF = kSplitNWarpgroups and (WG_L1_OUT_BLOCK_N < kL2ActsSFGranK);
-    DG_STATIC_ASSERT(not kSplitNSharesSF or kSplitNWarpgroups,
+    constexpr bool kSplitNCombinesL1Store = kHasNSplit and (WG_L1_OUT_BLOCK_N < 64);
+    constexpr bool kSplitNSharesSF = kHasNSplit and (WG_L1_OUT_BLOCK_N < kL2ActsSFGranK);
+    DG_STATIC_ASSERT(not kSplitNSharesSF or kHasNSplit,
                      "share-SF only meaningful under split-N");
     DG_STATIC_ASSERT(not kSplitNSharesSF or (kWarpgroupSplitN == 2),
                      "share-SF currently only supports split-N=2");
@@ -786,10 +788,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // Only col_idx==0 lanes write SF, so those lanes publish each WG's amax,
     // synchronize once, and read both halves back to avoid atomicMax and a
     // second epilogue-wide barrier.
-    //   row_slot = warp_idx_in_wg * 8 + row_idx  (row_idx = lane_idx / 4)
+    //   row_slot = wg_m_offset/2 + warp_idx_in_wg*8 + row_idx
     //   scratch[row_slot][wg_n_idx][r0/r1]
-    // 32 rows x 2 WGs x 2 row values (r0, r1) = 128 float slots.
-    constexpr uint32_t kAmaxScratchSlots = 32 * 2 * 2;
+    // One scratch row-pair represents r0/r1.  Every M partition owns
+    // BLOCK_M/2 row-pairs and every N partition contributes two values.
+    constexpr uint32_t kAmaxScratchSlots =
+        (BLOCK_M / 2) * kWarpgroupSplitN * 2;
     constexpr uint32_t SMEM_AMAX_SCRATCH_SIZE = kSplitNSharesSF ?
         math::constexpr_align<uint32_t>(kAmaxScratchSlots * sizeof(uint32_t),
                                         kSharedMemoryAlignment) : 0;
@@ -996,6 +1000,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kDispatchWithEpilogueBarrierIdx  = 1;
     constexpr uint32_t kEpilogueFullBarrierIdx          = 2;
     constexpr uint32_t kEpilogueWGBarrierStartIdx       = 3;
+    constexpr uint32_t kEpilogueNPairBarrierStartIdx    =
+        kEpilogueWGBarrierStartIdx + kNumEpilogueWarpgroups;
     constexpr uint32_t kSchedulerCountCacheBarrierIdx   = 14;
     constexpr uint32_t kFP4DecodeBarrierIdx             = 15;
 #ifdef DG_MEGA_MOE_INTERNODE
@@ -1008,6 +1014,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         kNumAsyncPublisherThreads;
     DG_STATIC_ASSERT(kEpilogueWGBarrierStartIdx + kNumEpilogueWarpgroups <= kSchedulerCountCacheBarrierIdx,
                      "Epilogue WG barriers overlap scheduler-count cache barrier");
+    DG_STATIC_ASSERT(kEpilogueNPairBarrierStartIdx + kWarpgroupSplitM <=
+                         kSchedulerCountCacheBarrierIdx,
+                     "Epilogue N-pair barriers overlap scheduler-count cache barrier");
     const uint32_t* cached_recv_counts = smem_expert_count;
     auto cache_expert_recv_counts = [&]() {
         // The inter-node scheduler reads count/manifest from the same
@@ -1031,7 +1040,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // regular N=128 path.
     constexpr uint32_t kNumDispatchRegisters    = 48;
     constexpr uint32_t kNumNonEpilogueRegisters = 40;
-    constexpr uint32_t kNumEpilogueRegisters    = kSplitNWarpgroups ? 160 : 208;
+    // Four M64xN64 WGs fit in the CTA register budget with 104 registers each:
+    // 64 accumulator floats plus control/epilogue state, with no N256-sized
+    // live range. Total for the 64+192+512-thread topology is 64000 registers.
+    constexpr uint32_t kNumEpilogueRegisters =
+        kSplitMNWarpgroups ? 104 : (kSplitNWarpgroups ? 160 : 208);
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
                      kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
@@ -2666,14 +2679,24 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         // into one joint L1 tile so WG0 can issue a combined TMA store. Otherwise
         // each WG owns a compact contiguous staging tile, matching the TMA box.
         const uint32_t smem_cd_l1_wg_offset =
-            kSplitNCombinesL1Store ? wg_l1_out_n_offset
-                                   : epilogue_wg_idx * WG_BLOCK_M * WG_L1_OUT_BLOCK_N;
+            kSplitNCombinesL1Store
+                ? wg_m_offset * L1_OUT_BLOCK_N + wg_l1_out_n_offset
+                : epilogue_wg_idx * WG_BLOCK_M * WG_L1_OUT_BLOCK_N;
         // L2 BF16 staging keeps the full BLOCK_N row stride. In split-N the
         // WG offset selects the column half while preserving the original tile
         // layout used by the scatter path.
         const uint32_t smem_cd_l2_wg_offset = wg_m_offset * BLOCK_N + wg_n_offset;
 
         cache_expert_recv_counts();
+
+        // Synchronize the two N-partition WGs that own the same M rows.  This
+        // is narrower than the full epilogue barrier and remains valid for a
+        // short tail where the second M partition exits the epilogue early.
+        auto sync_n_peer_wgs = [&]() {
+            ptx::sync_aligned(
+                128 * kWarpgroupSplitN,
+                kEpilogueNPairBarrierStartIdx + epilogue_wg_m_idx);
+        };
 
         // Sync with dispatch
         ptx::sync_unaligned(
@@ -3548,18 +3571,22 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 // take the max in registers.
                 if constexpr (kSplitNSharesSF) {
                     if (col_idx == 0) {
-                        const uint32_t row_slot = warp_idx_in_wg * 8 + row_idx;
-                        const uint32_t slot = row_slot * 4 + epilogue_wg_n_idx * 2;
+                        const uint32_t row_slot =
+                            wg_m_offset / 2 + warp_idx_in_wg * 8 + row_idx;
+                        const uint32_t slot =
+                            row_slot * (kWarpgroupSplitN * 2) +
+                            epilogue_wg_n_idx * 2;
                         ptx::st_shared(smem_amax_scratch + slot + 0,
                                        __float_as_uint(amax_r0));
                         ptx::st_shared(smem_amax_scratch + slot + 1,
                                        __float_as_uint(amax_r1));
                     }
-                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    sync_n_peer_wgs();
                     // Both WGs read the merged amax.
                     if (col_idx == 0) {
-                        const uint32_t row_slot = warp_idx_in_wg * 8 + row_idx;
-                        const uint32_t slot = row_slot * 4;
+                        const uint32_t row_slot =
+                            wg_m_offset / 2 + warp_idx_in_wg * 8 + row_idx;
+                        const uint32_t slot = row_slot * (kWarpgroupSplitN * 2);
                         const float wg0_r0 = __uint_as_float(
                             ptx::ld_shared(smem_amax_scratch + slot + 0));
                         const float wg0_r1 = __uint_as_float(
@@ -3646,10 +3673,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         sf_base_ptr[k_sf_idx * kNumL2SFStorageTokens + token_r1] = sf_r1;
                 }
 
-                // Combined split-N store needs an epilogue-wide sync so WG0 can
-                // store the full L1 staging tile after WG1 writes its slice.
+                // A combined split-N store synchronizes the two N peers for
+                // this M partition so its leader sees both column slices.
                 if constexpr (kSplitNCombinesL1Store) {
-                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    sync_n_peer_wgs();
                 } else {
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
                 }
@@ -3673,9 +3700,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             cute::tma_store_fence();
                             cute::SM90_TMA_STORE_2D::copy(
                                 &tensor_map_l1_output,
-                                smem_cd_l1,
+                                smem_cd_l1 + wg_m_offset * L1_OUT_BLOCK_N,
                                 out_n_idx,
-                                l2_ring_m_idx);
+                                l2_ring_m_idx + wg_m_offset);
                             cute::tma_store_arrive();
                         }
                         // WG1 is covered by WG0's combined store.
@@ -3727,7 +3754,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 // Add a tail sync so WG1 cannot overwrite the shared L1 staging
                 // tile for the next N block while WG0's combined store drains.
                 if constexpr (kSplitNCombinesL1Store and kL2ArrivalCounter)
-                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    sync_n_peer_wgs();
                 }
             } else {
                 // ---------------- L2 EPILOGUE: BF16 cast + NVLink scatter ----------------
