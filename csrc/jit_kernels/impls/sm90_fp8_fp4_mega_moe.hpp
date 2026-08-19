@@ -141,6 +141,9 @@ public:
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE_SILENT", 0) != 0)
             internode_prefix +=
                 "#define DG_MEGA_MOE_PHASE_PROFILE_SILENT 1\n";
+        if (get_env<int>("DG_MEGA_MOE_FP4_ROW_MAJOR_DECODE", 0) != 0)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_FP4_ROW_MAJOR_DECODE 1\n";
         const int actual_pool_tokens = layout::get_num_max_pool_tokens(
             args.num_ranks, args.num_tokens, args.num_topk,
             args.num_experts / args.num_ranks);

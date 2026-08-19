@@ -240,6 +240,76 @@ template <
     uint32_t kNumSFBPerBlockK,
     typename PackedT,
     typename DecodedT>
+__device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_row_major(
+    const uint32_t decode_thread_idx,
+    const uint32_t num_decode_threads,
+    const PackedT* __restrict__ smem_b_packed_stage,
+    DecodedT* __restrict__ smem_b_stage,
+    const uint32_t* __restrict__ smem_sfb_stage) {
+    constexpr uint32_t kPackedWordsPerKG = kScaleBGranK / 8;  // 4
+    constexpr uint32_t kPackedWordPairsPerKG = kPackedWordsPerKG / 2;
+    DG_STATIC_ASSERT(kPackedWordsPerKG == 4,
+                     "Row-major decode assumes per-32K groups");
+
+    // Large-token kernels use exactly LOAD_BLOCK_N decode threads.  Give each
+    // thread a whole N row so the four K/32 groups share one SFB load, one row
+    // base calculation, and one swizzle calculation.  Keep the K-group loop
+    // rolled to reuse the same small register set instead of materializing four
+    // independent LUT/decode chains at once.
+    for (uint32_t n_row = decode_thread_idx;
+         n_row < LOAD_BLOCK_N; n_row += num_decode_threads) {
+        const uint32_t sfb_word = smem_sfb_stage[n_row];
+        const auto* packed_row = reinterpret_cast<const uint32_t*>(
+            smem_b_packed_stage + n_row * (BLOCK_K / 2));
+        auto* decoded_row_u64 = reinterpret_cast<uint64_t*>(
+            smem_b_stage + n_row * BLOCK_K);
+        const uint32_t row_swizzle = n_row & 7u;
+
+        #pragma unroll 1
+        for (uint32_t kg = 0; kg < kNumSFBPerBlockK; ++kg) {
+            const uint32_t e8m0 = (sfb_word >> (kg * 8)) & 0xffu;
+            const uint64_t scaled_lut =
+                fp4_decode_detail::pack_scaled_e4m3_lut_from_e8m0_const(e8m0);
+            const uint32_t scaled_lut_lo =
+                static_cast<uint32_t>(scaled_lut);
+            const uint32_t scaled_lut_hi =
+                static_cast<uint32_t>(scaled_lut >> 32);
+
+            #pragma unroll
+            for (uint32_t pair = 0;
+                 pair < kPackedWordPairsPerKG; ++pair) {
+                const uint32_t pw_global_0 =
+                    kg * kPackedWordsPerKG + pair * 2u;
+                const uint32_t packed_0 = packed_row[pw_global_0];
+                const uint32_t packed_1 = packed_row[pw_global_0 + 1u];
+                const uint32_t lo_0 =
+                    fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
+                        packed_0 & 0xffffu, scaled_lut_lo, scaled_lut_hi);
+                const uint32_t hi_0 =
+                    fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
+                        packed_0 >> 16, scaled_lut_lo, scaled_lut_hi);
+                const uint32_t lo_1 =
+                    fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
+                        packed_1 & 0xffffu, scaled_lut_lo, scaled_lut_hi);
+                const uint32_t hi_1 =
+                    fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
+                        packed_1 >> 16, scaled_lut_lo, scaled_lut_hi);
+                const uint32_t swz_seg = (pw_global_0 >> 1) ^ row_swizzle;
+                ptx::st_shared(
+                    decoded_row_u64 + swz_seg * 2u,
+                    lo_0, hi_0, lo_1, hi_1);
+            }
+        }
+    }
+}
+
+template <
+    uint32_t LOAD_BLOCK_N,
+    uint32_t BLOCK_K,
+    uint32_t kScaleBGranK,
+    uint32_t kNumSFBPerBlockK,
+    typename PackedT,
+    typename DecodedT>
 __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_vec_store(
     const uint32_t decode_thread_idx,
     const uint32_t num_decode_threads,
@@ -295,6 +365,7 @@ template <
     uint32_t kScaleBGranK,
     uint32_t kNumSFBPerBlockK,
     bool kUseWideLoadDecode,
+    bool kUseRowMajorDecode,
     typename PackedT,
     typename DecodedT>
 __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_dispatch(
@@ -305,6 +376,11 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_dispatch(
     const uint32_t* __restrict__ smem_sfb_stage) {
     if constexpr (kUseWideLoadDecode) {
         dequant_fp4_b_tile_to_e4m3_smem_wide_load<
+            LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK>(
+            decode_thread_idx, num_decode_threads,
+            smem_b_packed_stage, smem_b_stage, smem_sfb_stage);
+    } else if constexpr (kUseRowMajorDecode) {
+        dequant_fp4_b_tile_to_e4m3_smem_row_major<
             LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK>(
             decode_thread_idx, num_decode_threads,
             smem_b_packed_stage, smem_b_stage, smem_sfb_stage);
@@ -1052,6 +1128,13 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kNumFP4DecodeAssistThreads = kNumFP4DecodeAssistWarps * 32;
     constexpr uint32_t kNumFP4DecodeWorkerThreads = kNumFP4DecodeAssistThreads +
         kNumMathWGDecodeWarps * 32;
+#ifdef DG_MEGA_MOE_FP4_ROW_MAJOR_DECODE
+    constexpr bool kUseRowMajorFP4Decode =
+        not kUseWideLoadDecode and
+        kNumFP4DecodeWorkerThreads == LOAD_BLOCK_N;
+#else
+    constexpr bool kUseRowMajorFP4Decode = false;
+#endif
     constexpr uint32_t kNumFP4DecodeBarrierThreads =
         kNumFP4DecodeAssistThreads + kNumEpilogueThreads;
     auto arrive_or_sync_fp4_decode_done = [&](const uint32_t& cur_stage_idx) {
@@ -1083,7 +1166,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                   const uint32_t& decode_thread_idx) {
         dequant_fp4_b_tile_to_e4m3_smem_dispatch<
             LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
-            kUseWideLoadDecode>(
+            kUseWideLoadDecode, kUseRowMajorFP4Decode>(
             decode_thread_idx, kNumFP4DecodeWorkerThreads,
             smem_b_packed[cur_stage_idx], smem_b[cur_stage_idx], smem_sfb[cur_stage_idx]);
         arrive_or_sync_fp4_decode_done(cur_stage_idx);
@@ -2755,7 +2838,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             kNumFP4DecodeAssistThreads + epilogue_thread_idx;
                         dequant_fp4_b_tile_to_e4m3_smem_dispatch<
                             LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
-                            kUseWideLoadDecode>(
+                            kUseWideLoadDecode, kUseRowMajorFP4Decode>(
                             decode_thread_idx, kNumFP4DecodeWorkerThreads,
                             smem_b_packed[stage_idx], smem_b[stage_idx], smem_sfb[stage_idx]);
                     }
