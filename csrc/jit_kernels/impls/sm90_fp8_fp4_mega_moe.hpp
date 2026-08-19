@@ -141,6 +141,9 @@ public:
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE_SILENT", 0) != 0)
             internode_prefix +=
                 "#define DG_MEGA_MOE_PHASE_PROFILE_SILENT 1\n";
+        if (get_env<int>("DG_MEGA_MOE_FP4_LOADER_CONTEXT", 0) != 0)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_FP4_LOADER_CONTEXT 1\n";
         const int actual_pool_tokens = layout::get_num_max_pool_tokens(
             args.num_ranks, args.num_tokens, args.num_topk,
             args.num_experts / args.num_ranks);
@@ -283,13 +286,20 @@ static void sm90_fp8_fp4_mega_moe(
     DG_HOST_ASSERT(first_fp4_decode_assist_warp >= 0 and first_fp4_decode_assist_warp <= 4);
 
     // Heuristics
-    const auto config = get_mega_moe_config_sm90_fp4(
+    auto config = get_mega_moe_config_sm90_fp4(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden, num_l1_sf_storage_tokens,
         use_early_b_decode, use_decode_done_mbarrier,
         use_swap_ab, use_swap_ab_fast_amax,
         num_compute_ring_tokens);
+    if (get_env<int>("DG_MEGA_MOE_FP4_LOADER_CONTEXT", 0) != 0) {
+        constexpr int kLoaderContextSmemBytes = 128;
+        DG_HOST_ASSERT(
+            config.smem_size + kLoaderContextSmemBytes <=
+            SM90ArchSpec::smem_capacity);
+        config.smem_size += kLoaderContextSmemBytes;
+    }
 
     // Tensormap construction
     constexpr int kGranK         = 128;  // L1 acts SF granularity (per-128 K)

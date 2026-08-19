@@ -316,6 +316,368 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_dispatch(
     }
 }
 
+#ifdef DG_MEGA_MOE_FP4_LOADER_CONTEXT
+// Keep the persistent TMA loader's ABI to one shared-memory pointer.  Passing
+// every descriptor/buffer/scheduler field as an ordinary device-function
+// argument makes ptxas materialize most of the arguments in local memory.  A
+// compact shared context instead gives the noinline loader a narrow call
+// boundary and, more importantly, prevents the inter-node dispatch/publisher
+// state from extending the loader hot loop's register live ranges.
+struct alignas(16) SM90FP4MegaMoELoaderContext {
+    void* workspace_base;
+    uint64_t kernel_launch_epoch;
+    uint32_t rank_idx;
+    uint32_t reserved;
+    const cute::TmaDescriptor* tensor_map_l1_acts;
+    const cute::TmaDescriptor* tensor_map_l1_acts_sf;
+    const cute::TmaDescriptor* tensor_map_l1_weights;
+    const cute::TmaDescriptor* tensor_map_l2_acts;
+    const cute::TmaDescriptor* tensor_map_l2_acts_sf;
+    const cute::TmaDescriptor* tensor_map_l2_weights;
+    const uint32_t* l1_weights_sf;
+    const uint32_t* l2_weights_sf;
+    uint8_t* smem_base;
+};
+static_assert(sizeof(SM90FP4MegaMoELoaderContext) <= 128,
+              "FP4 loader context must fit the reserved shared-memory tail");
+
+template <
+    uint32_t kNumMaxTokensPerRank,
+    uint32_t kHidden, uint32_t kIntermediateHidden,
+    uint32_t kNumExperts, uint32_t kNumTopk,
+    uint32_t kNumExpertsPerWave,
+    uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+    uint32_t kNumMaxPoolTokens,
+    uint32_t kNumL1RingTokens, uint32_t kNumL2RingTokens,
+    uint32_t kNumStages,
+    uint32_t kNumDispatchWarps,
+    uint32_t kNumEpilogueWarps,
+    uint32_t kNumEpilogueWarpgroups,
+    uint32_t kNumSMs, uint32_t kNumRanks,
+    bool kUseEarlyBDecode,
+    bool kUseDecodeDoneMBarrier,
+    bool kL2ArrivalCounter,
+    bool kFP4SwapAB,
+    bool kFP4SwapABFastAmax>
+__device__ __noinline__ void sm90_fp8_fp4_mega_moe_loader(
+    const SM90FP4MegaMoELoaderContext* __restrict__ context) {
+    using Barrier = cutlass::arch::ClusterTransactionBarrier;
+    using a_dtype_t = cutlass::float_e4m3_t;
+    using b_dtype_t = cutlass::float_e4m3_t;
+    using b_packed_dtype_t = int8_t;
+
+    constexpr uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks;
+    constexpr uint32_t kNumExpertsPerLane =
+        math::constexpr_ceil_div(kNumExpertsPerRank, 32u);
+    constexpr uint32_t kNumL1BlockNs = (kIntermediateHidden * 2) / BLOCK_N;
+    constexpr uint32_t kNumL2BlockNs = kHidden / BLOCK_N;
+    constexpr uint32_t kNumL1BlockKs = kHidden / BLOCK_K;
+    constexpr uint32_t kNumL2BlockKs = kIntermediateHidden / BLOCK_K;
+    constexpr uint32_t kL2ActsSFGranK = BLOCK_N == 64 ? 32 : 64;
+    constexpr uint32_t kNumL2SFAPerBlockK = BLOCK_K / kL2ActsSFGranK;
+    constexpr uint32_t SF_BLOCK_M = math::constexpr_align(BLOCK_M, 128u);
+    constexpr uint32_t LOAD_BLOCK_M = BLOCK_M;
+    constexpr uint32_t LOAD_BLOCK_N = BLOCK_N;
+    constexpr uint32_t kSwizzleAMode = BLOCK_K * sizeof(a_dtype_t);
+    constexpr uint32_t kSwizzleBPackedMode = 0;
+
+    constexpr uint32_t kNumL1RingBlocks = kNumL1RingTokens / BLOCK_M;
+    constexpr uint32_t kNumL2RingBlocks = kNumL2RingTokens / BLOCK_M;
+#ifdef DG_MEGA_MOE_L1_RING_ACTIVE
+    constexpr bool kL1RingEnabled = kNumL1RingTokens < kNumMaxPoolTokens;
+#else
+    constexpr bool kL1RingEnabled = false;
+#endif
+#ifdef DG_MEGA_MOE_L2_RING_ACTIVE
+    constexpr bool kL2RingEnabled = kNumL2RingTokens < kNumMaxPoolTokens;
+#else
+    constexpr bool kL2RingEnabled = false;
+#endif
+    const auto get_l1_ring_block_idx = [](const uint32_t pool_block_idx) {
+        if constexpr (kL1RingEnabled)
+            return pool_block_idx % kNumL1RingBlocks;
+        return pool_block_idx;
+    };
+    const auto get_l2_ring_block_idx = [](const uint32_t pool_block_idx) {
+        if constexpr (kL2RingEnabled)
+            return pool_block_idx % kNumL2RingBlocks;
+        return pool_block_idx;
+    };
+
+    constexpr uint32_t kWarpgroupSplitN =
+        (BLOCK_M == 64 and kNumEpilogueWarpgroups > 1 and
+         BLOCK_N % kNumEpilogueWarpgroups == 0 and
+         BLOCK_N / kNumEpilogueWarpgroups >= 64)
+            ? kNumEpilogueWarpgroups : 1u;
+    constexpr bool kSplitNWarpgroups = kWarpgroupSplitN > 1;
+    constexpr uint32_t kWarpgroupSplitM =
+        kSplitNWarpgroups ? 1u : kNumEpilogueWarpgroups;
+    constexpr uint32_t WG_BLOCK_N = BLOCK_N / kWarpgroupSplitN;
+    constexpr bool kSwapABEligible =
+        kFP4SwapAB and kSplitNWarpgroups and BLOCK_M == 64 and
+        BLOCK_N == 128 and kWarpgroupSplitN == 2;
+    constexpr bool kSwapABL1Active = kSwapABEligible;
+    constexpr bool kSplitNSharesSF =
+        kSplitNWarpgroups and (WG_BLOCK_N / 2 < kL2ActsSFGranK);
+
+    constexpr uint32_t kSharedMemoryAlignment = 1024;
+    constexpr auto fp8_token_layout = SM90FP8FP4MegaMoEData(kHidden);
+    constexpr uint32_t SMEM_EXPERT_COUNT_SIZE =
+        math::constexpr_align<uint32_t>(
+            kNumExperts * sizeof(uint32_t), kSharedMemoryAlignment);
+    constexpr uint32_t SMEM_SEND_BUFFER_SIZE =
+        math::constexpr_align(
+            fp8_token_layout.get_num_bytes() * kNumDispatchWarps,
+            kSharedMemoryAlignment);
+    constexpr uint32_t SMEM_CD_L1_SIZE =
+        BLOCK_M * (BLOCK_N / 2) * sizeof(cutlass::float_e4m3_t);
+    constexpr uint32_t SMEM_CD_L2_SIZE =
+        BLOCK_M * BLOCK_N * sizeof(nv_bfloat16);
+    constexpr uint32_t SMEM_CD_SWAP_L1_FP32_SIZE =
+        (kSwapABL1Active and not kFP4SwapABFastAmax)
+            ? BLOCK_M * (BLOCK_N / 2) * sizeof(float) : 0;
+    constexpr uint32_t SMEM_CD_SWAP_L1_FP8_SIZE =
+        kSwapABL1Active
+            ? BLOCK_M * (BLOCK_N / 2) * sizeof(cutlass::float_e4m3_t) : 0;
+    constexpr uint32_t SMEM_CD_SWAP_L1_SIZE =
+        SMEM_CD_SWAP_L1_FP32_SIZE + SMEM_CD_SWAP_L1_FP8_SIZE;
+    constexpr uint32_t SMEM_CD_BASE_SIZE =
+        SMEM_CD_L1_SIZE > SMEM_CD_L2_SIZE ? SMEM_CD_L1_SIZE : SMEM_CD_L2_SIZE;
+    constexpr uint32_t SMEM_CD_SIZE = math::constexpr_align(
+        SMEM_CD_BASE_SIZE > SMEM_CD_SWAP_L1_SIZE
+            ? SMEM_CD_BASE_SIZE : SMEM_CD_SWAP_L1_SIZE,
+        kSharedMemoryAlignment);
+    constexpr uint32_t SMEM_AMAX_SCRATCH_SIZE = kSplitNSharesSF
+        ? math::constexpr_align<uint32_t>(
+              32u * 2u * 2u * sizeof(uint32_t), kSharedMemoryAlignment)
+        : 0;
+    constexpr uint32_t SMEM_A_SIZE_PER_STAGE =
+        LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
+    constexpr uint32_t SMEM_B_SIZE_PER_STAGE =
+        LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
+    constexpr uint32_t SMEM_B_PACKED_SIZE_PER_STAGE =
+        LOAD_BLOCK_N * (BLOCK_K / 2) * sizeof(b_packed_dtype_t);
+    constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE =
+        math::constexpr_align<uint32_t>(
+            kNumL2SFAPerBlockK * BLOCK_M * sizeof(float), 128u);
+    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE =
+        math::constexpr_align<uint32_t>(
+            LOAD_BLOCK_N * sizeof(uint32_t), 128u);
+
+    auto smem_base = context->smem_base;
+    auto smem_gemm_base = math::advance_ptr(
+        smem_base, SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE);
+    auto smem_a = utils::PatternVisitor([=](const uint32_t i) {
+        return math::advance_ptr<a_dtype_t>(
+            smem_gemm_base,
+            SMEM_CD_SIZE + SMEM_AMAX_SCRATCH_SIZE +
+                i * SMEM_A_SIZE_PER_STAGE);
+    });
+    auto smem_b_packed = utils::PatternVisitor([=](const uint32_t i) {
+        return math::advance_ptr<b_packed_dtype_t>(
+            smem_gemm_base,
+            SMEM_CD_SIZE + SMEM_AMAX_SCRATCH_SIZE +
+                kNumStages *
+                    (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE) +
+                i * SMEM_B_PACKED_SIZE_PER_STAGE);
+    });
+    auto sf_start_ptr = math::advance_ptr<uint8_t>(
+        smem_gemm_base,
+        SMEM_CD_SIZE + SMEM_AMAX_SCRATCH_SIZE +
+            kNumStages *
+                (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE +
+                 SMEM_B_PACKED_SIZE_PER_STAGE));
+    auto smem_sfa = utils::PatternVisitor([=](const uint32_t i) {
+        return reinterpret_cast<float*>(
+            sf_start_ptr + i * SMEM_SFA_SIZE_PER_STAGE);
+    });
+    auto sfb_start_ptr =
+        sf_start_ptr + kNumStages * SMEM_SFA_SIZE_PER_STAGE;
+    auto smem_sfb = utils::PatternVisitor([=](const uint32_t i) {
+        return reinterpret_cast<uint32_t*>(
+            sfb_start_ptr + i * SMEM_SFB_SIZE_PER_STAGE);
+    });
+    constexpr uint32_t kNumDecodeFullBarriers =
+        kUseEarlyBDecode ? kNumStages : 0;
+    constexpr uint32_t kNumDecodeDoneBarriers =
+        kUseDecodeDoneMBarrier ? kNumStages : 0;
+    auto barrier_start_ptr = reinterpret_cast<Barrier*>(
+        sfb_start_ptr + kNumStages * SMEM_SFB_SIZE_PER_STAGE);
+    auto full_barriers = utils::PatternVisitor([=](const uint32_t i) {
+        return barrier_start_ptr + kNumDispatchWarps + i;
+    });
+    auto decode_full_barriers = utils::PatternVisitor([=](const uint32_t i) {
+        return barrier_start_ptr + kNumDispatchWarps + kNumStages + i;
+    });
+    auto empty_barriers = utils::PatternVisitor([=](const uint32_t i) {
+        return barrier_start_ptr + kNumDispatchWarps + kNumStages +
+            kNumDecodeFullBarriers + kNumDecodeDoneBarriers + i;
+    });
+
+    const auto workspace = layout::SM90Workspace(
+        context->workspace_base, kNumRanks, kNumExperts,
+        kNumMaxTokensPerRank, kNumTopk);
+    auto scheduler = sched::MegaMoEScheduler<
+        BLOCK_M, BLOCK_N, BLOCK_K,
+        kIntermediateHidden * 2, kHidden,
+        kHidden, kIntermediateHidden,
+        kNumExpertsPerRank, kNumExpertsPerWave,
+        kNumSMs, kNumRanks,
+        kNumExpertsPerLane, kNumL1BlockNs, kNumL2BlockNs,
+        kNumL1BlockKs, kNumL2BlockKs,
+        layout::SM90Workspace, (kNumTopk >= 8)>(
+            workspace, context->kernel_launch_epoch, context->rank_idx);
+
+    const uint32_t lane_idx = ptx::get_lane_idx();
+    uint32_t stage_idx = 0;
+    uint32_t phase = 0;
+    const uint32_t* cached_recv_counts =
+        reinterpret_cast<const uint32_t*>(smem_base);
+    sm90_fp8_fp4_mega_moe_for_each_cached_block<
+        kNumExpertsPerRank, kNumExpertsPerLane,
+        kNumL1BlockKs, kNumL2BlockKs>(
+        scheduler,
+        [&](const sched::BlockPhase block_phase,
+            const uint32_t local_expert_idx,
+            const uint32_t num_k_blocks,
+            const uint32_t m_block_idx,
+            const uint32_t n_block_idx) {
+            const auto tensor_map_a_ptr =
+                block_phase == sched::BlockPhase::Linear2
+                    ? context->tensor_map_l2_acts
+                    : context->tensor_map_l1_acts;
+            const auto tensor_map_sfa_ptr =
+                block_phase == sched::BlockPhase::Linear2
+                    ? context->tensor_map_l2_acts_sf
+                    : context->tensor_map_l1_acts_sf;
+            const auto tensor_map_b_ptr =
+                block_phase == sched::BlockPhase::Linear2
+                    ? context->tensor_map_l2_weights
+                    : context->tensor_map_l1_weights;
+            const uint32_t shape_n =
+                block_phase == sched::BlockPhase::Linear2
+                    ? kHidden : kIntermediateHidden * 2;
+            const uint32_t pool_block_idx =
+                scheduler.get_current_pool_block_offset() + m_block_idx;
+
+            if (block_phase == sched::BlockPhase::Linear1) {
+                const auto ptr =
+                    workspace.get_l1_arrival_count_ptr(pool_block_idx);
+                const auto expected = scheduler.template get_valid_m<false>();
+                while (ptx::ld_acq(ptr) != expected);
+            } else if constexpr (kL2ArrivalCounter) {
+                const auto ptr = reinterpret_cast<const uint32_t*>(
+                    workspace.get_l2_arrival_mask_ptr(pool_block_idx));
+                const uint32_t expected =
+                    kNumL1BlockNs * kNumEpilogueWarpgroups;
+                while (ptx::ld_acq(ptr) != expected);
+            } else {
+                const auto ptr =
+                    workspace.get_l2_arrival_mask_ptr(pool_block_idx);
+                const uint64_t expected = kNumL1BlockNs >= 64
+                    ? ~0ull : ((1ull << kNumL1BlockNs) - 1ull);
+                while (ptx::ld_acq_gpu(ptr) != expected);
+            }
+
+            for (uint32_t k_block_idx = 0;
+                 k_block_idx < num_k_blocks; ++k_block_idx) {
+                empty_barriers[stage_idx]->wait(phase ^ 1);
+                if (cute::elect_one_sync()) {
+                    const uint32_t ring_block_idx =
+                        block_phase == sched::BlockPhase::Linear1
+                            ? get_l1_ring_block_idx(pool_block_idx)
+                            : get_l2_ring_block_idx(pool_block_idx);
+                    const uint32_t m_idx = ring_block_idx * BLOCK_M;
+                    const uint32_t sfa_m_idx = ring_block_idx * SF_BLOCK_M;
+                    const uint32_t k_idx = k_block_idx * BLOCK_K;
+                    tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
+                        tensor_map_a_ptr, full_barriers[stage_idx],
+                        smem_a[stage_idx], k_idx, m_idx, 1);
+
+                    const uint32_t n_idx =
+                        local_expert_idx * shape_n + n_block_idx * BLOCK_N;
+                    const uint32_t k_idx_packed =
+                        k_block_idx * (BLOCK_K / 2);
+                    auto b_full_barrier = kUseEarlyBDecode
+                        ? decode_full_barriers[stage_idx]
+                        : full_barriers[stage_idx];
+                    tma::copy<BLOCK_K / 2, LOAD_BLOCK_N,
+                              kSwizzleBPackedMode, b_packed_dtype_t>(
+                        tensor_map_b_ptr, b_full_barrier,
+                        smem_b_packed[stage_idx], k_idx_packed, n_idx, 1);
+
+                    if (block_phase == sched::BlockPhase::Linear1) {
+                        tma::copy<BLOCK_M, 1, 0, float>(
+                            tensor_map_sfa_ptr, full_barriers[stage_idx],
+                            smem_sfa[stage_idx], sfa_m_idx, k_block_idx, 1);
+                    } else {
+                        #pragma unroll
+                        for (uint32_t sf_group = 0;
+                             sf_group < kNumL2SFAPerBlockK; ++sf_group) {
+                            tma::copy<BLOCK_M, 1, 0, float>(
+                                tensor_map_sfa_ptr,
+                                full_barriers[stage_idx],
+                                smem_sfa[stage_idx] + sf_group * BLOCK_M,
+                                sfa_m_idx,
+                                k_block_idx * kNumL2SFAPerBlockK + sf_group,
+                                1);
+                        }
+                    }
+                }
+                __syncwarp();
+
+                const bool is_l1 =
+                    block_phase == sched::BlockPhase::Linear1;
+                const uint32_t* sfb_base = is_l1
+                    ? context->l1_weights_sf : context->l2_weights_sf;
+                constexpr uint32_t kL1SFBKWords = kHidden / 128;
+                constexpr uint32_t kL2SFBKWords =
+                    kIntermediateHidden / 128;
+                constexpr uint32_t kL1SFBPerExpert =
+                    (kIntermediateHidden * 2) * kL1SFBKWords;
+                constexpr uint32_t kL2SFBPerExpert =
+                    kHidden * kL2SFBKWords;
+                const uint32_t sfb_per_expert = is_l1
+                    ? kL1SFBPerExpert : kL2SFBPerExpert;
+                const uint32_t sfb_k_words = is_l1
+                    ? kL1SFBKWords : kL2SFBKWords;
+                #pragma unroll
+                for (uint32_t row = lane_idx; row < LOAD_BLOCK_N;
+                     row += 32) {
+                    const uint32_t n_global =
+                        n_block_idx * BLOCK_N + row;
+                    smem_sfb[stage_idx][row] = __ldg(
+                        sfb_base + local_expert_idx * sfb_per_expert +
+                        n_global * sfb_k_words + k_block_idx);
+                }
+                __syncwarp();
+
+                if (cute::elect_one_sync()) {
+                    const uint32_t sfa_bytes = is_l1
+                        ? BLOCK_M * static_cast<uint32_t>(sizeof(float))
+                        : kNumL2SFAPerBlockK * BLOCK_M *
+                              static_cast<uint32_t>(sizeof(float));
+                    if constexpr (kUseEarlyBDecode) {
+                        decode_full_barriers[stage_idx]->arrive_and_expect_tx(
+                            SMEM_B_PACKED_SIZE_PER_STAGE);
+                        full_barriers[stage_idx]->arrive_and_expect_tx(
+                            SMEM_A_SIZE_PER_STAGE + sfa_bytes);
+                    } else {
+                        full_barriers[stage_idx]->arrive_and_expect_tx(
+                            SMEM_A_SIZE_PER_STAGE + sfa_bytes +
+                            SMEM_B_PACKED_SIZE_PER_STAGE);
+                    }
+                }
+                __syncwarp();
+
+                stage_idx = stage_idx == kNumStages - 1 ? 0 : stage_idx + 1;
+                phase ^= stage_idx == 0;
+            }
+        },
+        cached_recv_counts);
+}
+#endif
+
 // ============================================================================
 // SM90 (Hopper) FP8 x FP4 MegaMoE - software-dequant path.
 // ----------------------------------------------------------------------------
@@ -874,6 +1236,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     auto combine_barriers = utils::PatternVisitor([=](const uint32_t& i) {
         return barrier_start_ptr + kNumDispatchWarps + kNumStages + kNumDecodeFullBarriers + kNumDecodeDoneBarriers + kNumStages + i;
     });
+#ifdef DG_MEGA_MOE_FP4_LOADER_CONTEXT
+    auto loader_context = reinterpret_cast<SM90FP4MegaMoELoaderContext*>(
+        barrier_start_ptr + kNumDispatchWarps + kNumStages +
+        kNumDecodeFullBarriers + kNumDecodeDoneBarriers + kNumStages +
+        kNumEpilogueWarps * 2);
+#endif
 
     // =====================================================================
     // Initialization
@@ -2177,6 +2545,44 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
         cache_expert_recv_counts();
 
+#ifdef DG_MEGA_MOE_FP4_LOADER_CONTEXT
+        DG_STATIC_ASSERT(kFirstFP4DecodeAssistWarp >= 2,
+                         "Context loader does not participate in FP4 decode");
+        if (lane_idx == 0) {
+            loader_context->workspace_base = sym_buffer.get_base_ptr();
+            loader_context->kernel_launch_epoch = kernel_launch_epoch;
+            loader_context->rank_idx = sym_buffer.rank_idx;
+            loader_context->reserved = 0;
+            loader_context->tensor_map_l1_acts = &tensor_map_l1_acts;
+            loader_context->tensor_map_l1_acts_sf = &tensor_map_l1_acts_sf;
+            loader_context->tensor_map_l1_weights = &tensor_map_l1_weights;
+            loader_context->tensor_map_l2_acts = &tensor_map_l2_acts;
+            loader_context->tensor_map_l2_acts_sf = &tensor_map_l2_acts_sf;
+            loader_context->tensor_map_l2_weights = &tensor_map_l2_weights;
+            loader_context->l1_weights_sf = l1_weights_sf;
+            loader_context->l2_weights_sf = l2_weights_sf;
+            loader_context->smem_base = smem_buffer;
+        }
+        __syncwarp();
+        sm90_fp8_fp4_mega_moe_loader<
+            kNumMaxTokensPerRank,
+            kHidden, kIntermediateHidden,
+            kNumExperts, kNumTopk,
+            kNumExpertsPerWave,
+            BLOCK_M, BLOCK_N, BLOCK_K,
+            kNumMaxPoolTokens,
+            kNumL1RingTokens, kNumL2RingTokens,
+            kNumStages,
+            kNumDispatchWarps,
+            kNumEpilogueWarps,
+            kNumEpilogueWarpgroups,
+            kNumSMs, kNumRanks,
+            kUseEarlyBDecode,
+            kUseDecodeDoneMBarrier,
+            kL2ArrivalCounter,
+            kFP4SwapAB,
+            kFP4SwapABFastAmax>(loader_context);
+#else
         sm90_fp8_fp4_mega_moe_for_each_cached_block<
             kNumExpertsPerRank, kNumExpertsPerLane, L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K>(
             scheduler, [&](const sched::BlockPhase& block_phase,
@@ -2322,6 +2728,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 }
             }
         }, cached_recv_counts);
+#endif
 
     } else if (warp_idx == kNumDispatchWarps + 1) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
