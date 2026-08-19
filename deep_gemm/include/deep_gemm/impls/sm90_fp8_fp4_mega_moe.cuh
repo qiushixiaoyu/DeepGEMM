@@ -1033,12 +1033,13 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // regular N=128 path.
     constexpr uint32_t kNumDispatchRegisters    = 48;
     constexpr uint32_t kNumNonEpilogueRegisters = 40;
-    // Four M64xN128 WGs leave 104 registers/thread after reserving the
-    // dispatch and decode-assist roles (64000 registers/CTA in total).  SS
+    // With only two decode-assist warps, four M64xN128 WGs can retain the
+    // same 112-register dynamic allocation used by the FP8 2x2 tile (62976
+    // registers/CTA in total).  SS
     // N-splitting keeps the transient WGMMA accumulator at 32 floats while
     // the final M64xN128 accumulation remains unchanged.
     constexpr uint32_t kNumEpilogueRegisters =
-        kSplitMNWarpgroups ? 104 : (kSplitNWarpgroups ? 160 : 208);
+        kSplitMNWarpgroups ? 112 : (kSplitNWarpgroups ? 160 : 208);
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
                      kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,

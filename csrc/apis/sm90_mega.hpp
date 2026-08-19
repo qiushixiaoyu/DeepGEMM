@@ -141,8 +141,13 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
         fp4_shared_decode_assist_shape_band or
         (expected_tokens_per_expert >= 1.0f and expected_tokens_per_expert < 2.0f) or
         fp4_pro_two_tokens_per_expert_shape_band;
+    // The large-token M128xN256 specialization has four math WGs.  Keep the
+    // CTA at 640 threads (matching FP8) by retaining only two non-epilogue
+    // warps and let the first math WG contribute four decode warps.  This
+    // raises the launch-bounds register ceiling while preserving 192 decode
+    // workers in total.
     const bool math_wg_participates_in_decode =
-        !default_math_wg_decode;
+        fp4_2wg_decode_offload_shape_band or !default_math_wg_decode;
     const bool default_skip_loader_decode_assist =
         fp4_shared_decode_assist_shape_band or
         fp4_pro_single_token_per_expert_shape_band or
@@ -193,7 +198,8 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     return {
         math_wg_participates_in_decode,
         math_wg_participates_in_decode ? 4 : 0,
-        default_skip_loader_decode_assist ? 2 : 0,
+        fp4_2wg_decode_offload_shape_band ? 0 :
+            (default_skip_loader_decode_assist ? 2 : 0),
         default_wide_load_decode,
         default_ss_early_b_decode,
         default_decode_done_mbarrier,

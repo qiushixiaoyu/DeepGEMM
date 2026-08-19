@@ -549,10 +549,11 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const int num_dispatch_threads = default_num_dispatch_threads;
     DG_HOST_ASSERT(num_dispatch_threads == 64 or num_dispatch_threads == 128);
     const int default_num_non_epilogue_threads =
-        fp4_split_n_decode_thread_kernel_band ? 320 :
-        (fp4_decode_assist_thread_kernel_band ? 192 : 128);
+        fp4_large_2d_tile_kernel_band ? 64 :
+        (fp4_split_n_decode_thread_kernel_band ? 320 :
+         (fp4_decode_assist_thread_kernel_band ? 192 : 128));
     const int num_non_epilogue_threads = default_num_non_epilogue_threads;
-    DG_HOST_ASSERT(num_non_epilogue_threads >= 128 and
+    DG_HOST_ASSERT(num_non_epilogue_threads >= 64 and
                    num_non_epilogue_threads % 64 == 0);
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);
 
