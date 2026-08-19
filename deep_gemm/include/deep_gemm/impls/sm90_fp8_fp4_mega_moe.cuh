@@ -1081,11 +1081,13 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     };
     auto decode_fp4_b_stage = [&](const uint32_t& cur_stage_idx,
                                   const uint32_t& decode_thread_idx) {
+#ifndef DG_MEGA_MOE_FP4_PROBE_NO_DECODE
         dequant_fp4_b_tile_to_e4m3_smem_dispatch<
             LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
             kUseWideLoadDecode>(
             decode_thread_idx, kNumFP4DecodeWorkerThreads,
             smem_b_packed[cur_stage_idx], smem_b[cur_stage_idx], smem_sfb[cur_stage_idx]);
+#endif
         arrive_or_sync_fp4_decode_done(cur_stage_idx);
     };
 
