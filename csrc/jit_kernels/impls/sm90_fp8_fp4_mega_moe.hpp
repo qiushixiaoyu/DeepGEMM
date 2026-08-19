@@ -278,7 +278,7 @@ static void sm90_fp8_fp4_mega_moe(
     // must use byte-addressable packed FP4 storage (1 byte = 2 nibbles).
     DG_HOST_ASSERT(l1_weights_sf.scalar_type() == torch::kInt);
     DG_HOST_ASSERT(l2_weights_sf.scalar_type() == torch::kInt);
-    DG_HOST_ASSERT(num_math_wg_decode_warps >= 0 and num_math_wg_decode_warps <= 4);
+    DG_HOST_ASSERT(num_math_wg_decode_warps >= 0 and num_math_wg_decode_warps <= 16);
     DG_HOST_ASSERT(math_wg_participates_in_fp4_decode or num_math_wg_decode_warps == 0);
     DG_HOST_ASSERT(first_fp4_decode_assist_warp >= 0 and first_fp4_decode_assist_warp <= 4);
 
