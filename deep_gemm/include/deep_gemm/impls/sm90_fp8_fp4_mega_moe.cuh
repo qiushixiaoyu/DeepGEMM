@@ -316,6 +316,66 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_dispatch(
     }
 }
 
+// Decode one complete local grouped weight tensor into row-major E4M3 global
+// storage.  One worker handles a complete K/32 scale group: one cached UE8M0
+// LUT lookup, one 16-byte packed load and two 16-byte decoded stores.  Group
+// indices are globally linear because every row contains a multiple of four
+// K/32 groups, eliminating row division/modulo from the hot loop.  The scale
+// is baked into the FP8 bytes exactly like the existing per-tile SMEM decoder,
+// so the GEMM still applies activation SFA only.
+template <
+    uint32_t kRows,
+    uint32_t kK,
+    uint32_t kNumThreads,
+    uint32_t kNumSMs>
+__device__ __forceinline__ void decode_fp4_weight_to_e4m3_global(
+    const uint32_t sm_idx,
+    const uint32_t thread_idx,
+    const uint32_t* __restrict__ packed,
+    const uint32_t* __restrict__ sfb,
+    uint64_t* __restrict__ decoded) {
+    DG_STATIC_ASSERT(kK % 128 == 0,
+                     "Global FP4 decode requires K divisible by 128");
+    constexpr uint64_t kTotalGroups =
+        static_cast<uint64_t>(kRows) * (kK / 32);
+    const uint64_t global_thread_idx =
+        static_cast<uint64_t>(sm_idx) * kNumThreads + thread_idx;
+    constexpr uint64_t kGridThreads =
+        static_cast<uint64_t>(kNumSMs) * kNumThreads;
+
+    const auto* packed_groups = reinterpret_cast<const uint4*>(packed);
+    auto* decoded_groups = reinterpret_cast<uint4*>(decoded);
+    for (uint64_t group_idx = global_thread_idx;
+         group_idx < kTotalGroups; group_idx += kGridThreads) {
+        const uint32_t sfb_word = __ldg(sfb + (group_idx >> 2));
+        const uint32_t e8m0 =
+            (sfb_word >> ((group_idx & 3u) * 8)) & 0xffu;
+        const uint64_t scaled_lut =
+            fp4_decode_detail::pack_scaled_e4m3_lut_from_e8m0_const(e8m0);
+        const uint32_t lut_lo = static_cast<uint32_t>(scaled_lut);
+        const uint32_t lut_hi = static_cast<uint32_t>(scaled_lut >> 32);
+        const uint4 packed32 = packed_groups[group_idx];
+        const uint32_t d0 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
+            packed32.x & 0xffffu, lut_lo, lut_hi);
+        const uint32_t d1 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
+            packed32.x >> 16, lut_lo, lut_hi);
+        const uint32_t d2 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
+            packed32.y & 0xffffu, lut_lo, lut_hi);
+        const uint32_t d3 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
+            packed32.y >> 16, lut_lo, lut_hi);
+        const uint32_t d4 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
+            packed32.z & 0xffffu, lut_lo, lut_hi);
+        const uint32_t d5 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
+            packed32.z >> 16, lut_lo, lut_hi);
+        const uint32_t d6 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
+            packed32.w & 0xffffu, lut_lo, lut_hi);
+        const uint32_t d7 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
+            packed32.w >> 16, lut_lo, lut_hi);
+        decoded_groups[group_idx * 2] = make_uint4(d0, d1, d2, d3);
+        decoded_groups[group_idx * 2 + 1] = make_uint4(d4, d5, d6, d7);
+    }
+}
+
 // ============================================================================
 // SM90 (Hopper) FP8 x FP4 MegaMoE - software-dequant path.
 // ----------------------------------------------------------------------------
@@ -358,6 +418,7 @@ template <
     bool kEarlyBDecode            = false,  // Overlap assist decode with A/SFA TMA
     bool kDecodeDoneMBarrier      = false,  // One-way decode-done mbarrier instead of rendezvous sync
     bool kL2ArrivalCounter        = false,  // Count ready L1 output slices instead of bitmask + CTA sync
+    bool kGlobalDecodeCache       = false,  // Decode the local layer once into SymmBuffer
     bool kFP4SSNSplit             = false,  // Split SS N=128 WGMMA into 2x N=64 to reduce accum pressure
     bool kFP4SwapAB               = false,  // weight@M, token@N for small-batch padding relief
     bool kFP4SwapABFastAmax       = false,  // Reuse L1 swapAB store lanes to publish per-token partial amax
@@ -382,11 +443,15 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
                            const uint32_t* __restrict__ l1_weights_sf,
+                           const uint32_t* __restrict__ l1_weights_packed,
+                           uint64_t* __restrict__ l1_weights_decoded,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_output,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
-                           const uint32_t* __restrict__ l2_weights_sf) {
+                           const uint32_t* __restrict__ l2_weights_sf,
+                           const uint32_t* __restrict__ l2_weights_packed,
+                           uint64_t* __restrict__ l2_weights_decoded) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900) and (__CUDA_ARCH__ < 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
@@ -405,7 +470,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // =====================================================================
     DG_STATIC_ASSERT(kNumDispatchThreads == 64 or kNumDispatchThreads == 128,
                      "Dispatch supports 2 or 4 warps");
-    DG_STATIC_ASSERT(kNumNonEpilogueThreads >= 128 and kNumNonEpilogueThreads % 64 == 0,
+    DG_STATIC_ASSERT(kNumNonEpilogueThreads >= 64 and kNumNonEpilogueThreads % 64 == 0,
                      "Invalid number of GEMM TMA/decode-assist warps");
     DG_STATIC_ASSERT((kNumDispatchThreads + kNumNonEpilogueThreads) % 128 == 0,
                      "Math warps must start on a warpgroup boundary");
@@ -444,6 +509,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                      "Math decode warp count requires math WG decode participation");
     DG_STATIC_ASSERT(kFirstFP4DecodeAssistWarp <= kNumMMANonEpilogueWarps,
                      "First FP4 decode assist warp is out of range");
+    DG_STATIC_ASSERT(not kGlobalDecodeCache or
+                         (not kEarlyBDecode and not kDecodeDoneMBarrier and
+                          not kMathWGParticipatesInFP4Decode and
+                          kNumMathWGDecodeWarps == 0),
+                     "Global decode cache must disable the per-tile decode pipeline");
     // =====================================================================
     // Thread / warp identification
     // =====================================================================
@@ -596,6 +666,21 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         kCombineStageRing, kNumCombineStageTokens,
         kNumExpertsPerRank, kNumRanks>(workspace);
 
+    // One-layer bounded decode cache.  Every FP4 launch uses the same two
+    // regions and the next layer overwrites them after the previous launch has
+    // completed on the stream.  Keep the regions in the layout even for a
+    // non-cache specialization so host and device slicing remain identical.
+    constexpr auto fp4_decoded_l1_weight_layout = SM90FP8FP4MegaMoEData(
+        2 * kIntermediateHidden * kHidden);
+    const auto fp4_decoded_l1_weight_buffer = SM90FP8FP4MegaMoEBuffer(
+        fp4_decoded_l1_weight_layout, kNumExpertsPerRank, 1,
+        combine_full_row_staging_buffer.get_end_ptr());
+    constexpr auto fp4_decoded_l2_weight_layout = SM90FP8FP4MegaMoEData(
+        kHidden * kIntermediateHidden);
+    const auto fp4_decoded_l2_weight_buffer = SM90FP8FP4MegaMoEBuffer(
+        fp4_decoded_l2_weight_layout, kNumExpertsPerRank, 1,
+        fp4_decoded_l1_weight_buffer.get_end_ptr());
+
     constexpr uint32_t kPhaseProfileMaxSMs =
         layout::kSM90MegaMoEProfileMaxSMs;
     constexpr uint32_t kPhaseProfileSlots =
@@ -604,7 +689,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         SM90FP8FP4MegaMoEData(
             kPhaseProfileSlots * sizeof(uint64_t), false),
         1, kPhaseProfileMaxSMs,
-        combine_full_row_staging_buffer.get_end_ptr());
+        fp4_decoded_l2_weight_buffer.get_end_ptr());
 
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
     DG_STATIC_ASSERT(kNumSMs <= kPhaseProfileMaxSMs,
@@ -653,21 +738,23 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // packs 2 nibbles (low nibble = lower-K element, high nibble = upper-K),
     // matching DSV4's TMA-friendly layout.
     using b_packed_dtype_t = int8_t;
-    // FP4 SS split-N infrastructure: when BLOCK_M=64 and BLOCK_N is a
-    // multiple of 128, the host heuristics may request
-    // `kNumEpilogueWarpgroups == BLOCK_N / 128 > 1` math warpgroups. In that
-    // mode every WG shares the same BLOCK_M rows and partitions the N
-    // columns, so each WG owns WG_BLOCK_N = BLOCK_N / num_wg columns. The
-    // packed-B / SFB / decoded-B SMEM tiles still cover the full LOAD_BLOCK_N
-    // because FP4 decode is shared across WGs (see comment on smem_b below);
-    // split-N only manifests in WGMMA descriptors and the L1/L2 epilogue.
+    // The cache-backed large-token specialization mirrors the FP8 M128xN256
+    // tile with four math WGs arranged as a 2x2 grid.  Each WG still owns an
+    // M64xN128 WGMMA tile, so its accumulator footprint is unchanged.  The
+    // existing M64 split-N path remains available to non-cache small shapes.
+    constexpr bool kSplitMNWarpgroups =
+        kGlobalDecodeCache and BLOCK_M == 128 and BLOCK_N == 256 and
+        kNumEpilogueWarpgroups == 4;
     constexpr bool kSplitNWarpgroups =
         BLOCK_M == 64 and
         kNumEpilogueWarpgroups > 1 and
         BLOCK_N % kNumEpilogueWarpgroups == 0 and
         (BLOCK_N / kNumEpilogueWarpgroups) >= 64;
-    constexpr uint32_t kWarpgroupSplitM = kSplitNWarpgroups ? 1u : kNumEpilogueWarpgroups;
-    constexpr uint32_t kWarpgroupSplitN = kSplitNWarpgroups ? kNumEpilogueWarpgroups : 1u;
+    constexpr uint32_t kWarpgroupSplitM = kSplitMNWarpgroups ? 2u :
+        (kSplitNWarpgroups ? 1u : kNumEpilogueWarpgroups);
+    constexpr uint32_t kWarpgroupSplitN = kSplitMNWarpgroups ? 2u :
+        (kSplitNWarpgroups ? kNumEpilogueWarpgroups : 1u);
+    constexpr bool kHasNSplit = kWarpgroupSplitN > 1;
     constexpr uint32_t WG_BLOCK_M = BLOCK_M / kWarpgroupSplitM;
     constexpr uint32_t WG_BLOCK_N = BLOCK_N / kWarpgroupSplitN;
     constexpr bool kSwapABEligible =
@@ -704,9 +791,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // In the split-N=2, BLOCK_N=128 path each WG produces only
     // WG_L1_OUT_BLOCK_N post-SwiGLU columns. WG0 issues one combined 64-column
     // TMA store after both WGs reduce amax, matching the 64-column SF block.
-    constexpr bool kSplitNCombinesL1Store = kSplitNWarpgroups and (WG_L1_OUT_BLOCK_N < 64);
-    constexpr bool kSplitNSharesSF = kSplitNWarpgroups and (WG_L1_OUT_BLOCK_N < kL2ActsSFGranK);
-    DG_STATIC_ASSERT(not kSplitNSharesSF or kSplitNWarpgroups,
+    constexpr bool kSplitNCombinesL1Store = kHasNSplit and (WG_L1_OUT_BLOCK_N < 64);
+    constexpr bool kSplitNSharesSF = kHasNSplit and (WG_L1_OUT_BLOCK_N < kL2ActsSFGranK);
+    DG_STATIC_ASSERT(not kSplitNSharesSF or kHasNSplit,
                      "share-SF only meaningful under split-N");
     DG_STATIC_ASSERT(not kSplitNSharesSF or (kWarpgroupSplitN == 2),
                      "share-SF currently only supports split-N=2");
@@ -743,7 +830,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE =
         LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
     // Packed FP4 source tile (TMA-loaded raw nibbles)
-    constexpr uint32_t SMEM_B_PACKED_SIZE_PER_STAGE = LOAD_BLOCK_N * (BLOCK_K / 2) * sizeof(b_packed_dtype_t);
+    constexpr uint32_t SMEM_B_PACKED_SIZE_PER_STAGE = kGlobalDecodeCache ? 0 :
+        LOAD_BLOCK_N * (BLOCK_K / 2) * sizeof(b_packed_dtype_t);
     // SFA per-stage must be sized for the larger of L1 (BLOCK_M floats) and
     // L2 (2*BLOCK_M floats per-64, or 4*BLOCK_M floats per-32 with BLOCK_N=64).
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE =
@@ -751,7 +839,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // SFB UE8M0 per-32: the decode-to-SMEM path stages one packed uint32 per
     // N row per BLOCK_K in SMEM. Each word contains the 4 K/32 scale bytes, so
     // dequant avoids reloading the same word once per K group.
-    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE =
+    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = kGlobalDecodeCache ? 0 :
         math::constexpr_align<uint32_t>(LOAD_BLOCK_N * sizeof(uint32_t), 128u);
 
     // CD output: max of L1 FP8 (BLOCK_M * (BLOCK_N/2) * 1 byte) and
@@ -963,6 +1051,26 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         __syncthreads();
     }
 
+    if constexpr (kGlobalDecodeCache) {
+        constexpr uint32_t kL1WeightRows =
+            kNumExpertsPerRank * 2 * kIntermediateHidden;
+        constexpr uint32_t kL2WeightRows =
+            kNumExpertsPerRank * kHidden;
+        decode_fp4_weight_to_e4m3_global<
+            kL1WeightRows, kHidden, kNumThreads, kNumSMs>(
+                sm_idx, thread_idx, l1_weights_packed, l1_weights_sf,
+                l1_weights_decoded);
+        decode_fp4_weight_to_e4m3_global<
+            kL2WeightRows, kIntermediateHidden, kNumThreads, kNumSMs>(
+                sm_idx, thread_idx, l2_weights_packed, l2_weights_sf,
+                l2_weights_decoded);
+
+        __threadfence();
+        comm::grid_sync<kNumSMs, 3>(
+            workspace, sm_idx, thread_idx,
+            [&]() { __syncthreads(); });
+    }
+
     // =====================================================================
     // Scheduler
     // =====================================================================
@@ -1031,7 +1139,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // regular N=128 path.
     constexpr uint32_t kNumDispatchRegisters    = 48;
     constexpr uint32_t kNumNonEpilogueRegisters = 40;
-    constexpr uint32_t kNumEpilogueRegisters    = kSplitNWarpgroups ? 160 : 208;
+    constexpr uint32_t kNumEpilogueRegisters =
+        kSplitMNWarpgroups ? 112 : (kSplitNWarpgroups ? 160 : 208);
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
                      kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
@@ -2233,13 +2342,24 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx],
                         k_idx, m_idx, 1);
 
-                    // Merged B loader: issue the packed-FP4 weight TMA from
-                    // this warp too, freeing loader warp 1 for the publisher.
+                    // Merged B loader: the cache specialization loads decoded
+                    // E4M3 directly; the regular specialization loads packed
+                    // FP4 for the per-tile software decoder.  Both keep warp 1
+                    // free for the publisher.
                     // Producer arrivals for the merged path are deferred until
                     // after the SFB shared-memory writes below: SFB does not
                     // ride the TMA tx count, so an early arrival would let a
                     // consumer read stale scale factors.
-                    {
+                    if constexpr (kGlobalDecodeCache) {
+                        const uint32_t n_idx =
+                            local_expert_idx * shape_n +
+                            n_block_idx * BLOCK_N;
+                        tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode,
+                                  b_dtype_t>(
+                            tensor_map_b_ptr, full_barriers[stage_idx],
+                            smem_b[stage_idx], k_block_idx * BLOCK_K,
+                            n_idx, 1);
+                    } else {
                         const uint32_t n_idx =
                             local_expert_idx * shape_n + n_block_idx * BLOCK_N;
                         const uint32_t k_idx_packed = k_block_idx * (BLOCK_K / 2);
@@ -2276,7 +2396,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
                 // Merged SFB load: the whole warp cooperates (one UE8M0 word
                 // per N row), exactly as loader warp 1 used to.
-                {
+                if constexpr (not kGlobalDecodeCache) {
                     const bool is_l1 = block_phase == sched::BlockPhase::Linear1;
                     const uint32_t* sfb_base = is_l1 ? l1_weights_sf : l2_weights_sf;
                     const uint32_t sfb_per_expert = is_l1 ? kL1SFBPerExpert : kL2SFBPerExpert;
@@ -2301,7 +2421,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             ? BLOCK_M * static_cast<uint32_t>(sizeof(float))
                             : kNumL2SFAPerBlockK * BLOCK_M *
                                   static_cast<uint32_t>(sizeof(float));
-                    if constexpr (kUseEarlyBDecode) {
+                    if constexpr (kGlobalDecodeCache) {
+                        full_barriers[stage_idx]->arrive_and_expect_tx(
+                            SMEM_A_SIZE_PER_STAGE + sfa_bytes +
+                            SMEM_B_SIZE_PER_STAGE);
+                    } else if constexpr (kUseEarlyBDecode) {
                         decode_full_barriers[stage_idx]->arrive_and_expect_tx(
                             SMEM_B_PACKED_SIZE_PER_STAGE);
                         full_barriers[stage_idx]->arrive_and_expect_tx(
@@ -2314,7 +2438,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
 
-                if constexpr (kFirstFP4DecodeAssistWarp == 0) {
+                if constexpr (not kGlobalDecodeCache and
+                              kFirstFP4DecodeAssistWarp == 0) {
                     const uint32_t decode_thread_idx =
                         (warp_idx - kNumDispatchWarps) * 32 + lane_idx;
                     wait_fp4_decode_input_ready(stage_idx, phase);
@@ -2588,7 +2713,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
         cache_expert_recv_counts();
 
-        {
+        if constexpr (not kGlobalDecodeCache) {
             const uint32_t non_epilogue_warp_idx = warp_idx - kNumDispatchWarps;
             if (non_epilogue_warp_idx >= kFirstFP4DecodeAssistWarp) {
                 const uint32_t decode_thread_idx =
@@ -2714,7 +2839,154 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             constexpr uint32_t kSSHalfAccum = SSHalfWGMMA::kNumAccum;
             constexpr uint32_t kSSAccum = kSSNSplitActive ? kSSHalfAccum : kAccumPerThread;
             float final_accum[kAccumPerThread] = {};
-            {
+            if constexpr (kGlobalDecodeCache) {
+                // The decoded cache already has every FP4 weight scale baked
+                // into its E4M3 byte.  Reuse the FP8 hot-path accumulator
+                // strategy: WGMMA accumulates directly into final_accum and
+                // only the activation scale basis is changed between K
+                // groups.  This removes the per-K temporary accumulator,
+                // wait/promote/add loop used by the tile decoder path.
+                auto rescale_final = [&](const float& prev_scale_0,
+                                         const float& prev_scale_1,
+                                         const float& scale_0,
+                                         const float& scale_1) {
+                    const float ratio_0 = prev_scale_0 *
+                        (kFastMath ? math::fast_rcp(scale_0) : 1.0f / scale_0);
+                    const float ratio_1 = prev_scale_1 *
+                        (kFastMath ? math::fast_rcp(scale_1) : 1.0f / scale_1);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                        final_accum[i * 4 + 0] *= ratio_0;
+                        final_accum[i * 4 + 1] *= ratio_0;
+                        final_accum[i * 4 + 2] *= ratio_1;
+                        final_accum[i * 4 + 3] *= ratio_1;
+                    }
+                };
+                auto postscale_final = [&](const float& scale_0,
+                                           const float& scale_1) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                        final_accum[i * 4 + 0] *= scale_0;
+                        final_accum[i * 4 + 1] *= scale_0;
+                        final_accum[i * 4 + 2] *= scale_1;
+                        final_accum[i * 4 + 3] *= scale_1;
+                    }
+                };
+
+                float prev_scale_0 = 1.0f;
+                float prev_scale_1 = 1.0f;
+                for (uint32_t k_block_idx = 0;
+                     k_block_idx < num_k_blocks;
+                     advance_pipeline(k_block_idx)) {
+                    full_barriers[stage_idx]->wait(phase);
+
+                    if (block_phase == sched::BlockPhase::Linear1) {
+                        const float scale_0 = ptx::ld_shared(
+                            smem_sfa[stage_idx] + wg_m_offset + r_0);
+                        const float scale_1 = ptx::ld_shared(
+                            smem_sfa[stage_idx] + wg_m_offset + r_1);
+                        if (k_block_idx != 0)
+                            rescale_final(prev_scale_0, prev_scale_1,
+                                          scale_0, scale_1);
+
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            ptx::warpgroup_fence_operand(final_accum[i]);
+                        ptx::warpgroup_arrive();
+                        #pragma unroll
+                        for (uint32_t k = 0;
+                             k < BLOCK_K / WGMMA::K; ++ k) {
+                            auto desc_a = mma::sm90::make_smem_desc(
+                                smem_a[stage_idx] + smem_a_wg_offset +
+                                k * WGMMA::K, 1);
+                            auto desc_b = mma::sm90::make_smem_desc(
+                                smem_b[stage_idx] + smem_b_wg_offset +
+                                k * WGMMA::K, 1);
+                            WGMMA::wgmma(
+                                desc_a, desc_b, final_accum, true);
+                        }
+                        ptx::warpgroup_commit_batch();
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            ptx::warpgroup_fence_operand(final_accum[i]);
+                        ptx::warpgroup_wait<0>();
+
+                        if (lane_idx == 0)
+                            empty_barriers[stage_idx]->arrive();
+                        prev_scale_0 = scale_0;
+                        prev_scale_1 = scale_1;
+                    } else {
+                        const float scale_0_lo = ptx::ld_shared(
+                            smem_sfa[stage_idx] + wg_m_offset + r_0);
+                        const float scale_1_lo = ptx::ld_shared(
+                            smem_sfa[stage_idx] + wg_m_offset + r_1);
+                        const float scale_0_hi = ptx::ld_shared(
+                            smem_sfa[stage_idx] + BLOCK_M +
+                            wg_m_offset + r_0);
+                        const float scale_1_hi = ptx::ld_shared(
+                            smem_sfa[stage_idx] + BLOCK_M +
+                            wg_m_offset + r_1);
+                        if (k_block_idx != 0)
+                            rescale_final(prev_scale_0, prev_scale_1,
+                                          scale_0_lo, scale_1_lo);
+
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            ptx::warpgroup_fence_operand(final_accum[i]);
+                        ptx::warpgroup_arrive();
+                        #pragma unroll
+                        for (uint32_t k = 0;
+                             k < (BLOCK_K / 2) / WGMMA::K; ++ k) {
+                            auto desc_a = mma::sm90::make_smem_desc(
+                                smem_a[stage_idx] + smem_a_wg_offset +
+                                k * WGMMA::K, 1);
+                            auto desc_b = mma::sm90::make_smem_desc(
+                                smem_b[stage_idx] + smem_b_wg_offset +
+                                k * WGMMA::K, 1);
+                            WGMMA::wgmma(
+                                desc_a, desc_b, final_accum, true);
+                        }
+                        ptx::warpgroup_commit_batch();
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            ptx::warpgroup_fence_operand(final_accum[i]);
+                        ptx::warpgroup_wait<0>();
+
+                        rescale_final(scale_0_lo, scale_1_lo,
+                                      scale_0_hi, scale_1_hi);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            ptx::warpgroup_fence_operand(final_accum[i]);
+                        ptx::warpgroup_arrive();
+                        #pragma unroll
+                        for (uint32_t k = 0;
+                             k < (BLOCK_K / 2) / WGMMA::K; ++ k) {
+                            const uint32_t k_offset =
+                                BLOCK_K / 2 + k * WGMMA::K;
+                            auto desc_a = mma::sm90::make_smem_desc(
+                                smem_a[stage_idx] + smem_a_wg_offset +
+                                k_offset, 1);
+                            auto desc_b = mma::sm90::make_smem_desc(
+                                smem_b[stage_idx] + smem_b_wg_offset +
+                                k_offset, 1);
+                            WGMMA::wgmma(
+                                desc_a, desc_b, final_accum, true);
+                        }
+                        ptx::warpgroup_commit_batch();
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            ptx::warpgroup_fence_operand(final_accum[i]);
+                        ptx::warpgroup_wait<0>();
+
+                        if (lane_idx == 0)
+                            empty_barriers[stage_idx]->arrive();
+                        prev_scale_0 = scale_0_hi;
+                        prev_scale_1 = scale_1_hi;
+                    }
+                }
+                if (num_k_blocks != 0)
+                    postscale_final(prev_scale_0, prev_scale_1);
+            } else {
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 full_barriers[stage_idx]->wait(phase);
 
@@ -2745,32 +3017,34 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 // is partitioned over the assist threads plus the
                 // epilogue/math threads, then all participants rendezvous
                 // before WGMMA reads the decoded shared tile.
-                if constexpr (kUseEarlyBDecode)
-                    wait_fp4_decode_input_ready(stage_idx, phase);
-                const bool math_warp_decodes =
-                    epilogue_warp_idx < kNumMathWGDecodeWarps;
-                if constexpr (kNumMathWGDecodeWarps > 0) {
-                    if (math_warp_decodes) {
-                        const uint32_t decode_thread_idx =
-                            kNumFP4DecodeAssistThreads + epilogue_thread_idx;
-                        dequant_fp4_b_tile_to_e4m3_smem_dispatch<
-                            LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
-                            kUseWideLoadDecode>(
-                            decode_thread_idx, kNumFP4DecodeWorkerThreads,
-                            smem_b_packed[stage_idx], smem_b[stage_idx], smem_sfb[stage_idx]);
+                if constexpr (not kGlobalDecodeCache) {
+                    if constexpr (kUseEarlyBDecode)
+                        wait_fp4_decode_input_ready(stage_idx, phase);
+                    const bool math_warp_decodes =
+                        epilogue_warp_idx < kNumMathWGDecodeWarps;
+                    if constexpr (kNumMathWGDecodeWarps > 0) {
+                        if (math_warp_decodes) {
+                            const uint32_t decode_thread_idx =
+                                kNumFP4DecodeAssistThreads + epilogue_thread_idx;
+                            dequant_fp4_b_tile_to_e4m3_smem_dispatch<
+                                LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
+                                kUseWideLoadDecode>(
+                                decode_thread_idx, kNumFP4DecodeWorkerThreads,
+                                smem_b_packed[stage_idx], smem_b[stage_idx], smem_sfb[stage_idx]);
+                        }
                     }
-                }
-                if constexpr (kNumMathWGDecodeWarps > 0) {
-                    if (math_warp_decodes)
-                        arrive_or_sync_fp4_decode_done(stage_idx);
-                    if constexpr (kUseDecodeDoneMBarrier) {
-                        wait_fp4_decode_done(stage_idx, phase);
-                    } else {
-                        if (!math_warp_decodes)
+                    if constexpr (kNumMathWGDecodeWarps > 0) {
+                        if (math_warp_decodes)
+                            arrive_or_sync_fp4_decode_done(stage_idx);
+                        if constexpr (kUseDecodeDoneMBarrier) {
                             wait_fp4_decode_done(stage_idx, phase);
+                        } else {
+                            if (!math_warp_decodes)
+                                wait_fp4_decode_done(stage_idx, phase);
+                        }
+                    } else {
+                        wait_fp4_decode_done(stage_idx, phase);
                     }
-                } else {
-                    wait_fp4_decode_done(stage_idx, phase);
                 }
 
                 if (block_phase == sched::BlockPhase::Linear1) {

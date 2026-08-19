@@ -74,6 +74,9 @@ public:
         // Mirror the FP8 split-MN arrival-counter path for FP4 L1->L2
         // readiness, avoiding the bitmask update's CTA-wide epilogue sync.
         bool use_l2_arrival_counter;
+        // Decode the current layer once into a bounded SymmBuffer FP8 cache,
+        // then let all GEMM tiles load the cached bytes directly.
+        bool use_global_decode_cache;
         // Split each SS N=128 WGMMA into two N=64 WGMMAs so the
         // per-K-block accumulator is 32 floats instead of 64. Large-token SS
         // shapes enable this to reduce accumulator pressure while keeping SS
@@ -96,11 +99,15 @@ public:
         CUtensorMap tensor_map_l1_acts_sf;
         CUtensorMap tensor_map_l1_weights;
         const uint32_t* l1_weights_sf;
+        const uint32_t* l1_weights_packed;
+        uint64_t* l1_weights_decoded;
         CUtensorMap tensor_map_l1_output;
         CUtensorMap tensor_map_l2_acts;
         CUtensorMap tensor_map_l2_acts_sf;
         CUtensorMap tensor_map_l2_weights;
         const uint32_t* l2_weights_sf;
+        const uint32_t* l2_weights_packed;
+        uint64_t* l2_weights_decoded;
 
         // Launch configs
         LaunchArgs launch_args;
@@ -173,7 +180,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {}, {}, {},
-        {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}, {}
     >);
 }};
 )",
@@ -204,6 +211,7 @@ static void __instantiate_kernel() {{
     args.use_early_b_decode ? "true" : "false",
     args.use_decode_done_mbarrier ? "true" : "false",
     args.use_l2_arrival_counter ? "true" : "false",
+    args.use_global_decode_cache ? "true" : "false",
     args.use_ss_nsplit ? "true" : "false",
     args.use_swap_ab ? "true" : "false",
     args.use_swap_ab_fast_amax ? "true" : "false");
@@ -219,11 +227,15 @@ static void __instantiate_kernel() {{
             args.tensor_map_l1_acts_sf,
             args.tensor_map_l1_weights,
             args.l1_weights_sf,
+            args.l1_weights_packed,
+            args.l1_weights_decoded,
             args.tensor_map_l1_output,
             args.tensor_map_l2_acts,
             args.tensor_map_l2_acts_sf,
             args.tensor_map_l2_weights,
-            args.l2_weights_sf
+            args.l2_weights_sf,
+            args.l2_weights_packed,
+            args.l2_weights_decoded
         ));
     }
 };
@@ -233,6 +245,8 @@ static void sm90_fp8_fp4_mega_moe(
     const torch::Tensor& l1_acts, const torch::Tensor& l1_acts_sf,
     const torch::Tensor& l2_acts, const torch::Tensor& l2_acts_sf,
     const torch::Tensor& l1_weights, const torch::Tensor& l2_weights,
+    const torch::Tensor& l1_weights_decoded,
+    const torch::Tensor& l2_weights_decoded,
     const torch::Tensor& l1_weights_sf, const torch::Tensor& l2_weights_sf,
     const std::optional<torch::Tensor> cumulative_local_expert_recv_stats,
     const std::vector<int64_t>& sym_buffer_ptrs,
@@ -250,6 +264,7 @@ static void sm90_fp8_fp4_mega_moe(
     const bool& use_early_b_decode = false,
     const bool& use_decode_done_mbarrier = false,
     const bool& use_l2_arrival_counter = false,
+    const bool& use_global_decode_cache = false,
     const bool& use_ss_nsplit = false,
     const bool& use_swap_ab = false,
     const bool& use_swap_ab_fast_amax = false
@@ -281,6 +296,8 @@ static void sm90_fp8_fp4_mega_moe(
     DG_HOST_ASSERT(num_math_wg_decode_warps >= 0 and num_math_wg_decode_warps <= 4);
     DG_HOST_ASSERT(math_wg_participates_in_fp4_decode or num_math_wg_decode_warps == 0);
     DG_HOST_ASSERT(first_fp4_decode_assist_warp >= 0 and first_fp4_decode_assist_warp <= 4);
+    DG_HOST_ASSERT(l1_weights_decoded.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(l2_weights_decoded.scalar_type() == torch::kFloat8_e4m3fn);
 
     // Heuristics
     const auto config = get_mega_moe_config_sm90_fp4(
@@ -289,7 +306,7 @@ static void sm90_fp8_fp4_mega_moe(
         hidden, intermediate_hidden, num_l1_sf_storage_tokens,
         use_early_b_decode, use_decode_done_mbarrier,
         use_swap_ab, use_swap_ab_fast_amax,
-        num_compute_ring_tokens);
+        num_compute_ring_tokens, use_global_decode_cache);
 
     // Tensormap construction
     constexpr int kGranK         = 128;  // L1 acts SF granularity (per-128 K)
@@ -313,12 +330,21 @@ static void sm90_fp8_fp4_mega_moe(
         ? l1_weights : l1_weights.view(torch::kByte);
     const auto l2_weights_bytes = l2_weights.scalar_type() == torch::kByte
         ? l2_weights : l2_weights.view(torch::kByte);
-    const auto tensor_map_l1_weights = make_tma_2d_desc(l1_weights_bytes,
-                                                        hidden / 2, num_experts_per_rank * intermediate_hidden * 2,
-                                                        config.block_k / 2, config.block_n,
-                                                        static_cast<int>(l1_weights_bytes.stride(-2)),
-                                                        config.swizzle_weights_mode, /*swizzle_base=*/0,
-                                                        /*allow_tf32=*/false);
+    const auto tensor_map_l1_weights = use_global_decode_cache
+        ? make_tma_2d_desc(l1_weights_decoded,
+                           hidden,
+                           num_experts_per_rank * intermediate_hidden * 2,
+                           config.block_k, config.block_n,
+                           static_cast<int>(l1_weights_decoded.stride(-2)),
+                           /*swizzle_mode=*/128, /*swizzle_base=*/0,
+                           /*allow_tf32=*/false)
+        : make_tma_2d_desc(l1_weights_bytes,
+                           hidden / 2,
+                           num_experts_per_rank * intermediate_hidden * 2,
+                           config.block_k / 2, config.block_n,
+                           static_cast<int>(l1_weights_bytes.stride(-2)),
+                           config.swizzle_weights_mode, /*swizzle_base=*/0,
+                           /*allow_tf32=*/false);
 
     // L1 output (post-SwiGLU FP8): N is halved.
     // Mirror the FP8 split-N infrastructure: when BLOCK_M=64 and the host
@@ -330,12 +356,17 @@ static void sm90_fp8_fp4_mega_moe(
     // gating must match the kernel-side `kSplitNWarpgroups` predicate, which
     // requires WG_BLOCK_N >= 64 (so the FP8MMASelector remains valid).
     const int num_epilogue_warpgroups_h = config.num_epilogue_threads / 128;
+    const bool split_mn_warpgroups =
+        use_global_decode_cache and config.block_m == 128 and
+        config.block_n == 256 and num_epilogue_warpgroups_h == 4;
     const bool split_n_warpgroups =
         config.block_m == 64 and num_epilogue_warpgroups_h > 1 and
         config.block_n % num_epilogue_warpgroups_h == 0 and
         (config.block_n / num_epilogue_warpgroups_h) >= 64;
-    const int wg_split_m = split_n_warpgroups ? 1 : num_epilogue_warpgroups_h;
-    const int wg_split_n = split_n_warpgroups ? num_epilogue_warpgroups_h : 1;
+    const int wg_split_m = split_mn_warpgroups ? 2 :
+        (split_n_warpgroups ? 1 : num_epilogue_warpgroups_h);
+    const int wg_split_n = split_mn_warpgroups ? 2 :
+        (split_n_warpgroups ? num_epilogue_warpgroups_h : 1);
     DG_HOST_ASSERT(wg_split_m * wg_split_n == num_epilogue_warpgroups_h);
     const int wg_block_m = config.block_m / wg_split_m;
     const int wg_block_n = config.block_n / wg_split_n;
@@ -343,7 +374,8 @@ static void sm90_fp8_fp4_mega_moe(
     const int l1_output_box_m = wg_block_m;
     // Split-N with 32 post-SwiGLU cols per WG uses one combined 64-col TMA
     // store from WG0, matching the 64-col L2 activation-scale group.
-    const bool split_n_combines_l1_store = split_n_warpgroups and wg_l1_out_block_n < 64;
+    const bool split_n_combines_l1_store =
+        wg_split_n > 1 and wg_l1_out_block_n < 64;
     const int tma_l1_out_box_n = split_n_combines_l1_store ? (config.block_n / 2) : wg_l1_out_block_n;
     const int tma_l1_out_box_m = split_n_combines_l1_store ? config.block_m : l1_output_box_m;
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
@@ -361,12 +393,21 @@ static void sm90_fp8_fp4_mega_moe(
                                                         num_l2_sf_storage_tokens, intermediate_hidden,
                                                         config.block_m, kL2ActsSFGranK,
                                                         1, 0);
-    const auto tensor_map_l2_weights = make_tma_2d_desc(l2_weights_bytes,
-                                                        intermediate_hidden / 2, num_experts_per_rank * hidden,
-                                                        config.block_k / 2, config.block_n,
-                                                        static_cast<int>(l2_weights_bytes.stride(-2)),
-                                                        config.swizzle_weights_mode, /*swizzle_base=*/0,
-                                                        /*allow_tf32=*/false);
+    const auto tensor_map_l2_weights = use_global_decode_cache
+        ? make_tma_2d_desc(l2_weights_decoded,
+                           intermediate_hidden,
+                           num_experts_per_rank * hidden,
+                           config.block_k, config.block_n,
+                           static_cast<int>(l2_weights_decoded.stride(-2)),
+                           /*swizzle_mode=*/128, /*swizzle_base=*/0,
+                           /*allow_tf32=*/false)
+        : make_tma_2d_desc(l2_weights_bytes,
+                           intermediate_hidden / 2,
+                           num_experts_per_rank * hidden,
+                           config.block_k / 2, config.block_n,
+                           static_cast<int>(l2_weights_bytes.stride(-2)),
+                           config.swizzle_weights_mode, /*swizzle_base=*/0,
+                           /*allow_tf32=*/false);
 
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
@@ -394,6 +435,7 @@ static void sm90_fp8_fp4_mega_moe(
         .use_early_b_decode = use_early_b_decode,
         .use_decode_done_mbarrier = use_decode_done_mbarrier,
         .use_l2_arrival_counter = use_l2_arrival_counter,
+        .use_global_decode_cache = use_global_decode_cache,
         .use_ss_nsplit = use_ss_nsplit,
         .use_swap_ab = use_swap_ab,
         .use_swap_ab_fast_amax = use_swap_ab_fast_amax,
@@ -406,11 +448,15 @@ static void sm90_fp8_fp4_mega_moe(
         .tensor_map_l1_acts_sf = tensor_map_l1_acts_sf,
         .tensor_map_l1_weights = tensor_map_l1_weights,
         .l1_weights_sf = reinterpret_cast<const uint32_t*>(l1_weights_sf.data_ptr()),
+        .l1_weights_packed = reinterpret_cast<const uint32_t*>(l1_weights_bytes.data_ptr()),
+        .l1_weights_decoded = reinterpret_cast<uint64_t*>(l1_weights_decoded.data_ptr()),
         .tensor_map_l1_output = tensor_map_l1_output,
         .tensor_map_l2_acts = tensor_map_l2_acts,
         .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
         .tensor_map_l2_weights = tensor_map_l2_weights,
         .l2_weights_sf = reinterpret_cast<const uint32_t*>(l2_weights_sf.data_ptr()),
+        .l2_weights_packed = reinterpret_cast<const uint32_t*>(l2_weights_bytes.data_ptr()),
+        .l2_weights_decoded = reinterpret_cast<uint64_t*>(l2_weights_decoded.data_ptr()),
         .launch_args = LaunchArgs(num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, config.cluster_size)
     };

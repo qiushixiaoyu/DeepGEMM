@@ -398,7 +398,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const bool& use_decode_done_mbarrier = false,
     const int& default_num_stages_cap = 0,
     const bool& use_swap_ab = false,
-    const bool& use_swap_ab_fast_amax = false) {
+    const bool& use_swap_ab_fast_amax = false,
+    const bool& use_global_decode_cache = false) {
     constexpr int kSmemAlignment = 1024;
 
     const int smem_expert_count_size = align(
@@ -438,11 +439,12 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int l2_sfa_groups_per_block_k = block_k / kL2ActsSFGranK;
     const int smem_sfa_per_stage =
         align(l2_sfa_groups_per_block_k * block_m * static_cast<int>(sizeof(float)), 128);
-    const int smem_sfb_per_stage =
+    const int smem_sfb_per_stage = use_global_decode_cache ? 0 :
         align(block_n * static_cast<int>(sizeof(uint32_t)), 128);
 
     const int smem_b_decoded_per_stage = block_n * block_k;
-    const int smem_b_packed_per_stage = block_n * (block_k / 2);
+    const int smem_b_packed_per_stage = use_global_decode_cache ? 0 :
+        block_n * (block_k / 2);
     const int smem_per_stage = block_m * block_k +
                                smem_b_decoded_per_stage +
                                smem_b_packed_per_stage +
@@ -477,13 +479,22 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const bool& use_decode_done_mbarrier = false,
     const bool& use_swap_ab = false,
     const bool& use_swap_ab_fast_amax = false,
-    const int& num_compute_ring_tokens = -1) {
+    const int& num_compute_ring_tokens = -1,
+    const bool& use_global_decode_cache = false) {
     const auto [block_m, num_epilogue_threads] = get_block_config_for_mega_moe_sm90_fp4(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens);
     const int block_k = 128;
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-    const int block_n = 128;
+    // Once the packed weights have been decoded into the bounded E4M3 cache,
+    // use the same M128xN256 / four-math-WG decomposition as the FP8 kernel.
+    // Each WG still owns the proven M64xN128 WGMMA tile; the larger CTA tile
+    // halves scheduler, TMA and epilogue task counts without growing a WG's
+    // accumulator footprint.
+    const bool fp4_cache_large_2d_tile =
+        use_global_decode_cache and block_m == 128 and
+        expected_tokens_per_expert >= 64.0f;
+    const int block_n = fp4_cache_large_2d_tile ? 256 : 128;
     int fp4_num_epilogue_warpgroups = num_epilogue_threads / 128;
     const bool fp4_flash_shape = intermediate_hidden <= 2048;
     const bool fp4_pro_shape = intermediate_hidden >= 3072;
@@ -494,11 +505,15 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const bool fp4_split_n_shape_band =
         fp4_flash_or_pro_shape and
         expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 64.0f;
-    if (fp4_split_n_eligible and fp4_split_n_shape_band) {
+    if (fp4_cache_large_2d_tile) {
+        fp4_num_epilogue_warpgroups = 4;
+    } else if (fp4_split_n_eligible and fp4_split_n_shape_band) {
         fp4_num_epilogue_warpgroups = 2;
     }
     DG_HOST_ASSERT(fp4_num_epilogue_warpgroups >= 1);
-    DG_HOST_ASSERT((block_m / fp4_num_epilogue_warpgroups == 64) or
+    DG_HOST_ASSERT((fp4_cache_large_2d_tile and
+                    fp4_num_epilogue_warpgroups == 4) or
+                   (block_m / fp4_num_epilogue_warpgroups == 64) or
                    (block_m == 64 and fp4_num_epilogue_warpgroups > 1 and
                     block_n % fp4_num_epilogue_warpgroups == 0 and
                     (block_n / fp4_num_epilogue_warpgroups) >= 64));
@@ -529,15 +544,17 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         (fp4_small_block_n_kernel and
          expected_tokens_per_expert > 0.0f and expected_tokens_per_expert <= 24.0f);
     const int default_num_dispatch_threads =
-        (fp4_split_n_decode_thread_kernel_band or
+        (fp4_cache_large_2d_tile or fp4_split_n_decode_thread_kernel_band or
          fp4_decode_assist_thread_kernel_band) ? 64 : 128;
     const int num_dispatch_threads = default_num_dispatch_threads;
     DG_HOST_ASSERT(num_dispatch_threads == 64 or num_dispatch_threads == 128);
     const int default_num_non_epilogue_threads =
-        fp4_split_n_decode_thread_kernel_band ? 320 :
-        (fp4_decode_assist_thread_kernel_band ? 192 : 128);
+        fp4_cache_large_2d_tile ? 64 :
+        (fp4_split_n_decode_thread_kernel_band ? 320 :
+         (fp4_decode_assist_thread_kernel_band ? 192 : 128));
+
     const int num_non_epilogue_threads = default_num_non_epilogue_threads;
-    DG_HOST_ASSERT(num_non_epilogue_threads >= 128 and
+    DG_HOST_ASSERT(num_non_epilogue_threads >= 64 and
                    num_non_epilogue_threads % 64 == 0);
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);
 
@@ -550,7 +567,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         block_m, block_n, block_k,
         num_dispatch_threads / 32, fp4_num_epilogue_threads / 32,
         use_early_b_decode, use_decode_done_mbarrier, default_num_stages_cap,
-        use_swap_ab, use_swap_ab_fast_amax);
+        use_swap_ab, use_swap_ab_fast_amax, use_global_decode_cache);
 
     const auto config = MegaMoESM90Config {
         block_m, block_n, block_k,

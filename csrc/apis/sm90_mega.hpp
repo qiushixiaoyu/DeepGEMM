@@ -71,6 +71,7 @@ struct FP4SM90APIDefaults {
     bool early_b_decode;
     bool decode_done_mbarrier;
     bool l2_arrival_counter;
+    bool global_decode_cache;
     bool ss_nsplit;
     bool swap_ab;
     bool swap_ab_fast_amax;
@@ -198,6 +199,7 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
         default_ss_early_b_decode,
         default_decode_done_mbarrier,
         default_l2_arrival_counter,
+        expected_tokens_per_expert >= 64.0f,
         expected_tokens_per_expert >= 64.0f,
         default_swap_ab,
         default_swap_ab_fast_amax
@@ -329,9 +331,24 @@ get_symm_buffer_size_for_sm90_mega_moe_impl(
             combine_full_row_staging_base);
         symm_buffer_end = combine_full_row_staging_buffer.get_end_ptr();
     }
+    // The SM90 FP4 large-batch kernel decodes the current layer's packed
+    // weights once into this bounded FP8 cache, then reuses them for every
+    // token tile in the same fused launch.  The same SymmBuffer region is
+    // overwritten by the next layer, so memory is bounded by one local layer
+    // rather than growing with model depth.  The public SM90 buffer is shared
+    // by FP8 and FP4 entry points, therefore this tail reservation is part of
+    // the union layout; FP8 kernels simply leave it unused.
+    const auto fp4_decoded_l1_weight_buffer = layout::Buffer(
+        layout::Data(2 * intermediate_hidden * hidden),
+        num_experts / num_ranks, 1, symm_buffer_end);
+    const auto fp4_decoded_l2_weight_buffer = layout::Buffer(
+        layout::Data(hidden * intermediate_hidden),
+        num_experts / num_ranks, 1,
+        fp4_decoded_l1_weight_buffer.get_end_ptr());
     const auto phase_profile_buffer = layout::Buffer(
         layout::Data(layout::kSM90MegaMoEProfileSlots * sizeof(uint64_t), false),
-        1, layout::kSM90MegaMoEProfileMaxSMs, symm_buffer_end);
+        1, layout::kSM90MegaMoEProfileMaxSMs,
+        fp4_decoded_l2_weight_buffer.get_end_ptr());
     symm_buffer_end = phase_profile_buffer.get_end_ptr();
 
     DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
@@ -603,12 +620,51 @@ static void fp8_fp4_mega_moe_sm90(
     (void)topk_idx;
     (void)topk_weights;
 
+    // The decoded-weight cache is the final data region immediately before
+    // the fixed-size phase profiler.  Reconstruct tensor views here without
+    // changing the public eight-tensor SymmBuffer slicing interface.
+    const int64_t phase_profile_bytes =
+        static_cast<int64_t>(layout::kSM90MegaMoEProfileSlots) *
+        layout::kSM90MegaMoEProfileMaxSMs * sizeof(uint64_t);
+    const int64_t decoded_l1_numel =
+        static_cast<int64_t>(num_experts_per_rank) *
+        intermediate_hidden * 2 * hidden;
+    const int64_t decoded_l2_numel =
+        static_cast<int64_t>(num_experts_per_rank) *
+        hidden * intermediate_hidden;
+    const int64_t decoded_cache_offset = num_required_bytes -
+        phase_profile_bytes - decoded_l1_numel - decoded_l2_numel;
+    DG_HOST_ASSERT(decoded_cache_offset >= 0);
+    auto fp4_decoded_l1_weights = torch::from_blob(
+        math::advance_ptr(sym_buffer.data_ptr(), decoded_cache_offset),
+        {num_experts_per_rank, intermediate_hidden * 2, hidden},
+        torch::TensorOptions().dtype(torch::kFloat8_e4m3fn)
+            .device(sym_buffer.device()));
+    auto fp4_decoded_l2_weights = torch::from_blob(
+        math::advance_ptr(
+            sym_buffer.data_ptr(), decoded_cache_offset + decoded_l1_numel),
+        {num_experts_per_rank, hidden, intermediate_hidden},
+        torch::TensorOptions().dtype(torch::kFloat8_e4m3fn)
+            .device(sym_buffer.device()));
+
     DG_HOST_ASSERT(get_env<int>("DG_USE_FP4_ACTS") == 0);
     DG_HOST_ASSERT(get_env<int>("DG_USE_FP8_COMBINE") == 0);
 
     auto fp4_defaults = get_fp4_sm90_api_defaults(
         num_experts_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden);
+    fp4_defaults.global_decode_cache =
+        fp4_internode and fp4_defaults.global_decode_cache;
+    if (fp4_defaults.global_decode_cache) {
+        // Global predecode removes the per-tile decode producer/consumer
+        // pipeline entirely.  Keep the GEMM shape (including SS N-split), but
+        // do not instantiate now-dead decode helpers or decode barriers.
+        fp4_defaults.math_wg_participates_in_decode = false;
+        fp4_defaults.num_math_wg_decode_warps = 0;
+        fp4_defaults.wide_load_decode = false;
+        fp4_defaults.early_b_decode = false;
+        fp4_defaults.decode_done_mbarrier = false;
+    }
     // The merged loader frees warp 1, so it must no longer be counted as an
     // FP4 decode assistant -- otherwise the decode-done arrival count would
     // include a warp that never arrives.
@@ -626,6 +682,8 @@ static void fp8_fp4_mega_moe_sm90(
                           l1_acts, l1_acts_sf,
                           l2_acts, l2_acts_sf,
                           l1_weights, l2_weights,
+                          fp4_decoded_l1_weights,
+                          fp4_decoded_l2_weights,
                           l1_weights_sf, l2_weights_sf,
                           cumulative_local_expert_recv_stats,
                           sym_buffer_ptrs,
@@ -642,6 +700,7 @@ static void fp8_fp4_mega_moe_sm90(
                           fp4_defaults.early_b_decode,
                           fp4_defaults.decode_done_mbarrier,
                           fp4_defaults.l2_arrival_counter,
+                          fp4_defaults.global_decode_cache,
                           fp4_defaults.ss_nsplit,
                           fp4_defaults.swap_ab,
                           fp4_defaults.swap_ab_fast_amax);
