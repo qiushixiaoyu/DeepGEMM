@@ -503,13 +503,20 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
                     block_n % fp4_num_epilogue_warpgroups == 0 and
                     (block_n / fp4_num_epilogue_warpgroups) >= 64));
     const int fp4_num_epilogue_threads = fp4_num_epilogue_warpgroups * 128;
-    const int cluster_size = 1;
+    // Large-token FP4 keeps the proven 128x128 compute tile, but pairs two
+    // adjacent N tiles in a Hopper thread-block cluster.  They share the same
+    // activation rows and activation scales, so A/SFA can be multicast while
+    // packed B/SFB and all decode/math work remain CTA-local.
+    const int cluster_size =
+        expected_tokens_per_expert >= 64.0f and
+        block_m == 128 and block_n == 128 ? 2 : 1;
     const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
         num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
     const int swizzle_acts_mode = 128;
     const int swizzle_weights_mode = 0;
 
     const int num_sms = device_runtime->get_num_sms();
+    DG_HOST_ASSERT(num_sms % cluster_size == 0);
     int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90_fp4(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms,

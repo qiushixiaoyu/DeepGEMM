@@ -169,6 +169,7 @@ static void __instantiate_kernel() {{
         {},
         {}, {}, {}, {}, {},
         {},
+        {},
         {}, {}, {},
         {}, {},
         {}, {},
@@ -193,6 +194,7 @@ static void __instantiate_kernel() {{
             args.num_experts / args.num_ranks) :
         args.config.num_max_pool_tokens,
     args.config.num_stages,
+    args.config.cluster_size,
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),

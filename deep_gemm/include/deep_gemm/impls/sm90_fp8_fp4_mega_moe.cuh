@@ -346,6 +346,7 @@ template <
     uint32_t kNumL2SFStorageTokens,
     uint32_t kNumCombineStageTokens,
     uint32_t kNumStages,
+    uint32_t kNumTMAMulticast,
     uint32_t kNumDispatchThreads, uint32_t kNumNonEpilogueThreads,
     uint32_t kNumEpilogueThreads,
     uint32_t kNumSMs, uint32_t kNumRanks,
@@ -405,6 +406,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // =====================================================================
     DG_STATIC_ASSERT(kNumDispatchThreads == 64 or kNumDispatchThreads == 128,
                      "Dispatch supports 2 or 4 warps");
+    DG_STATIC_ASSERT(kNumTMAMulticast == 1 or kNumTMAMulticast == 2,
+                     "SM90 FP4 MegaMoE supports one- or two-CTA TMA groups");
+    DG_STATIC_ASSERT(kNumSMs % kNumTMAMulticast == 0,
+                     "Grid size must be divisible by the TMA multicast group");
     DG_STATIC_ASSERT(kNumNonEpilogueThreads >= 128 and kNumNonEpilogueThreads % 64 == 0,
                      "Invalid number of GEMM TMA/decode-assist warps");
     DG_STATIC_ASSERT((kNumDispatchThreads + kNumNonEpilogueThreads) % 128 == 0,
@@ -934,7 +939,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     decode_done_barriers[i]->init(kDecodeDoneArrivers);
                 }
                 // Each math warp arrives once per stage release.
-                empty_barriers[i]->init(kNumEpilogueWarps);
+                empty_barriers[i]->init(
+                    kNumTMAMulticast * kNumEpilogueWarps);
             }
             #pragma unroll
             for (uint32_t i = 0; i < kNumEpilogueWarps * 2; ++ i)
@@ -942,7 +948,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         }
         cutlass::arch::fence_barrier_init();
     }
-    __syncthreads();
+    // Distributed empty barriers must be initialized in both CTAs before
+    // either CTA can issue a multicast TMA or a remote barrier arrival.
+    (kNumTMAMulticast > 1)
+        ? comm::cluster_sync_with_relaxed_arrive()
+        : __syncthreads();
 
     if constexpr (kDispatchExpertReady or kCombineExpertReady)
         comm::grid_sync<kNumSMs, 2>(
@@ -2231,7 +2241,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     // TMA load A
                     tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
                         tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx],
-                        k_idx, m_idx, 1);
+                        k_idx, m_idx, kNumTMAMulticast);
 
                     // Merged B loader: issue the packed-FP4 weight TMA from
                     // this warp too, freeing loader warp 1 for the publisher.
@@ -2256,7 +2266,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         // L1 SFA per-128: load (BLOCK_M, 1) at K=k_block_idx
                         tma::copy<BLOCK_M, 1, 0, float>(
                             tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx],
-                            sfa_m_idx, k_block_idx, 1);
+                            sfa_m_idx, k_block_idx, kNumTMAMulticast);
                     } else {
                         // L2 SFA descriptor box is (block_mn, 1).  Default
                         // BLOCK_N=128 loads two per-64 groups; BLOCK_N=64
@@ -2268,7 +2278,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 tensor_map_sfa_ptr, full_barriers[stage_idx],
                                 smem_sfa[stage_idx] + sf_group * BLOCK_M,
                                 sfa_m_idx,
-                                k_block_idx * kNumL2SFAPerBlockK + sf_group, 1);
+                                k_block_idx * kNumL2SFAPerBlockK + sf_group,
+                                kNumTMAMulticast);
                         }
                     }
                 }
@@ -2675,6 +2686,21 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
         cache_expert_recv_counts();
 
+        // With A/SFA multicast, a pipeline stage may only be reused after the
+        // math warps in both CTAs have released it.  Each math warp therefore
+        // arrives on the corresponding empty barrier in every CTA in the
+        // cluster.  B/SFB remain CTA-local but deliberately share the same
+        // stage lifetime so the existing pipeline protocol stays intact.
+        auto arrive_empty_barrier = [&](const uint32_t& s) {
+            if constexpr (kNumTMAMulticast == 1) {
+                if (lane_idx == 0)
+                    empty_barriers[s]->arrive();
+            } else {
+                if (lane_idx < kNumTMAMulticast)
+                    empty_barriers[s]->arrive(lane_idx);
+            }
+        };
+
         // Sync with dispatch
         ptx::sync_unaligned(
             kNumDispatchEpilogueSyncThreads,
@@ -2830,8 +2856,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 }
                             }
 
-                            if (lane_idx == 0)
-                                empty_barriers[stage_idx]->arrive();
+                            arrive_empty_barrier(stage_idx);
                         };
 
                         const uint32_t n_swap = ((valid_m + 7u) / 8u) * 8u;
@@ -2887,8 +2912,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 final_accum[f+3] += scale_a_1_lo * accum[i*4+3];
                             }
                         }
-                        if (lane_idx == 0)
-                            empty_barriers[stage_idx]->arrive();
+                        arrive_empty_barrier(stage_idx);
                     } else {
                         float accum[kAccumPerThread];
                         #pragma unroll
@@ -2907,8 +2931,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(accum[i]);
                         ptx::warpgroup_wait<0>();
 
-                        if (lane_idx == 0)
-                            empty_barriers[stage_idx]->arrive();
+                        arrive_empty_barrier(stage_idx);
 
                         // L1: SFB is already baked into the decoded E4M3 tile,
                         // so only SFA remains.
@@ -3004,8 +3027,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             ptx::warpgroup_wait<0>();
                             promote_swap_accum(1);
 
-                            if (lane_idx == 0)
-                                empty_barriers[stage_idx]->arrive();
+                            arrive_empty_barrier(stage_idx);
                         };
 
                         const uint32_t n_swap = ((valid_m + 7u) / 8u) * 8u;
@@ -3066,8 +3088,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             }
                         }
 
-                        if (lane_idx == 0)
-                            empty_barriers[stage_idx]->arrive();
+                        arrive_empty_barrier(stage_idx);
                     } else {
                         if constexpr (kSSNSplitActive) {
                             // L2 per-64 SFA with split-N WGMMA: each N half owns a
@@ -3133,8 +3154,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 }
                             }
 
-                            if (lane_idx == 0)
-                                empty_barriers[stage_idx]->arrive();
+                            arrive_empty_barrier(stage_idx);
                         } else {
                             float accum[kAccumPerThread];
                             // L2: split BLOCK_K=128 into two halves (per-64 SFA), each 2 WGMMAs.
@@ -3182,8 +3202,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(accum[i]);
                             ptx::warpgroup_wait<0>();
 
-                            if (lane_idx == 0)
-                                empty_barriers[stage_idx]->arrive();
+                            arrive_empty_barrier(stage_idx);
 
                             // L2 second half: SFB baked into decoded E4M3 tile.
                             #pragma unroll
