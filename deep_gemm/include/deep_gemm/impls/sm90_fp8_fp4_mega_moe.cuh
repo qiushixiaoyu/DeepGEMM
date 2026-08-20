@@ -164,9 +164,18 @@ CUTLASS_DEVICE void sm90_fp8_fp4_mega_moe_for_each_cached_block(
         if (block_phase == sched::BlockPhase::None)
             break;
 
-        func(block_phase, current_local_expert_idx,
-             block_phase == sched::BlockPhase::Linear2 ? kNumL2BlockKs : kNumL1BlockKs,
-             m_block_idx, n_block_idx);
+        // The scheduler returns the phase at runtime, but both K extents are
+        // shape constants. Dispatch through a templated callback so loader,
+        // decoder and math roles all see an exact compile-time loop bound.
+        if (block_phase == sched::BlockPhase::Linear2) {
+            func.template operator()<
+                sched::BlockPhase::Linear2, kNumL2BlockKs>(
+                    current_local_expert_idx, m_block_idx, n_block_idx);
+        } else {
+            func.template operator()<
+                sched::BlockPhase::Linear1, kNumL1BlockKs>(
+                    current_local_expert_idx, m_block_idx, n_block_idx);
+        }
     }
 }
 
@@ -2288,10 +2297,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
         sm90_fp8_fp4_mega_moe_for_each_cached_block<
             kNumExpertsPerRank, kNumExpertsPerLane, L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K>(
-            scheduler, [&](const sched::BlockPhase& block_phase,
+            scheduler, [&]<sched::BlockPhase kBlockPhase, uint32_t kNumBlockKs>(
                            const uint32_t& local_expert_idx,
-                           const uint32_t& num_k_blocks,
                            const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+            constexpr auto block_phase = kBlockPhase;
+            constexpr uint32_t num_k_blocks = kNumBlockKs;
             const auto tensor_map_a_ptr = block_phase == sched::BlockPhase::Linear2
                 ? &tensor_map_l2_acts : &tensor_map_l1_acts;
             const auto tensor_map_sfa_ptr = block_phase == sched::BlockPhase::Linear2
@@ -2721,10 +2731,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
                 sm90_fp8_fp4_mega_moe_for_each_cached_block<
                     kNumExpertsPerRank, kNumExpertsPerLane, L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K>(
-                    scheduler, [&](const sched::BlockPhase& block_phase,
+                    scheduler, [&]<sched::BlockPhase kBlockPhase, uint32_t kNumBlockKs>(
                                    const uint32_t& local_expert_idx,
-                                   const uint32_t& num_k_blocks,
                                    const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+                    constexpr auto block_phase = kBlockPhase;
+                    constexpr uint32_t num_k_blocks = kNumBlockKs;
                     for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                         wait_fp4_decode_input_ready(stage_idx, phase);
                         decode_fp4_b_stage(stage_idx, decode_thread_idx);
@@ -2807,10 +2818,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
         sm90_fp8_fp4_mega_moe_for_each_cached_block<
             kNumExpertsPerRank, kNumExpertsPerLane, L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K>(
-            scheduler, [&](const sched::BlockPhase& block_phase,
+            scheduler, [&]<sched::BlockPhase kBlockPhase, uint32_t kNumBlockKs>(
                            const uint32_t& local_expert_idx,
-                           const uint32_t& num_k_blocks,
                            const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+            constexpr auto block_phase = kBlockPhase;
+            constexpr uint32_t num_k_blocks = kNumBlockKs;
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
             const uint64_t profile_math_block_start =
                 profile_math_leader ? clock64() : 0;
@@ -2838,14 +2850,20 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 typename mma::sm90::FP8MMASelector<(WG_BLOCK_N >= 64 ? WG_BLOCK_N / 2 : WG_BLOCK_N)>::type;
             constexpr uint32_t kSSHalfAccum = SSHalfWGMMA::kNumAccum;
             constexpr uint32_t kSSAccum = kSSNSplitActive ? kSSHalfAccum : kAccumPerThread;
+            // Large per-tile FP4 and global-cache kernels share the same
+            // direct-accumulator math path. The only difference is whether B
+            // reaches decoded SMEM through TMA or through the software tile
+            // decoder immediately before WGMMA.
+            constexpr bool kDirectAccumulator =
+                kGlobalDecodeCache or
+                (BLOCK_M == 128 and BLOCK_N == 128 and not kSwapABEligible);
             float final_accum[kAccumPerThread] = {};
-            if constexpr (kGlobalDecodeCache) {
-                // The decoded cache already has every FP4 weight scale baked
-                // into its E4M3 byte.  Reuse the FP8 hot-path accumulator
-                // strategy: WGMMA accumulates directly into final_accum and
-                // only the activation scale basis is changed between K
-                // groups.  This removes the per-K temporary accumulator,
-                // wait/promote/add loop used by the tile decoder path.
+            if constexpr (kDirectAccumulator) {
+                // Both decoders bake every FP4 weight scale into the E4M3 B
+                // tile. Reuse the FP8 hot-path accumulator strategy: WGMMA
+                // accumulates directly into final_accum and only the
+                // activation-scale basis changes between K groups. This
+                // removes the per-K temporary accumulator/promote/add loop.
                 auto rescale_final = [&](const float& prev_scale_0,
                                          const float& prev_scale_1,
                                          const float& scale_0,
@@ -2879,6 +2897,39 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                      k_block_idx < num_k_blocks;
                      advance_pipeline(k_block_idx)) {
                     full_barriers[stage_idx]->wait(phase);
+
+                    if constexpr (not kGlobalDecodeCache) {
+                        if constexpr (kUseEarlyBDecode)
+                            wait_fp4_decode_input_ready(stage_idx, phase);
+                        const bool math_warp_decodes =
+                            epilogue_warp_idx < kNumMathWGDecodeWarps;
+                        if constexpr (kNumMathWGDecodeWarps > 0) {
+                            if (math_warp_decodes) {
+                                const uint32_t decode_thread_idx =
+                                    kNumFP4DecodeAssistThreads +
+                                    epilogue_thread_idx;
+                                dequant_fp4_b_tile_to_e4m3_smem_dispatch<
+                                    LOAD_BLOCK_N, BLOCK_K, kScaleBGranK,
+                                    kNumSFBPerBlockK, kUseWideLoadDecode>(
+                                        decode_thread_idx,
+                                        kNumFP4DecodeWorkerThreads,
+                                        smem_b_packed[stage_idx],
+                                        smem_b[stage_idx],
+                                        smem_sfb[stage_idx]);
+                            }
+                        }
+                        if constexpr (kNumMathWGDecodeWarps > 0) {
+                            if (math_warp_decodes)
+                                arrive_or_sync_fp4_decode_done(stage_idx);
+                            if constexpr (kUseDecodeDoneMBarrier) {
+                                wait_fp4_decode_done(stage_idx, phase);
+                            } else if (not math_warp_decodes) {
+                                wait_fp4_decode_done(stage_idx, phase);
+                            }
+                        } else {
+                            wait_fp4_decode_done(stage_idx, phase);
+                        }
+                    }
 
                     if (block_phase == sched::BlockPhase::Linear1) {
                         const float scale_0 = ptx::ld_shared(

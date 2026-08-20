@@ -199,7 +199,10 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
         default_ss_early_b_decode,
         default_decode_done_mbarrier,
         default_l2_arrival_counter,
-        expected_tokens_per_expert >= 64.0f,
+        // Keep the large-token path on bounded N128 per-tile decode. Direct
+        // accumulation and compile-time K loops are implemented in that path,
+        // so the full-layer decoded-weight cache is no longer selected.
+        false,
         expected_tokens_per_expert >= 64.0f,
         default_swap_ab,
         default_swap_ab_fast_amax
