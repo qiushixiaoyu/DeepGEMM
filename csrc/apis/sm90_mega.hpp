@@ -334,24 +334,12 @@ get_symm_buffer_size_for_sm90_mega_moe_impl(
             combine_full_row_staging_base);
         symm_buffer_end = combine_full_row_staging_buffer.get_end_ptr();
     }
-    // The SM90 FP4 large-batch kernel decodes the current layer's packed
-    // weights once into this bounded FP8 cache, then reuses them for every
-    // token tile in the same fused launch.  The same SymmBuffer region is
-    // overwritten by the next layer, so memory is bounded by one local layer
-    // rather than growing with model depth.  The public SM90 buffer is shared
-    // by FP8 and FP4 entry points, therefore this tail reservation is part of
-    // the union layout; FP8 kernels simply leave it unused.
-    const auto fp4_decoded_l1_weight_buffer = layout::Buffer(
-        layout::Data(2 * intermediate_hidden * hidden),
-        num_experts / num_ranks, 1, symm_buffer_end);
-    const auto fp4_decoded_l2_weight_buffer = layout::Buffer(
-        layout::Data(hidden * intermediate_hidden),
-        num_experts / num_ranks, 1,
-        fp4_decoded_l1_weight_buffer.get_end_ptr());
+    // FP4 uses bounded N128 per-tile decode.  Do not reserve a full-layer
+    // decoded-weight cache in the shared FP8/FP4 SymmBuffer layout.
     const auto phase_profile_buffer = layout::Buffer(
         layout::Data(layout::kSM90MegaMoEProfileSlots * sizeof(uint64_t), false),
         1, layout::kSM90MegaMoEProfileMaxSMs,
-        fp4_decoded_l2_weight_buffer.get_end_ptr());
+        symm_buffer_end);
     symm_buffer_end = phase_profile_buffer.get_end_ptr();
 
     DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
@@ -397,7 +385,7 @@ get_symm_buffer_size_for_sm90_mega_moe_impl(
 }
 
 // Public sizing API stays unchanged.  It returns the union required by the
-// fixed FP8 inter-node protocol and the selected FP4 protocol family.
+// fixed FP8 and bounded per-tile FP4 inter-node protocols.
 static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
 get_symm_buffer_size_for_sm90_mega_moe(
     const int& num_ranks, const int& num_experts,
@@ -623,32 +611,12 @@ static void fp8_fp4_mega_moe_sm90(
     (void)topk_idx;
     (void)topk_weights;
 
-    // The decoded-weight cache is the final data region immediately before
-    // the fixed-size phase profiler.  Reconstruct tensor views here without
-    // changing the public eight-tensor SymmBuffer slicing interface.
-    const int64_t phase_profile_bytes =
-        static_cast<int64_t>(layout::kSM90MegaMoEProfileSlots) *
-        layout::kSM90MegaMoEProfileMaxSMs * sizeof(uint64_t);
-    const int64_t decoded_l1_numel =
-        static_cast<int64_t>(num_experts_per_rank) *
-        intermediate_hidden * 2 * hidden;
-    const int64_t decoded_l2_numel =
-        static_cast<int64_t>(num_experts_per_rank) *
-        hidden * intermediate_hidden;
-    const int64_t decoded_cache_offset = num_required_bytes -
-        phase_profile_bytes - decoded_l1_numel - decoded_l2_numel;
-    DG_HOST_ASSERT(decoded_cache_offset >= 0);
-    auto fp4_decoded_l1_weights = torch::from_blob(
-        math::advance_ptr(sym_buffer.data_ptr(), decoded_cache_offset),
-        {num_experts_per_rank, intermediate_hidden * 2, hidden},
-        torch::TensorOptions().dtype(torch::kFloat8_e4m3fn)
-            .device(sym_buffer.device()));
-    auto fp4_decoded_l2_weights = torch::from_blob(
-        math::advance_ptr(
-            sym_buffer.data_ptr(), decoded_cache_offset + decoded_l1_numel),
-        {num_experts_per_rank, hidden, intermediate_hidden},
-        torch::TensorOptions().dtype(torch::kFloat8_e4m3fn)
-            .device(sym_buffer.device()));
+    // The JIT API still carries decoded-weight tensor parameters so FP8 and
+    // FP4 launch plumbing can stay shared.  With global decode permanently
+    // disabled they are never dereferenced; reuse existing FP8 workspaces as
+    // valid typed placeholders instead of reserving full-layer storage.
+    const auto& fp4_decoded_l1_weights = l1_acts;
+    const auto& fp4_decoded_l2_weights = l2_acts;
 
     DG_HOST_ASSERT(get_env<int>("DG_USE_FP4_ACTS") == 0);
     DG_HOST_ASSERT(get_env<int>("DG_USE_FP8_COMBINE") == 0);
