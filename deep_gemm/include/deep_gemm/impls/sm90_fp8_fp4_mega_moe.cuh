@@ -2856,7 +2856,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             // decoder immediately before WGMMA.
             constexpr bool kDirectAccumulator =
                 kGlobalDecodeCache or
-                (BLOCK_M == 128 and BLOCK_N == 128 and not kSwapABEligible);
+                ((WG_BLOCK_N == 64 or WG_BLOCK_N == 128) and
+                 not kSwapABEligible);
             float final_accum[kAccumPerThread] = {};
             if constexpr (kDirectAccumulator) {
                 // Both decoders bake every FP4 weight scale into the E4M3 B
