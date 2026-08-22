@@ -138,6 +138,13 @@ public:
         }
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE", 0) != 0)
             internode_prefix += "#define DG_MEGA_MOE_PHASE_PROFILE 1\n";
+        // EXPERIMENT (dispatch-warp publisher probe)
+        if (get_env<int>("DG_MEGA_MOE_DISPATCH_WARP_PUBLISHER", 0) != 0)
+            internode_prefix += "#define DG_MEGA_MOE_DISPATCH_WARP_PUBLISHER 1\n";
+        // EXPERIMENT (split-A/B loader probe; requires the dispatch publisher)
+        if (get_env<int>("DG_MEGA_MOE_SPLIT_AB_LOADER", 0) != 0)
+            internode_prefix += "#define DG_MEGA_MOE_SPLIT_AB_LOADER 1\n";
+
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE_SILENT", 0) != 0)
             internode_prefix +=
                 "#define DG_MEGA_MOE_PHASE_PROFILE_SILENT 1\n";

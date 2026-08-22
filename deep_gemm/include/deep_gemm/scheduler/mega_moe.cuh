@@ -115,6 +115,7 @@ struct MegaMoEScheduler {
                     true, rel_src_node, expected_marker & 1u);
                 uint64_t header_epoch = ptx::ld_acq_sys(&header->epoch);
                 while (static_cast<uint32_t>(header_epoch) != expected_marker) {
+#ifdef DG_MEGA_MOE_DEVICE_DIAGNOSTICS
                     if (clock64() - start_clock >= kSlotTimeoutCycles)
                         printf(
                             "MEGA_MOE_COUNT_HEADER_TIMEOUT local_rank=%u "
@@ -122,6 +123,7 @@ struct MegaMoEScheduler {
                             local_rank_idx, src_rank_idx, expert_idx,
                             expected_marker,
                             static_cast<uint32_t>(header_epoch));
+#endif
                     DG_TRAP_ONLY_DEVICE_ASSERT(
                         clock64() - start_clock < kSlotTimeoutCycles);
                     header_epoch = ptx::ld_acq_sys(&header->epoch);
@@ -152,6 +154,7 @@ struct MegaMoEScheduler {
 #endif
         uint64_t slot_value = ptx::ld_acq_sys(slot_ptr);
         while (static_cast<uint32_t>(slot_value >> 32) != expected_marker) {
+#ifdef DG_MEGA_MOE_DEVICE_DIAGNOSTICS
             if (clock64() - start_clock >= kSlotTimeoutCycles)
                 printf(
                     "MEGA_MOE_COUNT_SLOT_TIMEOUT local_rank=%u src_rank=%u "
@@ -160,6 +163,7 @@ struct MegaMoEScheduler {
                     expected_marker,
                     static_cast<uint32_t>(slot_value >> 32),
                     static_cast<unsigned long long>(slot_value));
+#endif
             DG_TRAP_ONLY_DEVICE_ASSERT(
                 clock64() - start_clock < kSlotTimeoutCycles);
             slot_value = ptx::ld_acq_sys(slot_ptr);

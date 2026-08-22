@@ -1,7 +1,9 @@
 #pragma once
 
 #include <deep_gemm/common/math.cuh>
+#ifdef DG_MEGA_MOE_INTERNODE
 #include <deep_gemm/comm/ibgda.cuh>
+#endif
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 
@@ -18,6 +20,11 @@ template <
     uint32_t kNumRanks>
 struct SM90CombineStageRing {
     layout::SM90Workspace workspace;
+
+#ifndef DG_MEGA_MOE_INTERNODE
+    static_assert(not kEnabled,
+                  "Combine staging ring requires the inter-node specialization");
+#endif
 
     // Dispatch READ and scatter WRITE share QP(peer, expert).  The packed
     // metadata gateway alone reserves QP kNumExpertsPerRank.
@@ -81,10 +88,14 @@ struct SM90CombineStageRing {
                         const uint64_t completion = ptx::ld_acq_sys(
                             workspace.get_combine_ring_completion_target_ptr(
                                 expert_idx, dst));
+#ifdef DG_MEGA_MOE_INTERNODE
                         if (completion != 0)
                             comm::ibgda::wait_until(
                                 static_cast<int>(dst),
                                 scatter_qp_id(expert_idx), completion);
+#else
+                        (void)completion;
+#endif
                     }
                 }
             }
@@ -168,10 +179,14 @@ struct SM90CombineStageRing {
                         const uint64_t completion = ptx::ld_acq_sys(
                             workspace.get_combine_ring_completion_target_ptr(
                                 expert_idx, dst));
+#ifdef DG_MEGA_MOE_INTERNODE
                         if (completion != 0)
                             comm::ibgda::wait_until(
                                 static_cast<int>(dst),
                                 scatter_qp_id(expert_idx), completion);
+#else
+                        (void)completion;
+#endif
                     }
                 }
                 segment->state = static_cast<uint32_t>(
@@ -337,10 +352,14 @@ struct SM90CombineStageRing {
                 const uint64_t completion = ptx::ld_acq_sys(
                     workspace.get_combine_ring_completion_target_ptr(
                         expert_idx, dst));
+#ifdef DG_MEGA_MOE_INTERNODE
                 if (completion != 0)
                     comm::ibgda::wait_until(
                         static_cast<int>(dst), scatter_qp_id(expert_idx),
                         completion);
+#else
+                (void)completion;
+#endif
             }
             __threadfence_system();
             segment->state = static_cast<uint32_t>(

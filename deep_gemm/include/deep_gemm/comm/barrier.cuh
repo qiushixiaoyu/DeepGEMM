@@ -50,8 +50,10 @@ CUTLASS_DEVICE void grid_sync(const WorkspaceT& workspace,
         do {
             new_value = ptx::ld_acq(count_ptr);
             if (clock64() - start_clock >= kNumTimeoutCycles) {
+#ifdef DG_MEGA_MOE_DEVICE_DIAGNOSTICS
                 printf("DeepGEMM grid sync timeout: sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
                        sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
+#endif
                 DG_DEVICE_ASSERT(false and "Grid sync timeout");
             }
         } while (((new_value ^ old_value) & kFinishSumTag) == 0);
@@ -118,8 +120,10 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
         !(defined(DG_NVLINK_BARRIER_VERBOSE_TIMEOUT) && DG_NVLINK_BARRIER_VERBOSE_TIMEOUT)
                     DG_TRAP_ONLY_DEVICE_ASSERT(false);
 #else
+#ifdef DG_MEGA_MOE_DEVICE_DIAGNOSTICS
                     printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
                            sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
+#endif
                     DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
 #endif
                 }

@@ -448,7 +448,6 @@ struct SM90Workspace {
         // Preserve the established 16-byte alignment of all following
         // workspace regions.  This is padding, not a second epoch.
         num_bytes += sizeof(uint64_t);
-
         // Per-expert combine completion protocol.  Ready epochs are indexed
         // by global expert, while publication counters and destination masks
         // are owned by this rank's local experts.
@@ -751,10 +750,11 @@ struct SM90Workspace {
                 uint32_t(kGatewayNvlPeers) + src_nvl_idx;
     }
 
-    // Eager handshake: counts CTAs that finished writing route entries for
-    // one destination rank.  Reaching kNumSMs implies every CTA passed
-    // stake-out and fenced its stores, so the counter's final adder is the
-    // direction's trigger.  Local memory, reset by dispatch cleanup.
+    // Eager handshake: counts metadata CTAs that finished writing route
+    // entries for one destination rank.  Reaching the producer count implies
+    // every relevant CTA passed stake-out and fenced its stores, so the
+    // counter's final adder is the direction's trigger.  Local memory, reset
+    // by dispatch cleanup.
     CUTLASS_DEVICE
     uint32_t* get_gateway_direction_done_ptr(
         const uint32_t& dst_rank_idx = 0) const {
@@ -1019,8 +1019,10 @@ struct Buffer {
 // the diagnostic branch, so toggling the JIT-only profiler does not change the
 // public API or any tensor slice.
 static constexpr uint32_t kSM90MegaMoEProfileMaxSMs = 256;
-// 31 phase slots + 3 absolute globaltimer stamps (kernel entry, counts sent,
-// count barrier released) used to separate launch skew from protocol cost.
-static constexpr uint32_t kSM90MegaMoEProfileSlots = 34;
+// Phase slots include absolute globaltimer stamps plus an L1/L2 split of the
+// math mainloop and its input-arrival wait.  The latter is diagnostic-only and
+// lets a matched no-RDMA/RDMA A/B distinguish WGMMA/codegen regression from
+// delayed TMA input arrival.
+static constexpr uint32_t kSM90MegaMoEProfileSlots = 40;
 
 } // namespace deep_gemm::layout

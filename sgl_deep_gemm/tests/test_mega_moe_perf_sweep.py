@@ -36,6 +36,129 @@ def _print_rank0(rank: int, message: str) -> None:
         print(message, flush=True)
 
 
+def _make_world_size_matched_route(
+    rank: int,
+    world_size: int,
+    batch: int,
+    topk: int,
+    local_experts: int,
+) -> torch.Tensor:
+    """Build an exact per-rank workload match for no-RDMA/RDMA A/B.
+
+    Every destination rank receives ``batch * topk`` routes, and the local
+    expert index for each ``(destination, token, topk-slot)`` is independent
+    of world size.  Consequently an 8-rank run with half as many global
+    experts and a 16-rank run have identical local-expert counts, tile counts,
+    and WGMMA work per corresponding rank.  On 16 ranks the interleaved rank
+    offsets put half of top-k slots on the other 8-GPU node.
+    """
+    token = torch.arange(batch, dtype=torch.int64, device="cuda")[:, None]
+    slot = torch.arange(topk, dtype=torch.int64, device="cuda")[None, :]
+    half_world = world_size // 2
+    rank_offset = slot // 2 + (slot % 2) * half_world
+    dst_rank = (rank + rank_offset) % world_size
+    local_expert = (dst_rank + token * topk + slot) % local_experts
+    return dst_rank * local_experts + local_expert
+
+
+def _make_rdma_compiled_local_route(
+    rank: int,
+    world_size: int,
+    batch: int,
+    topk: int,
+    local_experts: int,
+) -> torch.Tensor:
+    """Keep the matched workload but make every data route node-local.
+
+    This is the middle arm of the strict A/B/C test:
+
+    A. 8 ranks, no inter-node specialization compiled;
+    B. 16 ranks, inter-node specialization compiled, data routes node-local;
+    C. 16 ranks, inter-node specialization compiled, half of routes remote.
+
+    The local expert assignment is inherited from the world-size-matched route,
+    while the destination rank is folded into the source rank's 8-GPU node.
+    Thus B retains the RDMA/control code and the same per-rank GEMM work as C,
+    but dispatch READ and scatter WRITE do not issue inter-node data WQEs.
+    """
+    if world_size % 16 != 0:
+        raise ValueError(
+            "DG_PERF_ROUTE_MATCH_LOCAL_NODE requires a multiple of 16 ranks"
+        )
+    token = torch.arange(batch, dtype=torch.int64, device="cuda")[:, None]
+    slot = torch.arange(topk, dtype=torch.int64, device="cuda")[None, :]
+    half_world = world_size // 2
+    rank_offset = slot // 2 + (slot % 2) * half_world
+    original_dst_rank = (rank + rank_offset) % world_size
+    local_expert = (original_dst_rank + token * topk + slot) % local_experts
+    node_base = (rank // 8) * 8
+    local_dst_rank = node_base + original_dst_rank % 8
+    return local_dst_rank * local_experts + local_expert
+
+
+def _dump_fp8_phase_profile(sym_buffer, model_name: str, batch: int, rank: int) -> None:
+    """Read the silent FP8 phase profiler from the SymmBuffer tail."""
+    if os.environ.get("DG_MEGA_MOE_PHASE_PROFILE", "0") != "1":
+        return
+    profile_rows, profile_slots, num_sms = 256, 40, 78
+    flat = sym_buffer.buffer.view(torch.uint8).view(-1)
+    tail = flat[-(profile_rows * profile_slots * 8):]
+    profile = tail.view(torch.int64).view(profile_rows, profile_slots).cpu()
+    rows = profile[:num_sms]
+    total = rows[:, 11]
+    slowest_sm = int(total.argmax())
+    slowest = profile[slowest_sm].tolist()
+    entry = rows[:, 31]
+    sent = rows[:, 32]
+    ready = rows[:, 33]
+    l1_blocks = int(rows[:, 13].sum())
+    l2_blocks = int(rows[:, 14].sum())
+    l1_mainloop = rows[:, 36]
+    l2_mainloop = rows[:, 37]
+    l1_a_wait = rows[:, 38]
+    l2_a_wait = rows[:, 39]
+    math_proxy = l1_mainloop + l2_mainloop - l1_a_wait - l2_a_wait
+    math_proxy_sum = int(math_proxy.sum())
+    num_math_blocks = l1_blocks + l2_blocks
+    print(
+        f"[HOSTPROF_SKEW] batch={batch} rank={rank} "
+        f"cta_entry_skew_ns={int(entry.max() - entry.min())} "
+        f"first_ready_ns={int((ready - entry.min()).min())} "
+        f"last_ready_ns={int((ready - entry.min()).max())} "
+        f"last_sent_ns={int((sent - entry.min()).max())}",
+        flush=True,
+    )
+    print(
+        f"[HOSTPROF_AGG] batch={batch} rank={rank} slowest_sm={slowest_sm} "
+        f"total_min={int(total.min())} total_p50={int(total.median())} "
+        f"total_max={int(total.max())} "
+        f"meta_max={int(rows[:, 0].max())} barrier_max={int(rows[:, 1].max())} "
+        f"pull_max={int(rows[:, 2].max())} l1_max={int(rows[:, 5].max())} "
+        f"l2_max={int(rows[:, 6].max())} pub_max={int(rows[:, 8].max())} "
+        f"combbar_max={int(rows[:, 9].max())} reduce_max={int(rows[:, 10].max())} "
+        f"CLEANUPBAR_max={int(rows[:, 4].max())} "
+        f"CLEANUPBAR_p50={int(rows[:, 4].median())} "
+        f"scatter_max={int(rows[:, 7].max())} "
+        f"a_wait_max={int(rows[:, 35].max())} "
+        f"l1_mainloop_sum={int(l1_mainloop.sum())} "
+        f"l2_mainloop_sum={int(l2_mainloop.sum())} "
+        f"l1_a_wait_sum={int(l1_a_wait.sum())} "
+        f"l2_a_wait_sum={int(l2_a_wait.sum())} "
+        f"l1_blocks={l1_blocks} l2_blocks={l2_blocks} "
+        f"math_proxy_sum={math_proxy_sum} "
+        f"math_proxy_cyc_per_block="
+        f"{math_proxy_sum / max(1, num_math_blocks):.3f}",
+        flush=True,
+    )
+    print(
+        f"[HOSTPROF] model={model_name} batch={batch} rank={rank} "
+        f"meta_cyc={slowest[0]} barrier_cyc={slowest[1]} "
+        f"pull_cyc={slowest[2]} total_cyc={slowest[11]} "
+        f"entry_ns={slowest[31]} sent_ns={slowest[32]} ready_ns={slowest[33]}",
+        flush=True,
+    )
+
+
 def _ep_call_kwargs(deep_ep, alignment):
     """DG_EP_REF_CALL=1 时改用 DeepEP 参考测试的显式 config 且不传 expert_alignment。"""
     if int(os.environ.get("DG_EP_REF_CALL", "0")):
@@ -263,7 +386,15 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         x_bf16 = torch.randn((batch, hidden), dtype=torch.bfloat16, device="cuda")
         scores = torch.randn((batch, num_experts), dtype=torch.float, device="cuda")
         topk_weights, topk_idx = torch.topk(scores, topk, dim=-1, largest=True, sorted=False)
-        if os.environ.get("DG_PERF_ROUTE_LOCAL_NODE", "0") == "1":
+        if os.environ.get("DG_PERF_ROUTE_MATCH_LOCAL_NODE", "0") == "1":
+            topk_idx = _make_rdma_compiled_local_route(
+                rank, world_size, batch, topk, local_experts
+            )
+        elif os.environ.get("DG_PERF_ROUTE_MATCH_WORLD_SIZE", "0") == "1":
+            topk_idx = _make_world_size_matched_route(
+                rank, world_size, batch, topk, local_experts
+            )
+        elif os.environ.get("DG_PERF_ROUTE_LOCAL_NODE", "0") == "1":
             # Diagnostic: keep every routed token inside this rank's NVLink
             # domain.  The full multi-node control flow (16-rank barriers,
             # 16 source slots, gateway handshake) is unchanged; only the
@@ -367,6 +498,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
             run_fused()
             torch.cuda.synchronize()
             dist.barrier()
+            _dump_fp8_phase_profile(sym_buffer, args.model_name, batch, rank)
             _print_rank0(rank, f"[PROFILE_POINT] model={args.model_name} batch={batch}")
             continue
 
@@ -722,50 +854,8 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
             )
             fused_stats = _global_stats(fused_seconds)
 
-            # Host-side profile dump: the phase-profile region is the tail of
-            # the symmetric buffer (kSM90MegaMoEProfileMaxSMs=256 rows x
-            # kSM90MegaMoEProfileSlots=34 uint64).  Reading it after the
-            # benchmark gives the LAST launch's counters with zero in-kernel
-            # printf perturbation.  Needs the kernel built with
-            # DG_MEGA_MOE_PHASE_PROFILE=1 (+ _SILENT=1 to drop the printf).
-            if os.environ.get("DG_MEGA_MOE_PHASE_PROFILE", "0") == "1":
-                _PROF_ROWS, _PROF_SLOTS = 256, 34
-                _buf = sym_buffer.buffer
-                _flat = _buf.view(torch.uint8).view(-1)
-                _tail = _flat[-(_PROF_ROWS * _PROF_SLOTS * 8):]
-                _prof = _tail.view(torch.int64).view(_PROF_ROWS, _PROF_SLOTS).cpu()
-                _nsm = 78
-                _rows = _prof[:_nsm]
-                _tot = _rows[:, 11]
-                _slow = int(_tot.argmax())
-                _sm0 = _prof[_slow].tolist()
-                _ent = _rows[:, 31]
-                _skew = int(_ent.max() - _ent.min())
-                _sent = _rows[:, 32]
-                _rdy = _rows[:, 33]
-                print(f"[HOSTPROF_SKEW] batch={batch} rank={rank} "
-                      f"cta_entry_skew_ns={_skew} "
-                      f"first_ready_ns={int((_rdy - _ent.min()).min())} "
-                      f"last_ready_ns={int((_rdy - _ent.min()).max())} "
-                      f"last_sent_ns={int((_sent - _ent.min()).max())}", flush=True)
-                print(f"[HOSTPROF_AGG] batch={batch} rank={rank} slowest_sm={_slow} "
-                      f"total_min={int(_tot.min())} total_p50={int(_tot.median())} "
-                      f"total_max={int(_tot.max())} "
-                      f"meta_max={int(_rows[:, 0].max())} barrier_max={int(_rows[:, 1].max())} "
-                      f"pull_max={int(_rows[:, 2].max())} l1_max={int(_rows[:, 5].max())} "
-                      f"l2_max={int(_rows[:, 6].max())} pub_max={int(_rows[:, 8].max())} "
-                      f"combbar_max={int(_rows[:, 9].max())} reduce_max={int(_rows[:, 10].max())} "
-                      f"CLEANUPBAR_max={int(_rows[:, 4].max())} "
-                      f"CLEANUPBAR_p50={int(_rows[:, 4].median())} "
-                      f"scatter_max={int(_rows[:, 7].max())}",
-                      flush=True)
-                # slots: 0 meta, 1 dispatch_barrier, 2 pull, 11 total,
-                #        31 entry_ns, 32 counts_sent_ns, 33 counts_ready_ns
-                print(
-                    f"[HOSTPROF] model={args.model_name} batch={batch} rank={rank} "
-                    f"meta_cyc={_sm0[0]} barrier_cyc={_sm0[1]} pull_cyc={_sm0[2]} "
-                    f"total_cyc={_sm0[11]} entry_ns={_sm0[31]} "
-                    f"sent_ns={_sm0[32]} ready_ns={_sm0[33]}", flush=True)
+            # Read the LAST launch's counters without device-side printf.
+            _dump_fp8_phase_profile(sym_buffer, args.model_name, batch, rank)
         if need_deep_ep:
             deep_ep_seconds = base._bench_cuda_events(
                 run_deep_ep,

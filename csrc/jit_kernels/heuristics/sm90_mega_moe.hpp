@@ -101,23 +101,29 @@ static int get_num_experts_per_wave_for_mega_moe_sm90(
         num_ring_tokens, num_max_tokens_per_rank, num_ranks);
 }
 
-// swapAB trades a smaller BLOCK_N (128 instead of 256) for less wasted work
-// in the M dimension.  It pays off only when the GEMM is latency/occupancy
-// bound; once weight streaming dominates, halving the weight tile costs more
-// than the saved M rows.  Two conditions, both calibrated on Flash / GLM5.2 /
-// Pro (2026-08-13, `test_logs/20260813_swapab_calib`):
+// swapAB keeps a BLOCK_N=256 scheduler/loader tile and executes two internal
+// N64 swapped-operand WGMMA subtiles per warpgroup. This preserves the wide
+// launch/protocol granularity while avoiding wasted M work in latency-bound
+// decode shapes. Two conditions are calibrated on Flash / GLM5.2 / Pro
+// (`test_logs/20260813_swapab_calib` and the 2026-08-21 N256 revalidation):
 //
 //   per-expert weights = 3 * hidden * intermediate bytes (FP8: L1 2HI + L2 HI)
-//     Flash 25.2 MB, GLM5.2 37.7 MB -> swapAB wins at small M
-//     Pro   66.1 MB                 -> swapAB loses at EVERY measured point
-//                                      (b1 +8.5% ... b96 +30%)
+//     Flash 25.2 MB, GLM5.2 37.7 MB -> swapAB wins at small M; both now use
+//                                      the N256/internal-N64 variant
+//     Pro   66.1 MB                 -> use the N256/internal-N64 swap path;
+//                                      it retains one scheduler/loader block
+//                                      while running two N64 swap subtiles/WG.
 //   tokens per expert
 //     Flash: swapAB wins at 1.5/3/6, ties at 12/24
-//     GLM:   wins at 0.5/4, ties at 2/8, loses 17% at 16
+//     GLM:   wins at 0.5/4, ties at 2/8, and wins again at 16 with the
+//            N256/internal-N64 path (2026-08-22); the old loss at 16 came
+//            from the removed N128 scheduler variant.
 //
-// Hence: enable only below both thresholds.  The weight bound sits between
-// GLM (12.6M) and Pro (22.0M) with >20% margin on each side; the token bound
-// sits between GLM's tie at 8 and its 17% loss at 16.
+// Hence: all swapAB shapes use N256/internal-N64.  The profitable density
+// band grows when each expert must stream a large weight footprint: light
+// weights switch back above 16 expected rows/expert, while weight-streaming
+// shapes keep swap through 24.  This uses workload properties rather than a
+// model-name or exact H/I whitelist.
 static bool should_use_swap_ab_for_mega_moe_sm90(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
     const int& block_m, const int& num_epilogue_threads,
@@ -126,15 +132,24 @@ static bool should_use_swap_ab_for_mega_moe_sm90(
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
     const bool decode_split_n_path =
         block_m == 64 and num_epilogue_threads == 256;
-    // Weight-streaming-bound shapes must keep the wide BLOCK_N.
+    // N256/internal-N64 already keeps the wide scheduler/loader tile, so
+    // weight-streaming-bound shapes can use swap for a wider M range without
+    // doubling the outer task count.
     constexpr int64_t kSwapAbMaxWeightElems = 16ll * 1024 * 1024;
-    const bool weight_light =
-        static_cast<int64_t>(hidden) * intermediate_hidden <
-        kSwapAbMaxWeightElems;
-    constexpr float kSwapAbMaxTokensPerExpert = 10.0f;
-    return decode_split_n_path and weight_light
-           and expected_tokens_per_expert < kSwapAbMaxTokensPerExpert
-           and expected_tokens_per_expert > 0.0f;
+    const int64_t weight_elems =
+        static_cast<int64_t>(hidden) * intermediate_hidden;
+    const bool weight_light = weight_elems < kSwapAbMaxWeightElems;
+    constexpr float kSwapAbMaxTokensPerExpert = 16.0f;
+    const bool light_weight_decode =
+        weight_light and expected_tokens_per_expert > 0.0f and
+        expected_tokens_per_expert <= kSwapAbMaxTokensPerExpert;
+    constexpr float kStreamingSwapAbMaxTokensPerExpert = 24.0f;
+    const bool weight_streaming_decode =
+        not weight_light and
+        expected_tokens_per_expert > 0.0f and
+        expected_tokens_per_expert <= kStreamingSwapAbMaxTokensPerExpert;
+    return decode_split_n_path and
+           (light_weight_decode or weight_streaming_decode);
 }
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
@@ -187,9 +202,15 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
 
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
-    const bool auto_split_mn = expected_tokens_per_expert >= 64.0f;
-    const bool ultra_small_split_n =
-        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f;
+    // EXPERIMENT (block-granularity probe, remove after use): force the
+    // small-batch 64-row split-N tile at any batch so the loader pool-ready
+    // gate waits on 64 rows instead of 128 (internode A-chain wait A/B).
+    const bool force_block_m64 =
+        get_env<int>("DG_MEGA_MOE_FP4_FORCE_BLOCK_M64", 0) != 0;
+    const bool auto_split_mn =
+        expected_tokens_per_expert >= 64.0f and not force_block_m64;
+    const bool ultra_small_split_n = force_block_m64 or
+        (expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f);
     int block_m = auto_split_mn ? 128 : 64;
     int num_epilogue_warpgroups = (auto_split_mn or ultra_small_split_n) ? 2 : block_m / 64;
     DG_HOST_ASSERT(block_m >= 64 and block_m % 64 == 0);
@@ -491,9 +512,13 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     // Shape bands depend only on model shape and routing density; kernel bands add tile/thread constraints.
     const bool fp4_split_n_eligible =
         block_m == 64 and block_n % 128 == 0;
+    // EXPERIMENT (block-granularity probe): the forced 64-row tile must also
+    // engage the split-N decode-thread band (dispatch 64 / non-epi 320) so the
+    // probe reuses the exact thread shape already validated at small batch.
     const bool fp4_split_n_shape_band =
-        fp4_flash_or_pro_shape and
-        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 64.0f;
+        (fp4_flash_or_pro_shape and
+         expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 64.0f)
+        or get_env<int>("DG_MEGA_MOE_FP4_FORCE_BLOCK_M64", 0) != 0;
     if (fp4_split_n_eligible and fp4_split_n_shape_band) {
         fp4_num_epilogue_warpgroups = 2;
     }
@@ -598,7 +623,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     const bool use_swap_ab = should_use_swap_ab_for_mega_moe_sm90(
         num_experts_per_rank, num_tokens, num_topk,
         block_m, num_epilogue_threads, hidden, intermediate_hidden);
-    int block_n = use_swap_ab ? 128
+    int block_n = use_swap_ab ? 256
                               : (auto_split_mn ? 256 :
                                  (decode_use_block_n_256 ? 256 : 128));
     const int block_k = 128;
@@ -609,11 +634,10 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     const int swizzle_weights_mode = 128;
 
     const int num_sms = device_runtime->get_num_sms();
-    const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90(
+    int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms,
         num_compute_ring_tokens, num_max_tokens_per_rank, num_ranks);
-
     const bool reduce_decode_threads = num_epilogue_threads == 128;
     const bool decode_split_n =
         block_m == 64 and num_epilogue_threads == 256;

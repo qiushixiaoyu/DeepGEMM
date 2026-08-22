@@ -13,6 +13,13 @@ CUTLASS_HOST_DEVICE void host_device_printf(const char* format, ...) {
 #endif
 
 #ifndef DG_DEVICE_ASSERT
+#ifdef DG_DEVICE_ASSERT_TRAP_ONLY
+#define DG_DEVICE_ASSERT(cond) \
+do { \
+    if (not (cond)) \
+        asm("trap;"); \
+} while (0)
+#else
 #define DG_DEVICE_ASSERT(cond) \
 do { \
     if (not (cond)) { \
@@ -20,6 +27,7 @@ do { \
         asm("trap;"); \
     } \
 } while (0)
+#endif
 #endif
 
 #ifndef DG_TRAP_ONLY_DEVICE_ASSERT

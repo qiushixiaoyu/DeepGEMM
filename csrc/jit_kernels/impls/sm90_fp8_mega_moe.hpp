@@ -98,6 +98,19 @@ public:
         if (get_env<int>("DG_MEGA_MOE_DEBUG_NVSHMEM_STATE", 0) != 0)
             internode_prefix +=
                 "#define DG_MEGA_MOE_DEBUG_NVSHMEM_STATE 1\n";
+        // Device printf forces ptxas to emit vprintf calls and a call stack for
+        // the entire fused kernel.  On the small swapAB shapes this also makes
+        // ptxas serialize every QGMMA with a DEPBAR, even though the print is
+        // only reachable on a protocol failure.  Production keeps the trap and
+        // assertions but compiles textual diagnostics only when requested.
+        const bool device_diagnostics =
+            get_env<int>("DG_MEGA_MOE_DEVICE_DIAGNOSTICS", 0) != 0;
+        if (device_diagnostics)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_DEVICE_DIAGNOSTICS 1\n";
+        else if (internode)
+            internode_prefix +=
+                "#define DG_DEVICE_ASSERT_TRAP_ONLY 1\n";
         // Unified two-level dispatch handshake. Packed mode compacts live route
         // cells into per-remote-node, per-epoch packed slots.  Sparse top-k
         // shapes use live payload + fixed-address trailing manifest; denser
@@ -122,6 +135,43 @@ public:
         if (dispatch_gateway == 4)
             internode_prefix +=
                 "#define DG_MEGA_MOE_DISPATCH_GATEWAY_DENSE_V3 1\n";
+        const int num_experts_per_rank =
+            static_cast<int>(args.num_experts / args.num_ranks);
+        // The route-count pass assigns one contiguous token tranche to each
+        // CTA.  Decode-sized launches therefore have a compile-time-known
+        // prefix of CTAs that can possibly own metadata; waiting for all 78
+        // CTAs only delays manifest publication after the last real producer
+        // has already finished.  Keep the full grid for pull/GEMM/scatter,
+        // but let the count/manifest protocol wait for exactly that producer
+        // prefix.  This is derived from the actual JIT shape, not an A/B
+        // switch, and applies to every dense-decode expert topology.
+        if (dispatch_gateway == 4) {
+            const int tokens_per_metadata_cta =
+                (args.config.num_dispatch_threads / 32) *
+                (32 / args.num_topk);
+            const int num_metadata_sms = std::min(
+                args.launch_args.grid_dim.first,
+                std::max(1, (args.num_tokens + tokens_per_metadata_cta - 1) /
+                                tokens_per_metadata_cta));
+            internode_prefix += fmt::format(
+                "#define DG_MEGA_MOE_NUM_METADATA_SMS {}\n",
+                num_metadata_sms);
+        }
+        // Active-pair completion removes zero-token (expert, dst) system
+        // atomics.  Its count snapshot pays off when the many-local-expert
+        // publisher matrix is sparse, but becomes overhead as rows per expert
+        // increase.  Select by expected work density instead of a model- or
+        // batch-specific upper bound.
+        const float expected_rows_per_local_expert =
+            static_cast<float>(args.num_tokens * args.num_topk) /
+            num_experts_per_rank;
+        const bool active_pair_completion =
+            dispatch_gateway == 4 and args.num_tokens >= 16 and
+            num_experts_per_rank >= 48 and
+            expected_rows_per_local_expert <= 6.0f;
+        if (active_pair_completion)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_ACTIVE_PAIR_COMPLETION 1\n";
         const int actual_pool_tokens = layout::get_num_max_pool_tokens(
             args.num_ranks, args.num_tokens, args.num_topk,
             args.num_experts / args.num_ranks);
@@ -280,8 +330,10 @@ static void sm90_fp8_mega_moe(
     const bool default_split_mn_barrier_opt =
         config.block_m == 128 and config.block_n == 256 and
         config.num_epilogue_threads == 512;
-    const bool split_phase_hot_path =
-        config.block_m == 128 and config.block_n == 256 and hidden >= 7168;
+    // L1/L2 K extents are JIT constants for every generated shape.  Keep a
+    // single statically unrolled implementation; the former Pro b1/b2 runtime
+    // loop exception no longer helps after the N256 internal-N64 path.
+    const bool split_phase_hot_path = true;
     const bool decode_split_n_path =
         config.block_m == 64 and config.num_epilogue_threads == 256;
     const bool decode_split_n_bn256 =

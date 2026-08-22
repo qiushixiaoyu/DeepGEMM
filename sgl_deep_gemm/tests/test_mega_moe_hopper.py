@@ -334,7 +334,12 @@ def _reference_fused(
     combine_buf = torch.zeros(mg, num_topk, hidden, dtype=torch.float32, device="cuda")
     x_fp32 = _dequant_per_token_per_128_k(x_fp8_g, x_sf_g)
 
-    chunk = 256
+    # Keep the FP32 reference's transient selected-expert weights bounded.
+    # Large production shapes (for example DeepSeekV4Pro) can require tens of
+    # GiB when all 256 selections are dequantized at once, even though this
+    # chunking does not change the reference result.
+    chunk = int(os.environ.get("DG_FP8_REFERENCE_CHUNK", "16"))
+    assert chunk > 0
     for k in range(num_topk):
         mask = topk_idx_g[:, k] >= 0
         if not mask.any():
@@ -397,7 +402,11 @@ def _run_accuracy_scenario(
     masked_ratio = cfg.get("masked_ratio", 0.0)
     activation_clamp = cfg.get("activation_clamp", 10.0)
     fast_math = cfg.get("fast_math", True)
-    num_repeats = cfg.get("num_repeats", 1)
+    num_repeats = int(
+        os.environ.get(
+            "DG_ACCURACY_NUM_REPEATS", cfg.get("num_repeats", 1)
+        )
+    )
 
     assert num_experts % num_ranks == 0, (
         f"{name}: experts {num_experts} not divisible by ranks {num_ranks}"
@@ -665,6 +674,38 @@ def _accuracy_layer5_stress(num_ranks: int, num_tests: int) -> List[Tuple[str, D
     return out
 
 
+def _accuracy_layer6_requested_shape(
+    num_ranks: int, args: argparse.Namespace
+) -> List[Tuple[str, Dict[str, Any]]]:
+    """Exercise the benchmark shape with the accuracy/reuse harness.
+
+    This makes production-sized model branches testable without hard-coding a
+    model recipe into the generic layered suite.  ``--batches`` may select
+    multiple actual token counts; every scenario keeps one SymmBuffer alive
+    across ``DG_ACCURACY_NUM_REPEATS`` launches.
+    """
+    assert args.num_experts % num_ranks == 0
+    batches = args.batches or [
+        args.num_tokens or args.num_max_tokens_per_rank
+    ]
+    out: List[Tuple[str, Dict[str, Any]]] = []
+    for num_tokens in batches:
+        assert 0 <= num_tokens <= args.num_max_tokens_per_rank
+        cfg = dict(
+            num_max_tokens_per_rank=args.num_max_tokens_per_rank,
+            num_tokens=num_tokens,
+            hidden=args.hidden,
+            intermediate_hidden=args.intermediate_hidden,
+            num_experts=args.num_experts,
+            num_topk=args.num_topk,
+            masked_ratio=args.masked_ratio,
+            activation_clamp=args.activation_clamp,
+            fast_math=bool(args.fast_math),
+        )
+        out.append((f"L6.requested.b{num_tokens}", cfg))
+    return out
+
+
 def _run_accuracy_tests(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
 
@@ -687,6 +728,8 @@ def _run_accuracy_tests(local_rank: int, num_local_ranks: int, args: argparse.Na
         layers += _accuracy_layer4_edges(num_ranks)
     if 5 in args.layers:
         layers += _accuracy_layer5_stress(num_ranks, args.num_correctness_tests or 8)
+    if 6 in args.layers:
+        layers += _accuracy_layer6_requested_shape(num_ranks, args)
     if args.filter:
         layers = [(name, cfg) for name, cfg in layers if args.filter in name]
     if args.accuracy_num_max_tokens_per_rank:

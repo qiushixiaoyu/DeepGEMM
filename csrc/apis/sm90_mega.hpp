@@ -384,9 +384,11 @@ get_symm_buffer_size_for_sm90_mega_moe(
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const bool& use_fp8_dispatch, const std::string& activation) {
+    const bool force_fp4_internode_probe =
+        get_env<int>("DG_MEGA_MOE_FP4_FORCE_INTERNODE", 0) != 0;
     const bool fp8_full_row = num_ranks > 8;
     const bool fp8_ring = fp8_full_row;
-    const bool fp4_full_row = num_ranks > 8;
+    const bool fp4_full_row = num_ranks > 8 or force_fp4_internode_probe;
     const bool fp4_ring = fp4_full_row;
     const bool full_row = fp8_full_row or fp4_full_row;
     const bool every_full_row_path_uses_ring =
@@ -587,7 +589,13 @@ static void fp8_fp4_mega_moe_sm90(
 
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
-    const bool fp4_internode = num_ranks > 8;
+    // EXPERIMENT (single-node internode probe): force the INTERNODE
+    // compilation shape on an 8-rank single node (all ranks NVLink peers, so
+    // remote traffic is naturally zero).  Reproduces the compilation-shape
+    // cost in a single-node setting where Nsight Compute can profile without
+    // multi-node kernel-replay deadlocks.
+    const bool fp4_internode = num_ranks > 8 or
+        get_env<int>("DG_MEGA_MOE_FP4_FORCE_INTERNODE", 0) != 0;
     const auto [num_required_bytes, slice] = get_symm_buffer_size_for_sm90_mega_moe_impl(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
@@ -611,9 +619,19 @@ static void fp8_fp4_mega_moe_sm90(
         hidden, intermediate_hidden);
     // The merged loader frees warp 1, so it must no longer be counted as an
     // FP4 decode assistant -- otherwise the decode-done arrival count would
-    // include a warp that never arrives.
+    // include a warp that never arrives.  Under the dispatch-warp-publisher
+    // probe the async publisher moves to dispatch warp 1, and non-epilogue
+    // warp 1 rejoins decode assist.
+    const bool fp4_dispatch_warp_publisher =
+        fp4_internode and
+        get_env<int>("DG_MEGA_MOE_DISPATCH_WARP_PUBLISHER", 0) != 0;
+    const bool fp4_split_ab_loader =
+        fp4_dispatch_warp_publisher and
+        get_env<int>("DG_MEGA_MOE_SPLIT_AB_LOADER", 0) != 0;
     fp4_defaults.first_decode_assist_warp =
-        std::max(fp4_defaults.first_decode_assist_warp, 2);
+        std::max(fp4_defaults.first_decode_assist_warp,
+                 (fp4_dispatch_warp_publisher and not fp4_split_ab_loader)
+                     ? 1 : 2);
     // The protocol is shape-fixed: inter-node launches use expert-ready
     // dispatch, full-row async combine and one extra gateway QP; single-node
     // launches retain the NVLink count-sum data path.
