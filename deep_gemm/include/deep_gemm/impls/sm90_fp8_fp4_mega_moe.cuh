@@ -724,7 +724,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kSwapABNSubtiles = WG_BLOCK_N / 64;
 #ifdef DG_MEGA_MOE_FP4_SWAP_PROMOTE_PIPELINE
     constexpr bool kSwapABPromotePipeline =
-        kSwapABEligible and kSwapABNSubtiles == 1;
+        kSwapABEligible and kSwapABNSubtiles == 1 and
+        kNumNonEpilogueThreads == 192;
 #else
     constexpr bool kSwapABPromotePipeline = false;
 #endif
