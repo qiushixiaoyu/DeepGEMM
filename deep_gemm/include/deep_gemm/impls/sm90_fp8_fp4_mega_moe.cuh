@@ -3313,7 +3313,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     final_accum[i * 4 + 3] *= scale_1;
                 }
             };
-            {
+            // `valid_m` is tile-invariant, hence so is the swapAB WGMMA-N
+            // bucket.  Dispatch the bucket once per tile instead of walking
+            // the runtime branch chain in every K stage.  Besides removing
+            // the repeated compares, this gives the compiler one fixed
+            // WGMMA shape for the complete K loop.
+            const auto run_k_stages = [&]<uint32_t kNSwap>() {
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
                 const uint64_t profile_a_wait_start =
@@ -3518,6 +3523,24 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                     const uint32_t token_0 =
                                         i * 8 + col_idx * 2;
                                     const uint32_t token_1 = token_0 + 1;
+#if defined(DG_MEGA_MOE_FP4_SWAP_SCALE_FLOAT2_LEVEL) && \
+    (DG_MEGA_MOE_FP4_SWAP_SCALE_FLOAT2_LEVEL & 1)
+                                    const float2 scale = ptx::ld_shared(
+                                        reinterpret_cast<const float2*>(
+                                            smem_sfa[stage_idx] + token_0));
+                                    if (token_0 < valid_m) {
+                                        final_accum[accum_base + i * 4 + 0] +=
+                                            scale.x * swap_accum[i * 4 + 0];
+                                        final_accum[accum_base + i * 4 + 2] +=
+                                            scale.x * swap_accum[i * 4 + 2];
+                                    }
+                                    if (token_1 < valid_m) {
+                                        final_accum[accum_base + i * 4 + 1] +=
+                                            scale.y * swap_accum[i * 4 + 1];
+                                        final_accum[accum_base + i * 4 + 3] +=
+                                            scale.y * swap_accum[i * 4 + 3];
+                                    }
+#else
                                     if (token_0 < valid_m) {
                                         const float scale_0 = ptx::ld_shared(
                                             smem_sfa[stage_idx] + token_0);
@@ -3534,6 +3557,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                         final_accum[accum_base + i * 4 + 3] +=
                                             scale_1 * swap_accum[i * 4 + 3];
                                     }
+#endif
                                 }
                             }
 
@@ -3542,58 +3566,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             }
                         };
 
-                        const uint32_t n_swap = ((valid_m + 7u) / 8u) * 8u;
-                        if constexpr (kSwapABFlashN24Dispatch) {
-                            if (n_swap <= 8) {
-                                run_swap_ab_l1.template operator()<8>();
-                            } else if (n_swap <= 16) {
-                                run_swap_ab_l1.template operator()<16>();
-                            } else if (n_swap <= 24) {
-                                run_swap_ab_l1.template operator()<24>();
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 1
-                            } else if (n_swap <= 32) {
-                                run_swap_ab_l1.template operator()<32>();
-                            } else if (n_swap <= 40) {
-                                run_swap_ab_l1.template operator()<40>();
-#endif
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 2
-                            } else if (n_swap <= 48) {
-                                run_swap_ab_l1.template operator()<48>();
-#endif
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 3
-                            } else if (n_swap <= 56) {
-                                run_swap_ab_l1.template operator()<56>();
-#endif
-                            } else {
-                                run_swap_ab_l1.template operator()<64>();
-                            }
-                        } else {
-                            if (n_swap <= 8) {
-                                run_swap_ab_l1.template operator()<8>();
-                            } else if (n_swap <= 16) {
-                                run_swap_ab_l1.template operator()<16>();
-#ifdef DG_MEGA_MOE_FP4_SWAP_AB_N24
-                            } else if (n_swap <= 24) {
-                                run_swap_ab_l1.template operator()<24>();
-#endif
-                            } else if (n_swap <= 32) {
-                                run_swap_ab_l1.template operator()<32>();
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 1
-                            } else if (n_swap <= 40) {
-                                run_swap_ab_l1.template operator()<40>();
-#endif
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 2
-                            } else if (n_swap <= 48) {
-                                run_swap_ab_l1.template operator()<48>();
-#endif
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 3
-                            } else if (n_swap <= 56) {
-                                run_swap_ab_l1.template operator()<56>();
-#endif
-                            } else {
-                                run_swap_ab_l1.template operator()<64>();
-                            }
-                        }
+                        run_swap_ab_l1.template operator()<kNSwap>();
                     } else if constexpr (kDirectAccumulator) {
                         if (k_block_idx != 0)
                             direct_rescale_final(
@@ -3723,6 +3696,29 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                         const uint32_t token_0 =
                                             i * 8 + col_idx * 2;
                                         const uint32_t token_1 = token_0 + 1;
+#if defined(DG_MEGA_MOE_FP4_SWAP_SCALE_FLOAT2_LEVEL) && \
+    (DG_MEGA_MOE_FP4_SWAP_SCALE_FLOAT2_LEVEL & 2)
+                                        const float2 scale = ptx::ld_shared(
+                                            reinterpret_cast<const float2*>(
+                                                smem_sfa[stage_idx] +
+                                                sf_group * BLOCK_M + token_0));
+                                        if (token_0 < valid_m) {
+                                            final_accum[
+                                                accum_base + i * 4 + 0] +=
+                                                scale.x * swap_accum[i * 4 + 0];
+                                            final_accum[
+                                                accum_base + i * 4 + 2] +=
+                                                scale.x * swap_accum[i * 4 + 2];
+                                        }
+                                        if (token_1 < valid_m) {
+                                            final_accum[
+                                                accum_base + i * 4 + 1] +=
+                                                scale.y * swap_accum[i * 4 + 1];
+                                            final_accum[
+                                                accum_base + i * 4 + 3] +=
+                                                scale.y * swap_accum[i * 4 + 3];
+                                        }
+#else
                                         if (token_0 < valid_m) {
                                             const float scale_0 = ptx::ld_shared(
                                                 smem_sfa[stage_idx] +
@@ -3745,6 +3741,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                                 accum_base + i * 4 + 3] +=
                                                 scale_1 * swap_accum[i * 4 + 3];
                                         }
+#endif
                                     }
                                 };
 
@@ -3803,58 +3800,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 empty_barriers[stage_idx]->arrive();
                         };
 
-                        const uint32_t n_swap = ((valid_m + 7u) / 8u) * 8u;
-                        if constexpr (kSwapABFlashN24Dispatch) {
-                            if (n_swap <= 8) {
-                                run_swap_ab_l2.template operator()<8>();
-                            } else if (n_swap <= 16) {
-                                run_swap_ab_l2.template operator()<16>();
-                            } else if (n_swap <= 24) {
-                                run_swap_ab_l2.template operator()<24>();
-                            } else if (n_swap <= 32) {
-                                run_swap_ab_l2.template operator()<32>();
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 1
-                            } else if (n_swap <= 40) {
-                                run_swap_ab_l2.template operator()<40>();
-#endif
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 2
-                            } else if (n_swap <= 48) {
-                                run_swap_ab_l2.template operator()<48>();
-#endif
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 3
-                            } else if (n_swap <= 56) {
-                                run_swap_ab_l2.template operator()<56>();
-#endif
-                            } else {
-                                run_swap_ab_l2.template operator()<64>();
-                            }
-                        } else {
-                            if (n_swap <= 8) {
-                                run_swap_ab_l2.template operator()<8>();
-                            } else if (n_swap <= 16) {
-                                run_swap_ab_l2.template operator()<16>();
-#ifdef DG_MEGA_MOE_FP4_SWAP_AB_N24
-                            } else if (n_swap <= 24) {
-                                run_swap_ab_l2.template operator()<24>();
-#endif
-                            } else if (n_swap <= 32) {
-                                run_swap_ab_l2.template operator()<32>();
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 1
-                            } else if (n_swap <= 40) {
-                                run_swap_ab_l2.template operator()<40>();
-#endif
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 2
-                            } else if (n_swap <= 48) {
-                                run_swap_ab_l2.template operator()<48>();
-#endif
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 3
-                            } else if (n_swap <= 56) {
-                                run_swap_ab_l2.template operator()<56>();
-#endif
-                            } else {
-                                run_swap_ab_l2.template operator()<64>();
-                            }
-                        }
+                        run_swap_ab_l2.template operator()<kNSwap>();
                     } else if constexpr (kDirectAccumulator) {
                         DG_STATIC_ASSERT(
                             kL2ActsSFGranK == 64,
@@ -4084,6 +4030,63 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
             }
+            };
+
+            if constexpr (kSwapABEligible) {
+                const uint32_t n_swap = ((valid_m + 7u) / 8u) * 8u;
+                if constexpr (kSwapABFlashN24Dispatch) {
+                    if (n_swap <= 8) {
+                        run_k_stages.template operator()<8>();
+                    } else if (n_swap <= 16) {
+                        run_k_stages.template operator()<16>();
+                    } else if (n_swap <= 24) {
+                        run_k_stages.template operator()<24>();
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 1
+                    } else if (n_swap <= 32) {
+                        run_k_stages.template operator()<32>();
+                    } else if (n_swap <= 40) {
+                        run_k_stages.template operator()<40>();
+#endif
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 2
+                    } else if (n_swap <= 48) {
+                        run_k_stages.template operator()<48>();
+#endif
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 3
+                    } else if (n_swap <= 56) {
+                        run_k_stages.template operator()<56>();
+#endif
+                    } else {
+                        run_k_stages.template operator()<64>();
+                    }
+                } else {
+                    if (n_swap <= 8) {
+                        run_k_stages.template operator()<8>();
+                    } else if (n_swap <= 16) {
+                        run_k_stages.template operator()<16>();
+#ifdef DG_MEGA_MOE_FP4_SWAP_AB_N24
+                    } else if (n_swap <= 24) {
+                        run_k_stages.template operator()<24>();
+#endif
+                    } else if (n_swap <= 32) {
+                        run_k_stages.template operator()<32>();
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 1
+                    } else if (n_swap <= 40) {
+                        run_k_stages.template operator()<40>();
+#endif
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 2
+                    } else if (n_swap <= 48) {
+                        run_k_stages.template operator()<48>();
+#endif
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 3
+                    } else if (n_swap <= 56) {
+                        run_k_stages.template operator()<56>();
+#endif
+                    } else {
+                        run_k_stages.template operator()<64>();
+                    }
+                }
+            } else {
+                run_k_stages.template operator()<0>();
             }
 #ifdef DG_MEGA_MOE_FP4_SWAP_PROMOTE_PIPELINE
             if constexpr (kSwapABPromotePipeline) {

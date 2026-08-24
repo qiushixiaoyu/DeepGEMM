@@ -240,6 +240,17 @@ public:
                 internode_prefix += fmt::format(
                     "#define DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS {}\n",
                     fp4_swap_ab_fine_bucket_level);
+            // The swapAB promotion loop consumes adjacent token scales in
+            // pairs.  A single aligned 64-bit shared load reduces the L1/L2
+            // promotion instruction stream without changing predicates or
+            // resources.  A-B-A showed a stable win in the 24--48-row band;
+            // sparse shapes do not amortize the wider load.
+            const bool use_swap_scale_float2 =
+                expected_rows_per_local_expert >= 24.0f and
+                expected_rows_per_local_expert <= 48.0f;
+            if (use_swap_scale_float2)
+                internode_prefix +=
+                    "#define DG_MEGA_MOE_FP4_SWAP_SCALE_FLOAT2_LEVEL 3\n";
         }
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE", 0) != 0)
             internode_prefix += "#define DG_MEGA_MOE_PHASE_PROFILE 1\n";
