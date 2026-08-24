@@ -243,6 +243,12 @@ public:
         }
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE", 0) != 0)
             internode_prefix += "#define DG_MEGA_MOE_PHASE_PROFILE 1\n";
+        // Experimental L1 swapAB software pipeline: keep two temporary
+        // WGMMA fragments so the current K-block can execute on tensor cores
+        // while FP32 promotion consumes the previous fragment.
+        if (get_env<int>("DG_MEGA_MOE_FP4_SWAP_PROMOTE_PIPELINE", 0) != 0)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_FP4_SWAP_PROMOTE_PIPELINE 1\n";
         // Match the FP8 production path: textual device diagnostics pull
         // vprintf and a call stack into every specialization, even though
         // they are only reachable after a protocol failure. Keep all traps

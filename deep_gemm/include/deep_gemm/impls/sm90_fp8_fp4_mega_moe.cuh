@@ -722,6 +722,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kSwapABFlashN24Dispatch =
         kSwapABEligible and kIntermediateHidden <= 2048 and kNumExpertsPerWave == 16;
     constexpr uint32_t kSwapABNSubtiles = WG_BLOCK_N / 64;
+#ifdef DG_MEGA_MOE_FP4_SWAP_PROMOTE_PIPELINE
+    constexpr bool kSwapABPromotePipeline =
+        kSwapABEligible and kSwapABNSubtiles == 1;
+#else
+    constexpr bool kSwapABPromotePipeline = false;
+#endif
     constexpr uint32_t kSwapABTokenChunks = BLOCK_M / 8;
     DG_STATIC_ASSERT(not kSwapABEligible or (BLOCK_M % 8 == 0),
                      "swapAB epilogue token chunks assume BLOCK_M is a multiple of 8");
@@ -1097,7 +1103,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // regular N=128 path.
     constexpr uint32_t kNumDispatchRegisters    = 48;
     constexpr uint32_t kNumNonEpilogueRegisters = 40;
-    constexpr uint32_t kNumEpilogueRegisters    = kSplitNWarpgroups ? 160 : 208;
+    constexpr uint32_t kNumEpilogueRegisters =
+        kSwapABPromotePipeline ? 208 :
+        (kSplitNWarpgroups ? 160 : 208);
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
                      kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
@@ -3234,6 +3242,47 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 not kSwapABEligible and BLOCK_M == 128 and BLOCK_N == 128 and
                 WG_BLOCK_N == 128;
             float final_accum[kAccumPerThread] = {};
+#ifdef DG_MEGA_MOE_FP4_SWAP_PROMOTE_PIPELINE
+            // Two named register fragments avoid dynamic indexing (which
+            // would spill to local memory).  The current WGMMA writes one
+            // fragment while the previous completed fragment is promoted.
+            float swap_pipe_accum[2][kAccumPerThread];
+            const auto promote_swap_pipe_l1 =
+                [&]<uint32_t N_SWAP, uint32_t BUFFER>(
+                    const uint32_t& promote_stage_idx) {
+                    if constexpr (kSwapABPromotePipeline) {
+                        using SwapWGMMA = typename
+                            mma::sm90::FP8MMASelector<N_SWAP>::type;
+                        constexpr uint32_t kSwapAccum =
+                            SwapWGMMA::kNumAccum;
+                        DG_STATIC_ASSERT(
+                            kSwapABNSubtiles == 1,
+                            "promotion pipeline requires one N64 subtile");
+                        #pragma unroll
+                        for (uint32_t i = 0;
+                             i < kSwapAccum / 4; ++ i) {
+                            const uint32_t token_0 =
+                                i * 8 + col_idx * 2;
+                            const uint32_t token_1 = token_0 + 1;
+                            if (token_0 < valid_m) {
+                                const float2 scale = ptx::ld_shared(
+                                    reinterpret_cast<const float2*>(
+                                        smem_sfa[promote_stage_idx] + token_0));
+                                final_accum[i * 4 + 0] +=
+                                    scale.x * swap_pipe_accum[BUFFER][i * 4 + 0];
+                                final_accum[i * 4 + 2] +=
+                                    scale.x * swap_pipe_accum[BUFFER][i * 4 + 2];
+                                if (token_1 < valid_m) {
+                                    final_accum[i * 4 + 1] +=
+                                        scale.y * swap_pipe_accum[BUFFER][i * 4 + 1];
+                                    final_accum[i * 4 + 3] +=
+                                        scale.y * swap_pipe_accum[BUFFER][i * 4 + 3];
+                                }
+                            }
+                        }
+                    }
+                };
+#endif
             float direct_prev_scale_0 = 1.0f;
             float direct_prev_scale_1 = 1.0f;
             const auto direct_rescale_final = [&] (
@@ -3367,6 +3416,71 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 kSwapAccum <= kSwapAccumStride,
                                 "swap accumulator does not fit N64 subtile slot");
 
+                            if constexpr (kSwapABPromotePipeline) {
+#ifdef DG_MEGA_MOE_FP4_SWAP_PROMOTE_PIPELINE
+                                DG_STATIC_ASSERT(
+                                    kSwapABNSubtiles == 1,
+                                    "promotion pipeline requires one N64 subtile");
+                                const auto issue_swap_pipe =
+                                    [&]<uint32_t CURRENT>() {
+                                        constexpr uint32_t PREVIOUS =
+                                            1u - CURRENT;
+                                        #pragma unroll
+                                        for (uint32_t i = 0;
+                                             i < kSwapAccum; ++ i)
+                                            ptx::warpgroup_fence_operand(
+                                                swap_pipe_accum[CURRENT][i]);
+                                        ptx::warpgroup_arrive();
+                                        #pragma unroll
+                                        for (uint32_t k = 0;
+                                             k < BLOCK_K / SwapWGMMA::K; ++ k) {
+                                            auto desc_a =
+                                                mma::sm90::make_smem_desc(
+                                                    smem_b[stage_idx] +
+                                                        smem_b_wg_offset +
+                                                        k * SwapWGMMA::K,
+                                                    1);
+                                            auto desc_b =
+                                                mma::sm90::make_smem_desc(
+                                                    smem_a[stage_idx] +
+                                                        k * SwapWGMMA::K,
+                                                    1);
+                                            SwapWGMMA::wgmma(
+                                                desc_a, desc_b,
+                                                swap_pipe_accum[CURRENT], k);
+                                        }
+                                        ptx::warpgroup_commit_batch();
+
+                                        if (k_block_idx != 0) {
+                                            #pragma unroll
+                                            for (uint32_t i = 0;
+                                                 i < kSwapAccum; ++ i)
+                                                ptx::warpgroup_fence_operand(
+                                                    swap_pipe_accum[PREVIOUS][i]);
+                                            // Leave the just-issued current
+                                            // batch outstanding; only the
+                                            // previous fragment is consumed.
+                                            ptx::warpgroup_wait<1>();
+                                            const uint32_t prev_stage_idx =
+                                                stage_idx == 0 ?
+                                                    kNumStages - 1 :
+                                                    stage_idx - 1;
+                                            promote_swap_pipe_l1
+                                                .template operator()<
+                                                    N_SWAP, PREVIOUS>(
+                                                        prev_stage_idx);
+                                            if (lane_idx == 0)
+                                                empty_barriers[prev_stage_idx]
+                                                    ->arrive();
+                                        }
+                                    };
+
+                                if (k_block_idx & 1u)
+                                    issue_swap_pipe.template operator()<1>();
+                                else
+                                    issue_swap_pipe.template operator()<0>();
+#endif
+                            } else {
                             #pragma unroll
                             for (uint32_t sub = 0;
                                  sub < kSwapABNSubtiles; ++ sub) {
@@ -3424,6 +3538,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
                             if (lane_idx == 0)
                                 empty_barriers[stage_idx]->arrive();
+                            }
                         };
 
                         const uint32_t n_swap = ((valid_m + 7u) / 8u) * 8u;
@@ -3969,6 +4084,88 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 }
             }
             }
+#ifdef DG_MEGA_MOE_FP4_SWAP_PROMOTE_PIPELINE
+            if constexpr (kSwapABPromotePipeline) {
+                if (block_phase == sched::BlockPhase::Linear1 and
+                    num_k_blocks != 0 and wg_has_valid_rows) {
+                    const auto finish_swap_pipe =
+                        [&]<uint32_t N_SWAP>() {
+                            using SwapWGMMA = typename
+                                mma::sm90::FP8MMASelector<N_SWAP>::type;
+                            constexpr uint32_t kSwapAccum =
+                                SwapWGMMA::kNumAccum;
+                            constexpr uint32_t LAST =
+                                (num_k_blocks - 1u) & 1u;
+                            #pragma unroll
+                            for (uint32_t i = 0;
+                                 i < kSwapAccum; ++ i)
+                                ptx::warpgroup_fence_operand(
+                                    swap_pipe_accum[LAST][i]);
+                            ptx::warpgroup_wait<0>();
+                            const uint32_t last_stage_idx =
+                                stage_idx == 0 ?
+                                    kNumStages - 1 : stage_idx - 1;
+                            promote_swap_pipe_l1
+                                .template operator()<N_SWAP, LAST>(
+                                    last_stage_idx);
+                            if (lane_idx == 0)
+                                empty_barriers[last_stage_idx]->arrive();
+                        };
+
+                    const uint32_t n_swap =
+                        ((valid_m + 7u) / 8u) * 8u;
+                    if constexpr (kSwapABFlashN24Dispatch) {
+                        if (n_swap <= 8)
+                            finish_swap_pipe.template operator()<8>();
+                        else if (n_swap <= 16)
+                            finish_swap_pipe.template operator()<16>();
+                        else if (n_swap <= 24)
+                            finish_swap_pipe.template operator()<24>();
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 1
+                        else if (n_swap <= 32)
+                            finish_swap_pipe.template operator()<32>();
+                        else if (n_swap <= 40)
+                            finish_swap_pipe.template operator()<40>();
+#endif
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 2
+                        else if (n_swap <= 48)
+                            finish_swap_pipe.template operator()<48>();
+#endif
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 3
+                        else if (n_swap <= 56)
+                            finish_swap_pipe.template operator()<56>();
+#endif
+                        else
+                            finish_swap_pipe.template operator()<64>();
+                    } else {
+                        if (n_swap <= 8)
+                            finish_swap_pipe.template operator()<8>();
+                        else if (n_swap <= 16)
+                            finish_swap_pipe.template operator()<16>();
+#ifdef DG_MEGA_MOE_FP4_SWAP_AB_N24
+                        else if (n_swap <= 24)
+                            finish_swap_pipe.template operator()<24>();
+#endif
+                        else if (n_swap <= 32)
+                            finish_swap_pipe.template operator()<32>();
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 1
+                        else if (n_swap <= 40)
+                            finish_swap_pipe.template operator()<40>();
+#endif
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 2
+                        else if (n_swap <= 48)
+                            finish_swap_pipe.template operator()<48>();
+#endif
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 3
+                        else if (n_swap <= 56)
+                            finish_swap_pipe.template operator()<56>();
+#endif
+                        else
+                            finish_swap_pipe.template operator()<64>();
+                    }
+                }
+            }
+#endif
             if constexpr (kDirectAccumulator) {
                 if (num_k_blocks != 0 and wg_has_valid_rows)
                     direct_postscale_final(
