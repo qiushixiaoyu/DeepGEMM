@@ -332,8 +332,11 @@ static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
     const int& num_ring_tokens, const int& num_max_tokens_per_rank, const int& num_ranks) {
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
+    const bool fp4_compact_n256 =
+        get_env<int>("DG_MEGA_MOE_FP4_COMPACT_N256", 0) != 0;
     const bool fp4_small_block_n_kernel =
-        block_m == 64 and block_n == 128;
+        block_m == 64 and
+        (block_n == 128 or (fp4_compact_n256 and block_n == 256));
     const bool fp4_flash_shape = intermediate_hidden <= 2048;
     const bool fp4_pro_shape = intermediate_hidden >= 3072;
     const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
@@ -415,7 +418,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const bool& use_decode_done_mbarrier = false,
     const int& default_num_stages_cap = 0,
     const bool& use_swap_ab = false,
-    const bool& use_swap_ab_fast_amax = false) {
+    const bool& use_swap_ab_fast_amax = false,
+    const bool& use_compact_n256 = false) {
     constexpr int kSmemAlignment = 1024;
 
     const int smem_expert_count_size = align(
@@ -458,7 +462,12 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int smem_sfb_per_stage =
         align(block_n * static_cast<int>(sizeof(uint32_t)), 128);
 
-    const int smem_b_decoded_per_stage = block_n * block_k;
+    // Compact N256 keeps one decoded N64 slot per split-N math WG. Each WG
+    // consumes its first internal-N64 subtile, releases the slot, then reuses
+    // it for the second. Packed-B remains a full coalesced TMA tile.
+    const int smem_b_decoded_per_stage = use_compact_n256
+        ? 2 * 64 * block_k
+        : block_n * block_k;
     const int smem_b_packed_per_stage = block_n * (block_k / 2);
     const int smem_per_stage = block_m * block_k +
                                smem_b_decoded_per_stage +
@@ -469,9 +478,13 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int smem_barriers_fixed = (num_dispatch_warps + 2 * num_epilogue_warps) * 8;
     const int smem_decode_full_per_stage = use_early_b_decode ? 8 : 0;
     const int smem_decode_done_per_stage =
-        use_decode_done_mbarrier ? 8 : 0;
+        use_decode_done_mbarrier and not use_compact_n256 ? 8 : 0;
+    const int smem_compact_n256_per_stage = use_compact_n256
+        ? (2 * 2 + 2) * 8  // ready[group][subtile] + release[group]
+        : 0;
     const int smem_barriers_per_stage =
-        2 * 8 + smem_decode_full_per_stage + smem_decode_done_per_stage;
+        2 * 8 + smem_decode_full_per_stage + smem_decode_done_per_stage +
+        smem_compact_n256_per_stage;
     const int smem_fixed =
         smem_dispatch_size + smem_cd + smem_amax_scratch + smem_barriers_fixed;
 
@@ -501,11 +514,16 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const int block_k = 128;
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-    const int block_n = 128;
-    int fp4_num_epilogue_warpgroups = num_epilogue_threads / 128;
     const bool fp4_flash_shape = intermediate_hidden <= 2048;
     const bool fp4_pro_shape = intermediate_hidden >= 3072;
     const bool fp4_flash_or_pro_shape = fp4_flash_shape or fp4_pro_shape;
+    const bool use_compact_n256 =
+        get_env<int>("DG_MEGA_MOE_FP4_COMPACT_N256", 0) != 0 and
+        use_swap_ab and block_m == 64 and fp4_flash_or_pro_shape and
+        expected_tokens_per_expert > 0.0f and
+        expected_tokens_per_expert < 64.0f;
+    const int block_n = use_compact_n256 ? 256 : 128;
+    int fp4_num_epilogue_warpgroups = num_epilogue_threads / 128;
     // Shape bands depend only on model shape and routing density; kernel bands add tile/thread constraints.
     const bool fp4_split_n_eligible =
         block_m == 64 and block_n % 128 == 0;
@@ -516,6 +534,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     if (fp4_split_n_eligible and fp4_split_n_shape_band) {
         fp4_num_epilogue_warpgroups = 2;
     }
+    DG_HOST_ASSERT(not use_compact_n256 or
+                   (block_n == 256 and fp4_num_epilogue_warpgroups == 2));
     DG_HOST_ASSERT(fp4_num_epilogue_warpgroups >= 1);
     DG_HOST_ASSERT((block_m / fp4_num_epilogue_warpgroups == 64) or
                    (block_m == 64 and fp4_num_epilogue_warpgroups > 1 and
@@ -536,7 +556,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
             std::min(num_max_pool_tokens, num_compute_ring_tokens),
         num_max_tokens_per_rank, num_ranks);
     const bool fp4_small_block_n_kernel =
-        block_m == 64 and block_n == 128;
+        block_m == 64 and
+        (block_n == 128 or use_compact_n256);
     const bool fp4_split_n_decode_thread_kernel_band =
         fp4_small_block_n_kernel and fp4_split_n_shape_band;
     const bool fp4_2wg_decode_offload_kernel_band =
@@ -575,7 +596,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         block_m, block_n, block_k,
         num_dispatch_threads / 32, fp4_num_epilogue_threads / 32,
         use_early_b_decode, use_decode_done_mbarrier, default_num_stages_cap,
-        use_swap_ab, use_swap_ab_fast_amax);
+        use_swap_ab, use_swap_ab_fast_amax, use_compact_n256);
 
     const auto config = MegaMoESM90Config {
         block_m, block_n, block_k,
@@ -589,10 +610,10 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
 
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
         const auto key = fmt::format(
-            "MegaMoESM90FP4Config(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={}, early_b_decode={}, decode_done_mbarrier={}, swap_ab={}, swap_ab_fast_amax={})",
+            "MegaMoESM90FP4Config(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={}, early_b_decode={}, decode_done_mbarrier={}, swap_ab={}, swap_ab_fast_amax={}, compact_n256={})",
             num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk,
             use_early_b_decode, use_decode_done_mbarrier,
-            use_swap_ab, use_swap_ab_fast_amax);
+            use_swap_ab, use_swap_ab_fast_amax, use_compact_n256);
         static std::unordered_set<std::string> printed;
         if (printed.count(key) == 0) {
             std::cout << key << ": " << config << std::endl;
