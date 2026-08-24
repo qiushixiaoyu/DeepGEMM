@@ -243,12 +243,6 @@ public:
         }
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE", 0) != 0)
             internode_prefix += "#define DG_MEGA_MOE_PHASE_PROFILE 1\n";
-        // EXPERIMENT: N256 scheduler tile with one reusable decoded-N64 slot
-        // per math WG. Packed-B remains TMA staged; a consumer-release
-        // barrier protects reuse between the two internal N64 subtiles.
-        if (get_env<int>("DG_MEGA_MOE_FP4_COMPACT_N256", 0) != 0)
-            internode_prefix +=
-                "#define DG_MEGA_MOE_FP4_COMPACT_N256 1\n";
         // Keep the explicit switch for controlled A/B outside the automatic
         // shape band.  The production band always selects delayed hand-off.
         if (use_delayed_dispatch_warp_publisher or
