@@ -1866,6 +1866,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             bool chain_made_progress = false;
 #endif
             if (clock64() - chain_wait_start >= kPublishTimeoutCycles) {
+#ifdef DG_MEGA_MOE_DEVICE_DIAGNOSTICS
                 if (lane_idx == 0)
                     printf(
                         "FP4_ASYNC_CHAIN_TIMEOUT "
@@ -1873,6 +1874,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         sym_buffer.rank_idx, sm_idx,
                         static_cast<unsigned long long>(launch_epoch),
                         dst_rank_idx, chain_pending);
+#endif
                 __syncwarp();
                 DG_TRAP_ONLY_DEVICE_ASSERT(false);
             }
@@ -1976,6 +1978,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t offset = 16; offset != 0; offset >>= 1)
                         pair_rows += __shfl_down_sync(
                             0xffffffff, pair_rows, offset);
+#ifdef DG_MEGA_MOE_DEVICE_DIAGNOSTICS
                     if (lane_idx == 0 and pair_rows != chain_tokens[idx])
                         printf(
                             "FP4_ASYNC_PAIR_COUNT_MISMATCH "
@@ -1987,6 +1990,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             local_expert_idx, dst_rank_idx, pair_rows,
                             chain_tokens[idx], expert_num_tokens,
                             chain_blocks[idx]);
+#endif
                     if (lane_idx == 0)
                         DG_DEVICE_ASSERT(pair_rows == chain_tokens[idx]);
 
@@ -2022,6 +2026,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     const auto old_pair_done = ptx::atomic_add_acq_rel_sys(
                         workspace.get_combine_publish_pair_done_count_ptr(
                             local_expert_idx), 1);
+#ifdef DG_MEGA_MOE_DEVICE_DIAGNOSTICS
                     if (old_pair_done >= kNumRanks)
                         printf(
                             "FP4_ASYNC_PAIR_DONE_OVERFLOW "
@@ -2030,6 +2035,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             sym_buffer.rank_idx, sm_idx,
                             static_cast<unsigned long long>(launch_epoch),
                             local_expert_idx, dst_rank_idx, old_pair_done);
+#endif
                     DG_DEVICE_ASSERT(old_pair_done < kNumRanks);
                     if (old_pair_done + 1 == kNumRanks) {
                         ptx::st_release_sys(
@@ -2446,6 +2452,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                workspace.get_combine_publish_done_epoch_ptr(i)) !=
                            expected_launch_epoch) {
                         if (clock64() - wait_start >= kCleanupTimeoutCycles) {
+#ifdef DG_MEGA_MOE_DEVICE_DIAGNOSTICS
                             printf("FP4_ASYNC_CLEANUP_TIMEOUT rank=%u sm=%u "
                                    "expert=%u done_epoch=%llu expected=%llu "
                                    "pair_done=%u\n",
@@ -2454,6 +2461,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                        workspace.get_combine_publish_done_epoch_ptr(i))),
                                    static_cast<unsigned long long>(expected_launch_epoch),
                                    *workspace.get_combine_publish_pair_done_count_ptr(i));
+#endif
                             DG_TRAP_ONLY_DEVICE_ASSERT(false);
                         }
                     }
@@ -2877,6 +2885,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             bool chain_made_progress = false;
 #endif
             if (clock64() - chain_wait_start >= kPublishTimeoutCycles) {
+#ifdef DG_MEGA_MOE_DEVICE_DIAGNOSTICS
                 if (lane_idx == 0)
                     printf(
                         "FP4_ASYNC_CHAIN_TIMEOUT "
@@ -2884,6 +2893,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         sym_buffer.rank_idx, sm_idx,
                         static_cast<unsigned long long>(launch_epoch),
                         dst_rank_idx, chain_pending);
+#endif
                 __syncwarp();
                 DG_TRAP_ONLY_DEVICE_ASSERT(false);
             }
@@ -2987,6 +2997,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t offset = 16; offset != 0; offset >>= 1)
                         pair_rows += __shfl_down_sync(
                             0xffffffff, pair_rows, offset);
+#ifdef DG_MEGA_MOE_DEVICE_DIAGNOSTICS
                     if (lane_idx == 0 and pair_rows != chain_tokens[idx])
                         printf(
                             "FP4_ASYNC_PAIR_COUNT_MISMATCH "
@@ -2998,6 +3009,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             local_expert_idx, dst_rank_idx, pair_rows,
                             chain_tokens[idx], expert_num_tokens,
                             chain_blocks[idx]);
+#endif
                     if (lane_idx == 0)
                         DG_DEVICE_ASSERT(pair_rows == chain_tokens[idx]);
 
@@ -3033,6 +3045,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     const auto old_pair_done = ptx::atomic_add_acq_rel_sys(
                         workspace.get_combine_publish_pair_done_count_ptr(
                             local_expert_idx), 1);
+#ifdef DG_MEGA_MOE_DEVICE_DIAGNOSTICS
                     if (old_pair_done >= kNumRanks)
                         printf(
                             "FP4_ASYNC_PAIR_DONE_OVERFLOW "
@@ -3041,6 +3054,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             sym_buffer.rank_idx, sm_idx,
                             static_cast<unsigned long long>(launch_epoch),
                             local_expert_idx, dst_rank_idx, old_pair_done);
+#endif
                     DG_DEVICE_ASSERT(old_pair_done < kNumRanks);
                     if (old_pair_done + 1 == kNumRanks) {
                         ptx::st_release_sys(

@@ -243,6 +243,18 @@ public:
         }
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE", 0) != 0)
             internode_prefix += "#define DG_MEGA_MOE_PHASE_PROFILE 1\n";
+        // Match the FP8 production path: textual device diagnostics pull
+        // vprintf and a call stack into every specialization, even though
+        // they are only reachable after a protocol failure. Keep all traps
+        // in production and make the text opt-in for debugging.
+        const bool device_diagnostics =
+            get_env<int>("DG_MEGA_MOE_DEVICE_DIAGNOSTICS", 0) != 0;
+        if (device_diagnostics)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_DEVICE_DIAGNOSTICS 1\n";
+        else if (args.num_ranks > kNvlPeers)
+            internode_prefix +=
+                "#define DG_DEVICE_ASSERT_TRAP_ONLY 1\n";
         // Keep the explicit switch for controlled A/B outside the automatic
         // shape band.  The production band always selects delayed hand-off.
         if (use_delayed_dispatch_warp_publisher or
