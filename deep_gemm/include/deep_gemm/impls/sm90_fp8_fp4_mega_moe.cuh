@@ -199,7 +199,15 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_wide_load(
     for (uint32_t group = decode_thread_idx; group < kGroupsPerTile; group += num_decode_threads) {
         const uint32_t n_row = group / kNumSFBPerBlockK;
         const uint32_t kg = group - n_row * kNumSFBPerBlockK;
+#ifdef DG_MEGA_MOE_FP4_SFB_SUBGROUP_BROADCAST
+        uint32_t sfb_word = 0;
+        const uint32_t warp_lane = threadIdx.x & 31u;
+        if ((warp_lane & 3u) == 0)
+            sfb_word = smem_sfb_stage[n_row];
+        sfb_word = __shfl_sync(0xffffffffu, sfb_word, warp_lane & ~3u);
+#else
         const uint32_t sfb_word = smem_sfb_stage[n_row];
+#endif
         const uint32_t e8m0 = (sfb_word >> (kg * 8)) & 0xffu;
 
         const auto* packed_row = reinterpret_cast<const uint32_t*>(
@@ -263,7 +271,15 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_vec_store(
     for (uint32_t group = decode_thread_idx; group < kGroupsPerTile; group += num_decode_threads) {
         const uint32_t n_row = group / kNumSFBPerBlockK;
         const uint32_t kg = group - n_row * kNumSFBPerBlockK;
+#ifdef DG_MEGA_MOE_FP4_SFB_SUBGROUP_BROADCAST
+        uint32_t sfb_word = 0;
+        const uint32_t warp_lane = threadIdx.x & 31u;
+        if ((warp_lane & 3u) == 0)
+            sfb_word = smem_sfb_stage[n_row];
+        sfb_word = __shfl_sync(0xffffffffu, sfb_word, warp_lane & ~3u);
+#else
         const uint32_t sfb_word = smem_sfb_stage[n_row];
+#endif
         const uint32_t e8m0 = (sfb_word >> (kg * 8)) & 0xffu;
 
         const auto* packed_row = reinterpret_cast<const uint32_t*>(
@@ -361,8 +377,8 @@ template <
     float kActivationClamp,
     bool kFastMath,
     bool kUseWideLoadDecode        = false,  // Read one K-group's packed FP4 words as uint4
-    bool kMathWGParticipatesInFP4Decode = true,
-    uint32_t kNumMathWGDecodeWarps = kMathWGParticipatesInFP4Decode ? (kNumEpilogueThreads / 32) : 0,
+    bool kMathWGParticipatesInFP4Decode = false,
+    uint32_t kNumMathWGDecodeWarps = 0,
     uint32_t kFirstFP4DecodeAssistWarp = 0,  // Skip early non-epilogue warps as decode helpers
     bool kEarlyBDecode            = false,  // Overlap assist decode with A/SFA TMA
     bool kDecodeDoneMBarrier      = false,  // One-way decode-done mbarrier instead of rendezvous sync
@@ -403,10 +419,18 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kDispatchExpertReady = true;
     constexpr bool kCombineFullRow = true;
     constexpr bool kCombineExpertReady = true;
+#ifdef DG_MEGA_MOE_NUM_METADATA_SMS
+    constexpr uint32_t kNumMetadataSMs =
+        DG_MEGA_MOE_NUM_METADATA_SMS;
+#else
+    constexpr uint32_t kNumMetadataSMs = kNumSMs;
+#endif
+
 #else
     constexpr bool kDispatchExpertReady = false;
     constexpr bool kCombineFullRow = false;
     constexpr bool kCombineExpertReady = false;
+    constexpr uint32_t kNumMetadataSMs = kNumSMs;
 #endif
 
     // =====================================================================
@@ -424,6 +448,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                      "Per-expert ready requires full-row combine staging");
     DG_STATIC_ASSERT(not kCombineExpertReady or kNumRanks <= 64,
                      "Per-expert destination mask supports at most 64 ranks");
+    DG_STATIC_ASSERT(kNumMetadataSMs >= 1 and kNumMetadataSMs <= kNumSMs,
+                     "Invalid number of metadata producer CTAs");
     DG_STATIC_ASSERT(kNumCombineStageTokens <= kNumMaxPoolTokens,
                      "Combine staging cannot exceed the logical full pool");
     DG_STATIC_ASSERT(not kCombineExpertReady or
@@ -683,7 +709,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t WG_BLOCK_M = BLOCK_M / kWarpgroupSplitM;
     constexpr uint32_t WG_BLOCK_N = BLOCK_N / kWarpgroupSplitN;
     constexpr bool kSwapABEligible =
-        kFP4SwapAB and kSplitNWarpgroups and (BLOCK_M == 64) and (BLOCK_N == 128)
+        kFP4SwapAB and kSplitNWarpgroups and (BLOCK_M == 64)
+        and (BLOCK_N == 128 or BLOCK_N == 256)
         and (kWarpgroupSplitN == 2) and (not kFP4SSNSplit);
     constexpr bool kSwapABL1Active = kSwapABEligible;
     constexpr bool kSwapABL2Active = kSwapABEligible;
@@ -694,9 +721,13 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // making the ultra-small epw32 kernel heavier.
     constexpr bool kSwapABFlashN24Dispatch =
         kSwapABEligible and kIntermediateHidden <= 2048 and kNumExpertsPerWave == 16;
+    constexpr uint32_t kSwapABNSubtiles = WG_BLOCK_N / 64;
     constexpr uint32_t kSwapABTokenChunks = BLOCK_M / 8;
     DG_STATIC_ASSERT(not kSwapABEligible or (BLOCK_M % 8 == 0),
                      "swapAB epilogue token chunks assume BLOCK_M is a multiple of 8");
+    DG_STATIC_ASSERT(not kSwapABEligible or
+                         (kSwapABNSubtiles == 1 or kSwapABNSubtiles == 2),
+                     "swapAB supports one or two internal N64 subtiles");
     using L1WGMMA = typename mma::sm90::FP8MMASelector<WG_BLOCK_N>::type;  // M=64, N=WG_BLOCK_N, K=32
     using L2WGMMA = typename mma::sm90::FP8MMASelector<WG_BLOCK_N>::type;
     static_assert(L1WGMMA::M == 64 and L1WGMMA::N == WG_BLOCK_N and L1WGMMA::K == 32,
@@ -755,7 +786,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE =
         LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
     // Packed FP4 source tile (TMA-loaded raw nibbles)
-    constexpr uint32_t SMEM_B_PACKED_SIZE_PER_STAGE = LOAD_BLOCK_N * (BLOCK_K / 2) * sizeof(b_packed_dtype_t);
+    constexpr uint32_t SMEM_B_PACKED_SIZE_PER_STAGE =
+        LOAD_BLOCK_N * (BLOCK_K / 2) * sizeof(b_packed_dtype_t);
     // SFA per-stage must be sized for the larger of L1 (BLOCK_M floats) and
     // L2 (2*BLOCK_M floats per-64, or 4*BLOCK_M floats per-32 with BLOCK_N=64).
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE =
@@ -805,7 +837,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t SMEM_AMAX_SCRATCH_SIZE = kSplitNSharesSF ?
         math::constexpr_align<uint32_t>(kAmaxScratchSlots * sizeof(uint32_t),
                                         kSharedMemoryAlignment) : 0;
-
     constexpr uint32_t SMEM_BEFORE_BARRIER_SIZE =
         SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE + SMEM_CD_SIZE +
         SMEM_AMAX_SCRATCH_SIZE +
@@ -832,10 +863,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // share-SF amax scratch lives in its own region after SMEM_CD.
     auto smem_amax_scratch = reinterpret_cast<uint32_t*>(
         math::advance_ptr(smem_gemm_base, SMEM_CD_SIZE));
-
     auto smem_a = utils::PatternVisitor([=](const uint32_t& i) {
         return math::advance_ptr<a_dtype_t>(
-            smem_gemm_base, SMEM_CD_SIZE + SMEM_AMAX_SCRATCH_SIZE + i * SMEM_A_SIZE_PER_STAGE);
+            smem_gemm_base,
+            SMEM_CD_SIZE + SMEM_AMAX_SCRATCH_SIZE +
+                i * SMEM_A_SIZE_PER_STAGE);
     });
     // Decoded e4m3 B tile (the operand actually consumed by WGMMA).
     auto smem_b = utils::PatternVisitor([=](const uint32_t& i) {
@@ -1119,7 +1151,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
             kUseWideLoadDecode>(
             decode_thread_idx, kNumFP4DecodeWorkerThreads,
-            smem_b_packed[cur_stage_idx], smem_b[cur_stage_idx], smem_sfb[cur_stage_idx]);
+            smem_b_packed[cur_stage_idx], smem_b[cur_stage_idx],
+            smem_sfb[cur_stage_idx]);
         arrive_or_sync_fp4_decode_done(cur_stage_idx);
     };
 
@@ -1147,7 +1180,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             #pragma unroll
             for (uint32_t i = (sm_idx * kNumDispatchWarps + warp_idx) * kNumTokensPerWarp;
                  i < num_tokens;
-                 i += kNumSMs * kNumDispatchWarps * kNumTokensPerWarp) {
+                 i += kNumMetadataSMs * kNumDispatchWarps * kNumTokensPerWarp) {
                 int expert_idx = -1;
                 if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
                     expert_idx = static_cast<int>(
@@ -1166,11 +1199,17 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Stake out per-expert SM offsets via global atomic
-        #pragma unroll
-        for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-            const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(smem_expert_count[i]);
-            smem_expert_count[i] = static_cast<uint32_t>(
-                ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
+        if (sm_idx < kNumMetadataSMs) {
+            #pragma unroll
+            for (uint32_t i = thread_idx; i < kNumExperts;
+                 i += kNumDispatchThreads) {
+                const uint64_t send_value =
+                    (1ull << 32) |
+                    static_cast<uint64_t>(smem_expert_count[i]);
+                smem_expert_count[i] = static_cast<uint32_t>(
+                    ptx::atomic_add(
+                        workspace.get_expert_send_count_ptr(i), send_value));
+            }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
@@ -1181,7 +1220,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             static_cast<uint32_t>(kernel_launch_epoch) & 1u;
 #endif
 
-        // Write source token-topk indices to remote ranks
+        // Write source token-topk indices to remote ranks.  Only a thread
+        // that actually publishes an entry needs a system fence before the
+        // CTA completion handoff below.
+        bool wrote_route_entry = false;
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
             const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
             const auto dst_local_expert_idx = expert_idx % kNumExpertsPerRank;
@@ -1210,13 +1252,16 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             } else
 #endif
             *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+            wrote_route_entry = true;
         });
 
         // Every writer makes its same-node route stores visible before the
         // grid-wide handoff to SM 0.  Inter-node WQE ordering is provided by
         // the per-expert RC QP itself.
-        if constexpr (kDispatchExpertReady)
-            __threadfence_system();
+        if constexpr (kDispatchExpertReady) {
+            if (wrote_route_entry)
+                __threadfence_system();
+        }
 
 #if (defined(DG_MEGA_MOE_DISPATCH_GATEWAY_PACKED) || \
      defined(DG_MEGA_MOE_DISPATCH_GATEWAY_DENSE_V3)) && \
@@ -1226,12 +1271,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         // owns publication of that direction's final manifest/count row.
         if constexpr (kDispatchExpertReady) {
             ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-            if (thread_idx < kNumRanks) {
+            if (sm_idx < kNumMetadataSMs and thread_idx < kNumRanks) {
                 const uint32_t dst_rank_idx = thread_idx;
                 const auto old_done = ptx::atomic_add_acq_rel_sys(
                     workspace.get_gateway_direction_done_ptr(dst_rank_idx), 1);
-                DG_TRAP_ONLY_DEVICE_ASSERT(old_done < kNumSMs);
-                if (old_done + 1 == kNumSMs) {
+                DG_TRAP_ONLY_DEVICE_ASSERT(old_done < kNumMetadataSMs);
+                if (old_done + 1 == kNumMetadataSMs) {
                     const auto dispatch_epoch_full = kernel_launch_epoch;
                     const auto dispatch_epoch =
                         static_cast<uint32_t>(dispatch_epoch_full);
@@ -1249,7 +1294,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             *workspace.get_expert_send_count_ptr(
                                 dst_rank_idx * kNumExpertsPerRank + e);
                         DG_TRAP_ONLY_DEVICE_ASSERT(
-                            (expert_status >> 32) == kNumSMs);
+                            (expert_status >> 32) == kNumMetadataSMs);
                         const uint64_t ready_status =
                             (static_cast<uint64_t>(dispatch_epoch) << 32) |
                             static_cast<uint32_t>(expert_status);
@@ -1752,7 +1797,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         // Token / SF pull loop
         uint32_t pull_mbarrier_phase = 0;
 #ifdef DG_MEGA_MOE_INTERNODE
-        if (kDispatchWarpPublisher and warp_idx == kNumDispatchWarps - 1) {
+        auto run_dispatch_warp_publisher = [&]() {
             // === Async publisher on the spare dispatch warp ===
             // This warp otherwise idles through the pull window (it used to
             // wait at the pre-cleanup rendezvous); run the dst-grouped
@@ -1817,6 +1862,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         const uint64_t chain_wait_start = clock64();
         constexpr int64_t kPublishTimeoutCycles = 60ll * 2000000000ll;
         while (chain_pending != 0) {
+#ifdef DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_IDLE_NANOSLEEP
+            bool chain_made_progress = false;
+#endif
             if (clock64() - chain_wait_start >= kPublishTimeoutCycles) {
                 if (lane_idx == 0)
                     printf(
@@ -1846,9 +1894,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             combine_full_row_arrival_buffer
                                 .get_data_buffer(pool_block_idx)
                                 .get_base_ptr<uint32_t>();
-                        if ((ptx::ld_acq_sys(arrival_ptr) &
+                        if ((ptx::ld_acq(arrival_ptr) &
                              kCombineFullRowPublishReadyBit) == 0)
                             break;
+#ifdef DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_IDLE_NANOSLEEP
+                        chain_made_progress = true;
+#endif
                         if constexpr (kCombineStageRing) {
                             if (chain_is_inter and
                                 chain_stage_ready[idx] == 0) {
@@ -1992,9 +2043,30 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
                 chain_pending &= ~(1u << idx);
+#ifdef DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_IDLE_NANOSLEEP
+                chain_made_progress = true;
+#endif
             }
+#ifdef DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_IDLE_NANOSLEEP
+            // Productive scans and completed expert pairs never sleep.
+            if (not chain_made_progress and chain_pending != 0)
+                __nanosleep(
+                    DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_IDLE_NANOSLEEP);
+#endif
         }
 
+        };
+#ifdef DG_MEGA_MOE_DELAYED_DISPATCH_WARP_PUBLISHER
+        DG_STATIC_ASSERT(kDispatchWarpPublisher,
+                         "Delayed publisher requires dispatch-warp publisher");
+        constexpr bool kRunPullOnThisDispatchWarp = true;
+#else
+        const bool kRunPullOnThisDispatchWarp =
+            not (kDispatchWarpPublisher and
+                 warp_idx == kNumDispatchWarps - 1);
+#endif
+        if (not kRunPullOnThisDispatchWarp) {
+            run_dispatch_warp_publisher();
         } else {
         const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
         const auto pull_mbarrier = dispatch_barriers[warp_idx];
@@ -2018,8 +2090,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         uint32_t expert_start_idx = 0, expert_end_idx = 0;
         uint32_t expert_pool_block_offset = 0;
 
+#ifdef DG_MEGA_MOE_DELAYED_DISPATCH_WARP_PUBLISHER
+        constexpr uint32_t kNumPullWarps = kNumDispatchWarps;
+#else
         constexpr uint32_t kNumPullWarps = kDispatchWarpPublisher
             ? kNumDispatchWarps - 1 : kNumDispatchWarps;
+#endif
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumPullWarps;
         for (uint32_t token_idx = sm_idx * kNumPullWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
             int old_expert_idx = current_expert_idx;
@@ -2304,6 +2380,14 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         }
 #endif
 
+#ifdef DG_MEGA_MOE_DELAYED_DISPATCH_WARP_PUBLISHER
+        // Both dispatch warps retain the original pull parallelism.  Once the
+        // CTA-local pull partition is complete, warp 1 changes role and starts
+        // publication; warp 0 can proceed to the existing cleanup rendezvous.
+        ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        if (warp_idx == kNumDispatchWarps - 1)
+            run_dispatch_warp_publisher();
+#endif
         }
 #endif
 
@@ -2544,13 +2628,15 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     if constexpr (not kSplitABLoader) {
                         const uint32_t n_idx =
                             local_expert_idx * shape_n + n_block_idx * BLOCK_N;
-                        const uint32_t k_idx_packed = k_block_idx * (BLOCK_K / 2);
                         auto b_full_barrier = kUseEarlyBDecode
                             ? decode_full_barriers[stage_idx]
                             : full_barriers[stage_idx];
-                        tma::copy<BLOCK_K / 2, LOAD_BLOCK_N, kSwizzleBPackedMode, b_packed_dtype_t>(
-                            tensor_map_b_ptr, b_full_barrier, smem_b_packed[stage_idx],
-                            k_idx_packed, n_idx, 1);
+                        tma::copy<
+                            BLOCK_K / 2, LOAD_BLOCK_N,
+                            kSwizzleBPackedMode, b_packed_dtype_t>(
+                            tensor_map_b_ptr, b_full_barrier,
+                            smem_b_packed[stage_idx],
+                            k_block_idx * (BLOCK_K / 2), n_idx, 1);
                     }
 
                     // TMA load SFA
@@ -2787,6 +2873,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         const uint64_t chain_wait_start = clock64();
         constexpr int64_t kPublishTimeoutCycles = 60ll * 2000000000ll;
         while (chain_pending != 0) {
+#ifdef DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_IDLE_NANOSLEEP
+            bool chain_made_progress = false;
+#endif
             if (clock64() - chain_wait_start >= kPublishTimeoutCycles) {
                 if (lane_idx == 0)
                     printf(
@@ -2816,9 +2905,12 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             combine_full_row_arrival_buffer
                                 .get_data_buffer(pool_block_idx)
                                 .get_base_ptr<uint32_t>();
-                        if ((ptx::ld_acq_sys(arrival_ptr) &
+                        if ((ptx::ld_acq(arrival_ptr) &
                              kCombineFullRowPublishReadyBit) == 0)
                             break;
+#ifdef DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_IDLE_NANOSLEEP
+                        chain_made_progress = true;
+#endif
                         if constexpr (kCombineStageRing) {
                             if (chain_is_inter and
                                 chain_stage_ready[idx] == 0) {
@@ -2962,7 +3054,16 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
                 chain_pending &= ~(1u << idx);
+#ifdef DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_IDLE_NANOSLEEP
+                chain_made_progress = true;
+#endif
             }
+#ifdef DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_IDLE_NANOSLEEP
+            // Productive scans and completed expert pairs never sleep.
+            if (not chain_made_progress and chain_pending != 0)
+                __nanosleep(
+                    DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_IDLE_NANOSLEEP);
+#endif
         }
 
         ptx::sync_unaligned(
@@ -3108,7 +3209,46 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 typename mma::sm90::FP8MMASelector<(WG_BLOCK_N >= 64 ? WG_BLOCK_N / 2 : WG_BLOCK_N)>::type;
             constexpr uint32_t kSSHalfAccum = SSHalfWGMMA::kNumAccum;
             constexpr uint32_t kSSAccum = kSSNSplitActive ? kSSHalfAccum : kAccumPerThread;
+            // A split-M warpgroup can be outside the valid rows of a short or
+            // tail block.  It must keep participating in decode and pipeline
+            // barriers, but issuing WGMMA for it is pure waste: the epilogue
+            // already drops the corresponding fragment below.  Split-N
+            // warpgroups all cover the same M rows and therefore stay active.
+            const bool wg_has_valid_rows =
+                kSplitNWarpgroups or wg_m_offset < valid_m;
+            constexpr bool kDirectAccumulator =
+                not kSwapABEligible and BLOCK_M == 128 and BLOCK_N == 128 and
+                WG_BLOCK_N == 128;
             float final_accum[kAccumPerThread] = {};
+            float direct_prev_scale_0 = 1.0f;
+            float direct_prev_scale_1 = 1.0f;
+            const auto direct_rescale_final = [&] (
+                    const float& prev_scale_0,
+                    const float& prev_scale_1,
+                    const float& scale_0,
+                    const float& scale_1) {
+                const float ratio_0 = prev_scale_0 *
+                    (kFastMath ? math::fast_rcp(scale_0) : 1.0f / scale_0);
+                const float ratio_1 = prev_scale_1 *
+                    (kFastMath ? math::fast_rcp(scale_1) : 1.0f / scale_1);
+                #pragma unroll
+                for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                    final_accum[i * 4 + 0] *= ratio_0;
+                    final_accum[i * 4 + 1] *= ratio_0;
+                    final_accum[i * 4 + 2] *= ratio_1;
+                    final_accum[i * 4 + 3] *= ratio_1;
+                }
+            };
+            const auto direct_postscale_final = [&] (
+                    const float& scale_0, const float& scale_1) {
+                #pragma unroll
+                for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                    final_accum[i * 4 + 0] *= scale_0;
+                    final_accum[i * 4 + 1] *= scale_0;
+                    final_accum[i * 4 + 2] *= scale_1;
+                    final_accum[i * 4 + 3] *= scale_1;
+                }
+            };
             {
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
@@ -3124,15 +3264,18 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 // Read SF (must precede warpgroup_arrive)
                 float scale_a_0_lo, scale_a_1_lo;
                 float scale_a_0_hi, scale_a_1_hi;  // Only used in L2 (per-64 K)
-                if (block_phase == sched::BlockPhase::Linear1) {
+                if (wg_has_valid_rows and
+                    block_phase == sched::BlockPhase::Linear1) {
                     scale_a_0_lo = ptx::ld_shared(smem_sfa[stage_idx] + wg_m_offset + r_0);
                     scale_a_1_lo = ptx::ld_shared(smem_sfa[stage_idx] + wg_m_offset + r_1);
                 } else if constexpr (kL2ActsSFGranK == 64) {
+                    if (wg_has_valid_rows) {
                     // L2: SFA layout is (K=2, M=BLOCK_M) MN-major; first half SF at offset 0, second at BLOCK_M
                     scale_a_0_lo = ptx::ld_shared(smem_sfa[stage_idx] + 0 * BLOCK_M + wg_m_offset + r_0);
                     scale_a_1_lo = ptx::ld_shared(smem_sfa[stage_idx] + 0 * BLOCK_M + wg_m_offset + r_1);
                     scale_a_0_hi = ptx::ld_shared(smem_sfa[stage_idx] + 1 * BLOCK_M + wg_m_offset + r_0);
                     scale_a_1_hi = ptx::ld_shared(smem_sfa[stage_idx] + 1 * BLOCK_M + wg_m_offset + r_1);
+                    }
                 }
 
                 // ----- FP4-to-E4M3 dequant of the packed weight tile -----
@@ -3164,7 +3307,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
                             kUseWideLoadDecode>(
                             decode_thread_idx, kNumFP4DecodeWorkerThreads,
-                            smem_b_packed[stage_idx], smem_b[stage_idx], smem_sfb[stage_idx]);
+                            smem_b_packed[stage_idx], smem_b[stage_idx],
+                            smem_sfb[stage_idx]);
                     }
                 }
                 if constexpr (kNumMathWGDecodeWarps > 0) {
@@ -3185,6 +3329,16 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         clock64() - profile_decode_wait_start;
 #endif
 
+                if (not wg_has_valid_rows) {
+                    // Return this warp's stage credit exactly as the WGMMA
+                    // path does.  The active split-M warpgroup remains the
+                    // final consumer, so the loader cannot recycle the stage
+                    // before its reads complete.
+                    if (lane_idx == 0)
+                        empty_barriers[stage_idx]->arrive();
+                    continue;
+                }
+
                 if (block_phase == sched::BlockPhase::Linear1) {
                     if constexpr (kSwapABL1Active) {
                         // L1 swapAB: WGMMA-M is the 64-row weight slice owned by
@@ -3193,51 +3347,63 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         auto run_swap_ab_l1 = [&]<uint32_t N_SWAP>() {
                             using SwapWGMMA = typename mma::sm90::FP8MMASelector<N_SWAP>::type;
                             constexpr uint32_t kSwapAccum = SwapWGMMA::kNumAccum;
-                            float swap_accum[kSwapAccum];
+                            constexpr uint32_t kSwapAccumStride =
+                                kAccumPerThread / kSwapABNSubtiles;
+                            DG_STATIC_ASSERT(
+                                kSwapAccum <= kSwapAccumStride,
+                                "swap accumulator does not fit N64 subtile slot");
 
                             #pragma unroll
-                            for (uint32_t i = 0; i < kSwapAccum; ++ i)
-                                ptx::warpgroup_fence_operand(swap_accum[i]);
-                            ptx::warpgroup_arrive();
-                            #pragma unroll
-                            for (uint32_t k = 0; k < BLOCK_K / SwapWGMMA::K; ++ k) {
-                                auto desc_a = mma::sm90::make_smem_desc(
-                                    smem_b[stage_idx] + smem_b_wg_offset + k * SwapWGMMA::K, 1);
-                                auto desc_b = mma::sm90::make_smem_desc(
-                                    smem_a[stage_idx] + k * SwapWGMMA::K, 1);
-                                SwapWGMMA::wgmma(desc_a, desc_b, swap_accum, k);
-                            }
-                            ptx::warpgroup_commit_batch();
-                            #pragma unroll
-                            for (uint32_t i = 0; i < kSwapAccum; ++ i)
-                                ptx::warpgroup_fence_operand(swap_accum[i]);
-                            ptx::warpgroup_wait<0>();
+                            for (uint32_t sub = 0;
+                                 sub < kSwapABNSubtiles; ++ sub) {
+                                float swap_accum[kSwapAccum];
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                    ptx::warpgroup_fence_operand(swap_accum[i]);
+                                ptx::warpgroup_arrive();
+                                #pragma unroll
+                                for (uint32_t k = 0;
+                                     k < BLOCK_K / SwapWGMMA::K; ++ k) {
+                                    auto desc_a = mma::sm90::make_smem_desc(
+                                        smem_b[stage_idx] + smem_b_wg_offset +
+                                            sub * 64 * BLOCK_K +
+                                            k * SwapWGMMA::K,
+                                        1);
+                                    auto desc_b = mma::sm90::make_smem_desc(
+                                        smem_a[stage_idx] + k * SwapWGMMA::K,
+                                        1);
+                                    SwapWGMMA::wgmma(
+                                        desc_a, desc_b, swap_accum, k);
+                                }
+                                ptx::warpgroup_commit_batch();
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                    ptx::warpgroup_fence_operand(swap_accum[i]);
+                                ptx::warpgroup_wait<0>();
 
-                            #pragma unroll
-                            for (uint32_t i = 0; i < kSwapAccum / 4; ++ i) {
-                                const uint32_t token_0 = i * 8 + col_idx * 2;
-                                const uint32_t token_1 = token_0 + 1;
-                                if constexpr (kSwapABFastAmaxActive) {
+                                const uint32_t accum_base =
+                                    sub * kSwapAccumStride;
+                                #pragma unroll
+                                for (uint32_t i = 0;
+                                     i < kSwapAccum / 4; ++ i) {
+                                    const uint32_t token_0 =
+                                        i * 8 + col_idx * 2;
+                                    const uint32_t token_1 = token_0 + 1;
                                     if (token_0 < valid_m) {
-                                        const float scale_0 = ptx::ld_shared(smem_sfa[stage_idx] + token_0);
-                                        final_accum[i * 4 + 0] += scale_0 * swap_accum[i * 4 + 0];
-                                        final_accum[i * 4 + 2] += scale_0 * swap_accum[i * 4 + 2];
+                                        const float scale_0 = ptx::ld_shared(
+                                            smem_sfa[stage_idx] + token_0);
+                                        final_accum[accum_base + i * 4 + 0] +=
+                                            scale_0 * swap_accum[i * 4 + 0];
+                                        final_accum[accum_base + i * 4 + 2] +=
+                                            scale_0 * swap_accum[i * 4 + 2];
                                     }
                                     if (token_1 < valid_m) {
-                                        const float scale_1 = ptx::ld_shared(smem_sfa[stage_idx] + token_1);
-                                        final_accum[i * 4 + 1] += scale_1 * swap_accum[i * 4 + 1];
-                                        final_accum[i * 4 + 3] += scale_1 * swap_accum[i * 4 + 3];
-                                    }
-                                } else {
-                                    if (token_0 < valid_m) {
-                                        const float scale_0 = ptx::ld_shared(smem_sfa[stage_idx] + token_0);
-                                        final_accum[i * 4 + 0] += scale_0 * swap_accum[i * 4 + 0];
-                                        final_accum[i * 4 + 2] += scale_0 * swap_accum[i * 4 + 2];
-                                    }
-                                    if (token_1 < valid_m) {
-                                        const float scale_1 = ptx::ld_shared(smem_sfa[stage_idx] + token_1);
-                                        final_accum[i * 4 + 1] += scale_1 * swap_accum[i * 4 + 1];
-                                        final_accum[i * 4 + 3] += scale_1 * swap_accum[i * 4 + 3];
+                                        const float scale_1 = ptx::ld_shared(
+                                            smem_sfa[stage_idx] + token_1);
+                                        final_accum[accum_base + i * 4 + 1] +=
+                                            scale_1 * swap_accum[i * 4 + 1];
+                                        final_accum[accum_base + i * 4 + 3] +=
+                                            scale_1 * swap_accum[i * 4 + 3];
                                     }
                                 }
                             }
@@ -3254,6 +3420,20 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 run_swap_ab_l1.template operator()<16>();
                             } else if (n_swap <= 24) {
                                 run_swap_ab_l1.template operator()<24>();
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 1
+                            } else if (n_swap <= 32) {
+                                run_swap_ab_l1.template operator()<32>();
+                            } else if (n_swap <= 40) {
+                                run_swap_ab_l1.template operator()<40>();
+#endif
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 2
+                            } else if (n_swap <= 48) {
+                                run_swap_ab_l1.template operator()<48>();
+#endif
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 3
+                            } else if (n_swap <= 56) {
+                                run_swap_ab_l1.template operator()<56>();
+#endif
                             } else {
                                 run_swap_ab_l1.template operator()<64>();
                             }
@@ -3262,10 +3442,62 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 run_swap_ab_l1.template operator()<8>();
                             } else if (n_swap <= 16) {
                                 run_swap_ab_l1.template operator()<16>();
+#ifdef DG_MEGA_MOE_FP4_SWAP_AB_N24
+                            } else if (n_swap <= 24) {
+                                run_swap_ab_l1.template operator()<24>();
+#endif
+                            } else if (n_swap <= 32) {
+                                run_swap_ab_l1.template operator()<32>();
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 1
+                            } else if (n_swap <= 40) {
+                                run_swap_ab_l1.template operator()<40>();
+#endif
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 2
+                            } else if (n_swap <= 48) {
+                                run_swap_ab_l1.template operator()<48>();
+#endif
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 3
+                            } else if (n_swap <= 56) {
+                                run_swap_ab_l1.template operator()<56>();
+#endif
                             } else {
                                 run_swap_ab_l1.template operator()<64>();
                             }
                         }
+                    } else if constexpr (kDirectAccumulator) {
+                        if (k_block_idx != 0)
+                            direct_rescale_final(
+                                direct_prev_scale_0, direct_prev_scale_1,
+                                scale_a_0_lo, scale_a_1_lo);
+
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            ptx::warpgroup_fence_operand(final_accum[i]);
+                        ptx::warpgroup_arrive();
+                        #pragma unroll
+                        for (uint32_t k = 0;
+                             k < BLOCK_K / WGMMA::K; ++ k) {
+                            auto desc_a = mma::sm90::make_smem_desc(
+                                smem_a[stage_idx] + smem_a_wg_offset +
+                                    k * WGMMA::K,
+                                1);
+                            auto desc_b = mma::sm90::make_smem_desc(
+                                smem_b[stage_idx] + smem_b_wg_offset +
+                                    k * WGMMA::K,
+                                1);
+                            WGMMA::wgmma(
+                                desc_a, desc_b, final_accum, true);
+                        }
+                        ptx::warpgroup_commit_batch();
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            ptx::warpgroup_fence_operand(final_accum[i]);
+                        ptx::warpgroup_wait<0>();
+
+                        if (lane_idx == 0)
+                            empty_barriers[stage_idx]->arrive();
+                        direct_prev_scale_0 = scale_a_0_lo;
+                        direct_prev_scale_1 = scale_a_1_lo;
                     } else {
                     // Single per-128 K-block WGMMA group
                     if constexpr (kSSNSplitActive) {
@@ -3340,81 +3572,102 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         auto run_swap_ab_l2 = [&]<uint32_t N_SWAP>() {
                             using SwapWGMMA = typename mma::sm90::FP8MMASelector<N_SWAP>::type;
                             constexpr uint32_t kSwapAccum = SwapWGMMA::kNumAccum;
-                            float swap_accum[kSwapAccum];
+                            constexpr uint32_t kSwapAccumStride =
+                                kAccumPerThread / kSwapABNSubtiles;
+                            DG_STATIC_ASSERT(
+                                kSwapAccum <= kSwapAccumStride,
+                                "swap accumulator does not fit N64 subtile slot");
 
-                            auto promote_swap_accum = [&](const uint32_t& sf_group) {
-                                #pragma unroll
-                                for (uint32_t i = 0; i < kSwapAccum / 4; ++ i) {
-                                    const uint32_t token_0 = i * 8 + col_idx * 2;
-                                    const uint32_t token_1 = token_0 + 1;
-                                    if constexpr (kSwapABFastAmaxActive) {
+                            #pragma unroll
+                            for (uint32_t sub = 0;
+                                 sub < kSwapABNSubtiles; ++ sub) {
+                                float swap_accum[kSwapAccum];
+                                const uint32_t accum_base =
+                                    sub * kSwapAccumStride;
+
+                                auto promote_swap_accum =
+                                    [&](const uint32_t& sf_group) {
+                                    #pragma unroll
+                                    for (uint32_t i = 0;
+                                         i < kSwapAccum / 4; ++ i) {
+                                        const uint32_t token_0 =
+                                            i * 8 + col_idx * 2;
+                                        const uint32_t token_1 = token_0 + 1;
                                         if (token_0 < valid_m) {
                                             const float scale_0 = ptx::ld_shared(
-                                                smem_sfa[stage_idx] + sf_group * BLOCK_M + token_0);
-                                            final_accum[i * 4 + 0] += scale_0 * swap_accum[i * 4 + 0];
-                                            final_accum[i * 4 + 2] += scale_0 * swap_accum[i * 4 + 2];
+                                                smem_sfa[stage_idx] +
+                                                sf_group * BLOCK_M + token_0);
+                                            final_accum[
+                                                accum_base + i * 4 + 0] +=
+                                                scale_0 * swap_accum[i * 4 + 0];
+                                            final_accum[
+                                                accum_base + i * 4 + 2] +=
+                                                scale_0 * swap_accum[i * 4 + 2];
                                         }
                                         if (token_1 < valid_m) {
                                             const float scale_1 = ptx::ld_shared(
-                                                smem_sfa[stage_idx] + sf_group * BLOCK_M + token_1);
-                                            final_accum[i * 4 + 1] += scale_1 * swap_accum[i * 4 + 1];
-                                            final_accum[i * 4 + 3] += scale_1 * swap_accum[i * 4 + 3];
-                                        }
-                                    } else {
-                                        if (token_0 < valid_m) {
-                                            const float scale_0 = ptx::ld_shared(
-                                                smem_sfa[stage_idx] + sf_group * BLOCK_M + token_0);
-                                            final_accum[i * 4 + 0] += scale_0 * swap_accum[i * 4 + 0];
-                                            final_accum[i * 4 + 2] += scale_0 * swap_accum[i * 4 + 2];
-                                        }
-                                        if (token_1 < valid_m) {
-                                            const float scale_1 = ptx::ld_shared(
-                                                smem_sfa[stage_idx] + sf_group * BLOCK_M + token_1);
-                                            final_accum[i * 4 + 1] += scale_1 * swap_accum[i * 4 + 1];
-                                            final_accum[i * 4 + 3] += scale_1 * swap_accum[i * 4 + 3];
+                                                smem_sfa[stage_idx] +
+                                                sf_group * BLOCK_M + token_1);
+                                            final_accum[
+                                                accum_base + i * 4 + 1] +=
+                                                scale_1 * swap_accum[i * 4 + 1];
+                                            final_accum[
+                                                accum_base + i * 4 + 3] +=
+                                                scale_1 * swap_accum[i * 4 + 3];
                                         }
                                     }
+                                };
+
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                    ptx::warpgroup_fence_operand(swap_accum[i]);
+                                ptx::warpgroup_arrive();
+                                #pragma unroll
+                                for (uint32_t k = 0;
+                                     k < (BLOCK_K / 2) / SwapWGMMA::K; ++ k) {
+                                    auto desc_a = mma::sm90::make_smem_desc(
+                                        smem_b[stage_idx] + smem_b_wg_offset +
+                                            sub * 64 * BLOCK_K +
+                                            k * SwapWGMMA::K,
+                                        1);
+                                    auto desc_b = mma::sm90::make_smem_desc(
+                                        smem_a[stage_idx] + k * SwapWGMMA::K,
+                                        1);
+                                    SwapWGMMA::wgmma(
+                                        desc_a, desc_b, swap_accum, k);
                                 }
-                            };
+                                ptx::warpgroup_commit_batch();
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                    ptx::warpgroup_fence_operand(swap_accum[i]);
+                                ptx::warpgroup_wait<0>();
+                                promote_swap_accum(0);
 
-                            #pragma unroll
-                            for (uint32_t i = 0; i < kSwapAccum; ++ i)
-                                ptx::warpgroup_fence_operand(swap_accum[i]);
-                            ptx::warpgroup_arrive();
-                            #pragma unroll
-                            for (uint32_t k = 0; k < (BLOCK_K / 2) / SwapWGMMA::K; ++ k) {
-                                auto desc_a = mma::sm90::make_smem_desc(
-                                    smem_b[stage_idx] + smem_b_wg_offset + k * SwapWGMMA::K, 1);
-                                auto desc_b = mma::sm90::make_smem_desc(
-                                    smem_a[stage_idx] + k * SwapWGMMA::K, 1);
-                                SwapWGMMA::wgmma(desc_a, desc_b, swap_accum, k);
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                    ptx::warpgroup_fence_operand(swap_accum[i]);
+                                ptx::warpgroup_arrive();
+                                #pragma unroll
+                                for (uint32_t k = 0;
+                                     k < (BLOCK_K / 2) / SwapWGMMA::K; ++ k) {
+                                    const uint32_t k_off =
+                                        (BLOCK_K / 2) + k * SwapWGMMA::K;
+                                    auto desc_a = mma::sm90::make_smem_desc(
+                                        smem_b[stage_idx] + smem_b_wg_offset +
+                                            sub * 64 * BLOCK_K + k_off,
+                                        1);
+                                    auto desc_b = mma::sm90::make_smem_desc(
+                                        smem_a[stage_idx] + k_off, 1);
+                                    SwapWGMMA::wgmma(
+                                        desc_a, desc_b, swap_accum, k);
+                                }
+                                ptx::warpgroup_commit_batch();
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                    ptx::warpgroup_fence_operand(swap_accum[i]);
+                                ptx::warpgroup_wait<0>();
+                                promote_swap_accum(1);
                             }
-                            ptx::warpgroup_commit_batch();
-                            #pragma unroll
-                            for (uint32_t i = 0; i < kSwapAccum; ++ i)
-                                ptx::warpgroup_fence_operand(swap_accum[i]);
-                            ptx::warpgroup_wait<0>();
-                            promote_swap_accum(0);
-
-                            #pragma unroll
-                            for (uint32_t i = 0; i < kSwapAccum; ++ i)
-                                ptx::warpgroup_fence_operand(swap_accum[i]);
-                            ptx::warpgroup_arrive();
-                            #pragma unroll
-                            for (uint32_t k = 0; k < (BLOCK_K / 2) / SwapWGMMA::K; ++ k) {
-                                const uint32_t k_off = (BLOCK_K / 2) + k * SwapWGMMA::K;
-                                auto desc_a = mma::sm90::make_smem_desc(
-                                    smem_b[stage_idx] + smem_b_wg_offset + k_off, 1);
-                                auto desc_b = mma::sm90::make_smem_desc(
-                                    smem_a[stage_idx] + k_off, 1);
-                                SwapWGMMA::wgmma(desc_a, desc_b, swap_accum, k);
-                            }
-                            ptx::warpgroup_commit_batch();
-                            #pragma unroll
-                            for (uint32_t i = 0; i < kSwapAccum; ++ i)
-                                ptx::warpgroup_fence_operand(swap_accum[i]);
-                            ptx::warpgroup_wait<0>();
-                            promote_swap_accum(1);
 
                             if (lane_idx == 0)
                                 empty_barriers[stage_idx]->arrive();
@@ -3430,6 +3683,18 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 run_swap_ab_l2.template operator()<24>();
                             } else if (n_swap <= 32) {
                                 run_swap_ab_l2.template operator()<32>();
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 1
+                            } else if (n_swap <= 40) {
+                                run_swap_ab_l2.template operator()<40>();
+#endif
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 2
+                            } else if (n_swap <= 48) {
+                                run_swap_ab_l2.template operator()<48>();
+#endif
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 3
+                            } else if (n_swap <= 56) {
+                                run_swap_ab_l2.template operator()<56>();
+#endif
                             } else {
                                 run_swap_ab_l2.template operator()<64>();
                             }
@@ -3438,12 +3703,92 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 run_swap_ab_l2.template operator()<8>();
                             } else if (n_swap <= 16) {
                                 run_swap_ab_l2.template operator()<16>();
+#ifdef DG_MEGA_MOE_FP4_SWAP_AB_N24
+                            } else if (n_swap <= 24) {
+                                run_swap_ab_l2.template operator()<24>();
+#endif
                             } else if (n_swap <= 32) {
                                 run_swap_ab_l2.template operator()<32>();
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 1
+                            } else if (n_swap <= 40) {
+                                run_swap_ab_l2.template operator()<40>();
+#endif
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 2
+                            } else if (n_swap <= 48) {
+                                run_swap_ab_l2.template operator()<48>();
+#endif
+#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 3
+                            } else if (n_swap <= 56) {
+                                run_swap_ab_l2.template operator()<56>();
+#endif
                             } else {
                                 run_swap_ab_l2.template operator()<64>();
                             }
                         }
+                    } else if constexpr (kDirectAccumulator) {
+                        DG_STATIC_ASSERT(
+                            kL2ActsSFGranK == 64,
+                            "Direct M128/N128 L2 expects per-64 activation scales");
+                        if (k_block_idx != 0)
+                            direct_rescale_final(
+                                direct_prev_scale_0, direct_prev_scale_1,
+                                scale_a_0_lo, scale_a_1_lo);
+
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            ptx::warpgroup_fence_operand(final_accum[i]);
+                        ptx::warpgroup_arrive();
+                        #pragma unroll
+                        for (uint32_t k = 0;
+                             k < (BLOCK_K / 2) / WGMMA::K; ++ k) {
+                            auto desc_a = mma::sm90::make_smem_desc(
+                                smem_a[stage_idx] + smem_a_wg_offset +
+                                    k * WGMMA::K,
+                                1);
+                            auto desc_b = mma::sm90::make_smem_desc(
+                                smem_b[stage_idx] + smem_b_wg_offset +
+                                    k * WGMMA::K,
+                                1);
+                            WGMMA::wgmma(
+                                desc_a, desc_b, final_accum, true);
+                        }
+                        ptx::warpgroup_commit_batch();
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            ptx::warpgroup_fence_operand(final_accum[i]);
+                        ptx::warpgroup_wait<0>();
+
+                        direct_rescale_final(
+                            scale_a_0_lo, scale_a_1_lo,
+                            scale_a_0_hi, scale_a_1_hi);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            ptx::warpgroup_fence_operand(final_accum[i]);
+                        ptx::warpgroup_arrive();
+                        #pragma unroll
+                        for (uint32_t k = 0;
+                             k < (BLOCK_K / 2) / WGMMA::K; ++ k) {
+                            const uint32_t k_off =
+                                BLOCK_K / 2 + k * WGMMA::K;
+                            auto desc_a = mma::sm90::make_smem_desc(
+                                smem_a[stage_idx] + smem_a_wg_offset + k_off,
+                                1);
+                            auto desc_b = mma::sm90::make_smem_desc(
+                                smem_b[stage_idx] + smem_b_wg_offset + k_off,
+                                1);
+                            WGMMA::wgmma(
+                                desc_a, desc_b, final_accum, true);
+                        }
+                        ptx::warpgroup_commit_batch();
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            ptx::warpgroup_fence_operand(final_accum[i]);
+                        ptx::warpgroup_wait<0>();
+
+                        if (lane_idx == 0)
+                            empty_barriers[stage_idx]->arrive();
+                        direct_prev_scale_0 = scale_a_0_hi;
+                        direct_prev_scale_1 = scale_a_1_hi;
                     } else if constexpr (kL2ActsSFGranK == 32) {
                         // L2 BLOCK_N=64: L1 produced 32-column FP8 chunks with
                         // independent SF, so promote each WGMMA::K=32 slice with
@@ -3610,6 +3955,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 }
             }
             }
+            if constexpr (kDirectAccumulator) {
+                if (num_k_blocks != 0 and wg_has_valid_rows)
+                    direct_postscale_final(
+                        direct_prev_scale_0, direct_prev_scale_1);
+            }
 
             // L2 is the last consumer of both physical compute slots.  One
             // retirement is published per L2 N-block after every math
@@ -3662,6 +4012,190 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     while (ptx::ld_acq(empty_ptr) < empty_target);
                 }
                 if constexpr (kSwapABL1Active) {
+                    if constexpr (kSwapABNSubtiles == 2) {
+                    // N256/internal-N64: each WG owns one N128 weight slice,
+                    // represented as two adjacent N64 swap subtiles.  Unlike
+                    // the N128 outer tile, each WG now produces a complete
+                    // 64-column activation-SF group, so quantization and the
+                    // TMA store can remain WG-local.
+                    DG_STATIC_ASSERT(not kSwapABFastAmaxActive,
+                                     "N256 A/B starts with the proven FP32 staging epilogue");
+                    auto silu = [](float x) -> float {
+                        const float e = kFastMath ? __expf(-x) : expf(-x);
+                        const float sig = kFastMath
+                            ? math::fast_rcp(1.0f + e)
+                            : 1.0f / (1.0f + e);
+                        return x * sig;
+                    };
+                    auto clamp_gate = [](float& x) {
+                        if constexpr (kActivationClamp !=
+                                      cute::numeric_limits<float>::infinity())
+                            x = cute::min(x, kActivationClamp);
+                    };
+                    auto clamp_up = [](float& x) {
+                        if constexpr (kActivationClamp !=
+                                      cute::numeric_limits<float>::infinity())
+                            x = cute::min(
+                                cute::max(x, -kActivationClamp),
+                                kActivationClamp);
+                    };
+
+                    constexpr uint32_t kSwapSmemRowStride =
+                        WG_L1_OUT_BLOCK_N;
+                    constexpr uint32_t kSwapAccumStride =
+                        kAccumPerThread / kSwapABNSubtiles;
+                    const uint32_t swap_smem_wg_base =
+                        epilogue_wg_idx * BLOCK_M * WG_L1_OUT_BLOCK_N;
+
+                    auto store_l1_swap_chunk = [&](const uint32_t& i) {
+                        const uint32_t token_0 = i * 8 + col_idx * 2;
+                        const uint32_t token_1 = token_0 + 1;
+                        #pragma unroll
+                        for (uint32_t sub = 0;
+                             sub < kSwapABNSubtiles; ++ sub) {
+                            const uint32_t accum_base =
+                                sub * kSwapAccumStride;
+                            const uint32_t local_out_col =
+                                sub * 32 + warp_idx_in_wg * 8 + row_idx;
+                            if (token_0 < valid_m) {
+                                float gate =
+                                    final_accum[accum_base + i * 4 + 0];
+                                float up =
+                                    final_accum[accum_base + i * 4 + 2];
+                                clamp_gate(gate);
+                                clamp_up(up);
+                                smem_cd_swap_l1_fp32[
+                                    swap_smem_wg_base +
+                                    token_0 * kSwapSmemRowStride +
+                                    local_out_col] = silu(gate) * up;
+                            }
+                            if (token_1 < valid_m) {
+                                float gate =
+                                    final_accum[accum_base + i * 4 + 1];
+                                float up =
+                                    final_accum[accum_base + i * 4 + 3];
+                                clamp_gate(gate);
+                                clamp_up(up);
+                                smem_cd_swap_l1_fp32[
+                                    swap_smem_wg_base +
+                                    token_1 * kSwapSmemRowStride +
+                                    local_out_col] = silu(gate) * up;
+                            }
+                        }
+                    };
+
+                    const uint32_t num_swap_token_chunks =
+                        (valid_m + 7u) / 8u;
+                    store_l1_swap_chunk(0);
+                    if (valid_m > 8) {
+                        #pragma unroll
+                        for (uint32_t i = 1;
+                             i < kSwapABTokenChunks; ++ i) {
+                            if (i < num_swap_token_chunks)
+                                store_l1_swap_chunk(i);
+                        }
+                    }
+
+                    ptx::sync_aligned(
+                        128,
+                        kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+
+                    const uint32_t swap_quant_thread_idx =
+                        warp_idx_in_wg * 32 + lane_idx;
+                    constexpr uint32_t kSwapQuantThreads = 128;
+                    for (uint32_t token = swap_quant_thread_idx;
+                         token < valid_m;
+                         token += kSwapQuantThreads) {
+                        float amax = 0.0f;
+                        #pragma unroll
+                        for (uint32_t col = 0;
+                             col < kSwapSmemRowStride; ++ col) {
+                            const float v = smem_cd_swap_l1_fp32[
+                                swap_smem_wg_base +
+                                token * kSwapSmemRowStride + col];
+                            amax = cute::max(amax, cute::abs(v));
+                        }
+                        const float topk_weight =
+                            *l1_topk_weights_buffer
+                                .get_data_buffer(l1_ring_m_idx + token)
+                                .get_base_ptr<float>();
+                        amax *= cute::abs(topk_weight);
+                        float2 amax_pair = {amax, amax};
+                        float2 sf_pair, sf_inv_pair;
+                        sm90_fp8_fp4_mega_moe_get_e4m3_sf_and_sf_inv(
+                            amax_pair, sf_pair, sf_inv_pair);
+                        const float sf_inv =
+                            topk_weight * sf_inv_pair.x;
+
+                        const uint32_t sf_n_block_idx_local =
+                            n_block_idx * kWarpgroupSplitN +
+                            epilogue_wg_n_idx;
+                        l2_sf_buffer.get_base_ptr<float>()[
+                            sf_n_block_idx_local *
+                                kNumL2SFStorageTokens +
+                            l2_ring_sf_m_idx + token] = sf_pair.x;
+
+                        #pragma unroll
+                        for (uint32_t col = 0;
+                             col < kSwapSmemRowStride; col += 2) {
+                            const float v0 = smem_cd_swap_l1_fp32[
+                                swap_smem_wg_base +
+                                token * kSwapSmemRowStride + col] * sf_inv;
+                            const float v1 = smem_cd_swap_l1_fp32[
+                                swap_smem_wg_base +
+                                token * kSwapSmemRowStride + col + 1] * sf_inv;
+                            const __nv_fp8x2_e4m3 pair(
+                                make_float2(v0, v1));
+                            *reinterpret_cast<uint16_t*>(
+                                smem_cd_swap_l1_fp8 +
+                                swap_smem_wg_base +
+                                token * kSwapSmemRowStride + col) = pair.__x;
+                        }
+                    }
+
+                    ptx::sync_aligned(
+                        128,
+                        kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+                    if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
+                        cute::tma_store_fence();
+                        cute::SM90_TMA_STORE_2D::copy(
+                            &tensor_map_l1_output,
+                            smem_cd_swap_l1_fp8 + swap_smem_wg_base,
+                            n_block_idx * L1_OUT_BLOCK_N +
+                                wg_l1_out_n_offset,
+                            l2_ring_m_idx);
+                        cute::tma_store_arrive();
+                    }
+                    __syncwarp();
+                    ptx::tma_store_wait<0>();
+
+                    if constexpr (kL2ArrivalCounter) {
+                        if (warp_idx_in_wg == 0 and
+                            cute::elect_one_sync()) {
+                            ptx::red_add_rel(
+                                reinterpret_cast<uint32_t*>(
+                                    workspace.get_l2_arrival_mask_ptr(
+                                        pool_block_idx)),
+                                1);
+                        }
+                    } else {
+                        ptx::sync_aligned(
+                            kNumEpilogueThreads,
+                            kEpilogueFullBarrierIdx);
+                        if (epilogue_warp_idx == 0 and
+                            cute::elect_one_sync()) {
+                            ptx::red_or_rel_gpu(
+                                workspace.get_l2_arrival_mask_ptr(
+                                    pool_block_idx),
+                                1ull << n_block_idx);
+                        }
+                    }
+                    __syncwarp();
+                    if constexpr (kL2ArrivalCounter)
+                        ptx::sync_aligned(
+                            kNumEpilogueThreads,
+                            kEpilogueFullBarrierIdx);
+                    } else {
                     // Each split-N WG writes its disjoint 32-column range into
                     // a shared token-major tile. The default path stages FP32,
                     // then scans complete token rows for amax before quantizing.
@@ -3868,6 +4402,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     __syncwarp();
                     if constexpr (kL2ArrivalCounter)
                         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    }
                 } else {
                 // ---------------- L1 EPILOGUE: SwiGLU + FP8 quantize + TMA store ----------------
                 // Layout in `final_accum`:
@@ -4154,13 +4689,34 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     auto store_l2_swap_chunk = [&](const uint32_t& i) {
                         const uint32_t token_0 = i * 8 + col_idx * 2;
                         const uint32_t token_1 = token_0 + 1;
-                        if (token_0 < valid_m) {
-                            store_bf16(token_0, r_0, final_accum[i * 4 + 0]);
-                            store_bf16(token_0, r_1, final_accum[i * 4 + 2]);
-                        }
-                        if (token_1 < valid_m) {
-                            store_bf16(token_1, r_0, final_accum[i * 4 + 1]);
-                            store_bf16(token_1, r_1, final_accum[i * 4 + 3]);
+                        constexpr uint32_t kSwapAccumStride =
+                            kAccumPerThread / kSwapABNSubtiles;
+                        #pragma unroll
+                        for (uint32_t sub = 0;
+                             sub < kSwapABNSubtiles; ++ sub) {
+                            const uint32_t accum_base =
+                                sub * kSwapAccumStride;
+                            const uint32_t col_base = sub * 64;
+                            if (token_0 < valid_m) {
+                                store_bf16(
+                                    token_0, col_base + r_0,
+                                    final_accum[
+                                        accum_base + i * 4 + 0]);
+                                store_bf16(
+                                    token_0, col_base + r_1,
+                                    final_accum[
+                                        accum_base + i * 4 + 2]);
+                            }
+                            if (token_1 < valid_m) {
+                                store_bf16(
+                                    token_1, col_base + r_0,
+                                    final_accum[
+                                        accum_base + i * 4 + 1]);
+                                store_bf16(
+                                    token_1, col_base + r_1,
+                                    final_accum[
+                                        accum_base + i * 4 + 3]);
+                            }
                         }
                     };
 
@@ -4307,7 +4863,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                         (n_idx + wg_n_offset) * sizeof(nv_bfloat16) +
                                             lane_in_row * sizeof(uint4));
                                     *staging_ptr = packed;
-                                    if (lane_in_row == 0)
+                                    if (lane_in_row == 0 and
+                                        not kCombineExpertReady)
                                         atomicExch(smem_expert_count, 1u);
                                 } else {
                                     *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
@@ -4343,7 +4900,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                         (n_idx + wg_n_offset) * sizeof(nv_bfloat16) +
                                             lane_in_row * sizeof(uint2));
                                     *staging_ptr = packed;
-                                    if (lane_in_row == 0)
+                                    if (lane_in_row == 0 and
+                                        not kCombineExpertReady)
                                         atomicExch(smem_expert_count, 1u);
                                 } else {
                                     *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
@@ -4364,9 +4922,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 #if defined(DG_MEGA_MOE_INTERNODE)
                 if constexpr (kCombineFullRow) {
                     // Publish this N-block only after every warpgroup completed
-                    // its fragments.  The system-scope acq_rel RMW makes the
-                    // final CTA acquire all earlier producers; the last N-block
-                    // hands the block to the publisher via a release marker.
+                    // its fragments. GPU-scope acq_rel RMWs are sufficient for
+                    // the local producer/publisher hand-off. The last producer
+                    // retains a system-scope release so the staged payload is
+                    // visible to the RNIC before the publisher rings a doorbell.
                     // The scatter section executes per warpgroup (split-N: two
                     // WGs own halves of this block's columns; split-M: rows),
                     // so a CTA-wide sync here can deadlock against a WG still
@@ -4381,7 +4940,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         const auto arrival_ptr = combine_full_row_arrival_buffer
                             .get_data_buffer(m_idx / BLOCK_M)
                             .get_base_ptr<uint32_t>();
-                        const auto old = ptx::atomic_add_acq_rel_sys(arrival_ptr, 1);
+                        const auto old = ptx::atomic_add_acq_rel_gpu(arrival_ptr, 1);
                         // Split-N always needs every column warpgroup.
                         // Split-M only runs the M warpgroups covered by this
                         // block's valid rows: the early-return path above

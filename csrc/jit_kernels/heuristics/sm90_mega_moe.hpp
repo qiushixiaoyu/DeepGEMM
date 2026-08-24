@@ -202,15 +202,11 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
 
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
-    // EXPERIMENT (block-granularity probe, remove after use): force the
-    // small-batch 64-row split-N tile at any batch so the loader pool-ready
-    // gate waits on 64 rows instead of 128 (internode A-chain wait A/B).
-    const bool force_block_m64 =
-        get_env<int>("DG_MEGA_MOE_FP4_FORCE_BLOCK_M64", 0) != 0;
     const bool auto_split_mn =
-        expected_tokens_per_expert >= 64.0f and not force_block_m64;
-    const bool ultra_small_split_n = force_block_m64 or
-        (expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f);
+        expected_tokens_per_expert >= 64.0f;
+    const bool ultra_small_split_n =
+        expected_tokens_per_expert > 0.0f and
+        expected_tokens_per_expert < 0.375f;
     int block_m = auto_split_mn ? 128 : 64;
     int num_epilogue_warpgroups = (auto_split_mn or ultra_small_split_n) ? 2 : block_m / 64;
     DG_HOST_ASSERT(block_m >= 64 and block_m % 64 == 0);
@@ -303,7 +299,7 @@ static int get_default_num_stages_cap_for_mega_moe_sm90_fp4(
     const bool fp4_pro_shape = intermediate_hidden >= 3072;
     // Ordered first-match rules preserve the historical stage-cap priority.
     static constexpr FP4SM90StageCapRule stage_cap_rules[] = {
-        {6.0f, 12.0f, true, false, FP4SM90StageShape::Flash, 4},
+        {6.0f, 12.0f, true, false, FP4SM90StageShape::Flash, 5},
         {3.0f, 6.0f, false, false, FP4SM90StageShape::Flash, 4},
         {0.0f, 0.25f, false, false, FP4SM90StageShape::Pro, 5},
         {0.375f, 0.75f, true, false, FP4SM90StageShape::Pro, 5},
@@ -467,7 +463,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int smem_per_stage = block_m * block_k +
                                smem_b_decoded_per_stage +
                                smem_b_packed_per_stage +
-                               smem_sfa_per_stage + smem_sfb_per_stage;
+                               smem_sfa_per_stage +
+                               smem_sfb_per_stage;
 
     const int smem_barriers_fixed = (num_dispatch_warps + 2 * num_epilogue_warps) * 8;
     const int smem_decode_full_per_stage = use_early_b_decode ? 8 : 0;
@@ -512,13 +509,10 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     // Shape bands depend only on model shape and routing density; kernel bands add tile/thread constraints.
     const bool fp4_split_n_eligible =
         block_m == 64 and block_n % 128 == 0;
-    // EXPERIMENT (block-granularity probe): the forced 64-row tile must also
-    // engage the split-N decode-thread band (dispatch 64 / non-epi 320) so the
-    // probe reuses the exact thread shape already validated at small batch.
     const bool fp4_split_n_shape_band =
         (fp4_flash_or_pro_shape and
-         expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 64.0f)
-        or get_env<int>("DG_MEGA_MOE_FP4_FORCE_BLOCK_M64", 0) != 0;
+         expected_tokens_per_expert > 0.0f and
+         expected_tokens_per_expert < 64.0f);
     if (fp4_split_n_eligible and fp4_split_n_shape_band) {
         fp4_num_epilogue_warpgroups = 2;
     }
@@ -541,7 +535,6 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         num_compute_ring_tokens < 0 ? num_max_pool_tokens :
             std::min(num_max_pool_tokens, num_compute_ring_tokens),
         num_max_tokens_per_rank, num_ranks);
-
     const bool fp4_small_block_n_kernel =
         block_m == 64 and block_n == 128;
     const bool fp4_split_n_decode_thread_kernel_band =
@@ -558,17 +551,24 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
          fp4_decode_assist_thread_kernel_band) ? 64 : 128;
     const int num_dispatch_threads = default_num_dispatch_threads;
     DG_HOST_ASSERT(num_dispatch_threads == 64 or num_dispatch_threads == 128);
-    const int default_num_non_epilogue_threads =
-        fp4_split_n_decode_thread_kernel_band ? 320 :
+    // Once a split-N expert has enough rows, four decode-assist warps are
+    // sufficient to cover packed-FP4 conversion.  Keeping eight helpers for
+    // this middle-density band over-subscribes the SM warp schedulers and
+    // delays WGMMA/TMA issue.  Very sparse experts remain latency-sensitive:
+    // retain the original eight helpers below six expected rows/expert.
+    const bool fp4_middle_density_decode_assist_kernel_band =
+        fp4_split_n_decode_thread_kernel_band and
+        expected_tokens_per_expert >= 6.0f;
+    const int num_non_epilogue_threads =
+        fp4_split_n_decode_thread_kernel_band ?
+            (fp4_middle_density_decode_assist_kernel_band ? 192 : 320) :
         (fp4_decode_assist_thread_kernel_band ? 192 : 128);
-    const int num_non_epilogue_threads = default_num_non_epilogue_threads;
     DG_HOST_ASSERT(num_non_epilogue_threads >= 128 and
                    num_non_epilogue_threads % 64 == 0);
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);
 
     const int default_num_stages_cap = get_default_num_stages_cap_for_mega_moe_sm90_fp4(
         intermediate_hidden, block_m, block_n, expected_tokens_per_expert);
-
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90_fp4(
         SM90ArchSpec::smem_capacity,
         num_experts, hidden,

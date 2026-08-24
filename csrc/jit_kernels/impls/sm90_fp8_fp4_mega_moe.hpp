@@ -121,6 +121,7 @@ public:
         std::string internode_prefix =
             "// sm90 fp4 mega-moe protocol revision 3\n"
             "// sm90 fp4 mega-moe support uses nvshmem device helpers\n";
+        bool use_delayed_dispatch_warp_publisher = false;
         if (args.num_ranks > kNvlPeers) {
             internode_prefix += fmt::format(
                 "// inter-node mega-moe: uses nvshmem device functions\n"
@@ -132,19 +133,127 @@ public:
             if (dispatch_gateway == 3)
                 internode_prefix +=
                     "#define DG_MEGA_MOE_DISPATCH_GATEWAY_PACKED 1\n";
-            else
+            else {
                 internode_prefix +=
                     "#define DG_MEGA_MOE_DISPATCH_GATEWAY_DENSE_V3 1\n";
+                // Only the prefix that can own input tokens participates in
+                // dense metadata production.  The rest of the grid remains
+                // available to pull/GEMM/scatter without paying empty
+                // expert stake-out, system-fence and direction-counter work.
+                const int tokens_per_metadata_cta =
+                    (args.config.num_dispatch_threads / 32) *
+                    (32 / args.num_topk);
+                const int num_metadata_sms = std::min(
+                    args.launch_args.grid_dim.first,
+                    std::max(1,
+                             (args.num_tokens + tokens_per_metadata_cta - 1) /
+                                 tokens_per_metadata_cta));
+                internode_prefix += fmt::format(
+                    "#define DG_MEGA_MOE_NUM_METADATA_SMS {}\n",
+                    num_metadata_sms);
+            }
+
+            // A hot async-publisher spin competes with FP4 decode/GEMM for
+            // issue/cache resources when a compact expert set waits for the
+            // next output tile. A wide expert set already gets a natural
+            // backoff from its longer scan, while very sparse or dense work
+            // is response-latency sensitive. Select the A-B-A validated
+            // density window at JIT time so inactive shapes compile the
+            // original eager polling loop without runtime branching.
+            const int num_experts_per_rank =
+                args.num_experts / args.num_ranks;
+            const float expected_rows_per_local_expert =
+                static_cast<float>(args.num_tokens) * args.num_topk /
+                num_experts_per_rank;
+            // Preserve two dispatch READ warps through remote pull, then
+            // transfer warp 1 to async publishing.  The first M128 band of a
+            // weight-heavy shape was the stable A-B-A win; sparse M64 shapes
+            // remain on the original topology because publisher latency and
+            // decode scheduling dominate there.
+            use_delayed_dispatch_warp_publisher =
+                num_experts_per_rank <= 32 and
+                args.intermediate_hidden >= 3072 and
+                expected_rows_per_local_expert >= 64.0f and
+                expected_rows_per_local_expert < 128.0f;
+            constexpr int64_t kPublisherBackoffMaxWeightElems =
+                16ll * 1024 * 1024;
+            const bool weight_light =
+                static_cast<int64_t>(args.hidden) *
+                    args.intermediate_hidden <
+                kPublisherBackoffMaxWeightElems;
+            const float max_backoff_rows_per_expert =
+                weight_light ? 16.0f : 8.0f;
+            const bool use_publisher_idle_backoff =
+                num_experts_per_rank <= 32 and
+                expected_rows_per_local_expert >= 1.0f and
+                expected_rows_per_local_expert <=
+                    max_backoff_rows_per_expert;
+            if (use_publisher_idle_backoff)
+                internode_prefix +=
+                    "#define "
+                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_IDLE_NANOSLEEP 128\n";
+            // Four neighboring decode lanes consume the four K groups of
+            // one N row and share its packed SFB word.  At middle density the
+            // work per block amortizes one subgroup shuffle and benefits from
+            // replacing four shared loads with one.  Very sparse work remains
+            // shuffle-latency sensitive, while >=64 rows switches execution
+            // topology and showed no benefit.  Use the same weight-footprint
+            // boundary as the other FP4 shape heuristics.
+            const float min_sfb_broadcast_rows = weight_light ? 24.0f : 16.0f;
+            const bool use_sfb_subgroup_broadcast =
+                expected_rows_per_local_expert >= min_sfb_broadcast_rows and
+                expected_rows_per_local_expert <= 32.0f;
+            if (use_sfb_subgroup_broadcast)
+                internode_prefix +=
+                    "#define DG_MEGA_MOE_FP4_SFB_SUBGROUP_BROADCAST 1\n";
+            // The generic swapAB path normally promotes 17--24 valid expert
+            // rows to N=32.  Use the native N=24 WGMMA bucket only in the
+            // A-B-A validated middle-density window: below it, the extra
+            // specialization does not amortize its instruction footprint;
+            // above it, routing tails made N24 slower for the tested shapes.
+            const bool use_fp4_swap_ab_n24 =
+                expected_rows_per_local_expert >= 16.0f and
+                expected_rows_per_local_expert <= 24.0f;
+            if (use_fp4_swap_ab_n24)
+                internode_prefix +=
+                    "#define DG_MEGA_MOE_FP4_SWAP_AB_N24 1\n";
+            // Preserve Hopper's native 8-column WGMMA granularity above
+            // N=32 instead of promoting every 33--64 row expert tile directly
+            // to N=64.  Select how many extra buckets are compiled from the
+            // A-B-A validated Flash/Pro/Kimi density and weight-footprint
+            // bands, keeping unnecessary template bodies out of the hot loop.
+            int fp4_swap_ab_fine_bucket_level = 0;
+            if (args.intermediate_hidden <= 2048 and
+                expected_rows_per_local_expert >= 24.0f and
+                expected_rows_per_local_expert <= 48.0f) {
+                fp4_swap_ab_fine_bucket_level =
+                    expected_rows_per_local_expert <= 32.0f ? 3 : 2;
+            }
+            if (args.intermediate_hidden >= 3072 and
+                expected_rows_per_local_expert >= 24.0f and
+                expected_rows_per_local_expert <= 48.0f) {
+                fp4_swap_ab_fine_bucket_level =
+                    weight_light ? 2 :
+                    expected_rows_per_local_expert < 28.0f ? 1 : 2;
+            }
+            if (fp4_swap_ab_fine_bucket_level > 0)
+                internode_prefix += fmt::format(
+                    "#define DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS {}\n",
+                    fp4_swap_ab_fine_bucket_level);
         }
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE", 0) != 0)
             internode_prefix += "#define DG_MEGA_MOE_PHASE_PROFILE 1\n";
-        // EXPERIMENT (dispatch-warp publisher probe)
-        if (get_env<int>("DG_MEGA_MOE_DISPATCH_WARP_PUBLISHER", 0) != 0)
+        // Keep the explicit switch for controlled A/B outside the automatic
+        // shape band.  The production band always selects delayed hand-off.
+        if (use_delayed_dispatch_warp_publisher or
+            get_env<int>("DG_MEGA_MOE_DISPATCH_WARP_PUBLISHER", 0) != 0)
             internode_prefix += "#define DG_MEGA_MOE_DISPATCH_WARP_PUBLISHER 1\n";
+        if (use_delayed_dispatch_warp_publisher)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_DELAYED_DISPATCH_WARP_PUBLISHER 1\n";
         // EXPERIMENT (split-A/B loader probe; requires the dispatch publisher)
         if (get_env<int>("DG_MEGA_MOE_SPLIT_AB_LOADER", 0) != 0)
             internode_prefix += "#define DG_MEGA_MOE_SPLIT_AB_LOADER 1\n";
-
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE_SILENT", 0) != 0)
             internode_prefix +=
                 "#define DG_MEGA_MOE_PHASE_PROFILE_SILENT 1\n";
@@ -171,10 +280,10 @@ static void __instantiate_kernel() {{
         {},
         {}, {},
         {}, {},
-        {},
         {}, {}, {},
         {},
         {}, {}, {}, {}, {},
+        {},
         {},
         {}, {}, {},
         {}, {},
@@ -250,8 +359,8 @@ static void sm90_fp8_fp4_mega_moe(
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
     const bool& fast_math,
-    const bool& math_wg_participates_in_fp4_decode = true,
-    const int& num_math_wg_decode_warps = 4,
+    const bool& math_wg_participates_in_fp4_decode = false,
+    const int& num_math_wg_decode_warps = 0,
     const int& first_fp4_decode_assist_warp = 0,
     const bool& use_wide_load_decode = false,
     const bool& use_early_b_decode = false,
@@ -314,18 +423,19 @@ static void sm90_fp8_fp4_mega_moe(
                                                         1, 0);
 
     // Packed FP4 weight tile: each byte = 2 nibbles. SM90 loads these as raw
-    // bytes and software-decodes them before WGMMA, so the TensorMap must be a
-    // UINT8 view with a packed K axis rather than a native FP4 TensorMap.
+    // bytes and software-decodes them before WGMMA, so the TensorMap uses a
+    // UINT8 view with a packed K axis.
     const auto l1_weights_bytes = l1_weights.scalar_type() == torch::kByte
         ? l1_weights : l1_weights.view(torch::kByte);
     const auto l2_weights_bytes = l2_weights.scalar_type() == torch::kByte
         ? l2_weights : l2_weights.view(torch::kByte);
-    const auto tensor_map_l1_weights = make_tma_2d_desc(l1_weights_bytes,
-                                                        hidden / 2, num_experts_per_rank * intermediate_hidden * 2,
-                                                        config.block_k / 2, config.block_n,
-                                                        static_cast<int>(l1_weights_bytes.stride(-2)),
-                                                        config.swizzle_weights_mode, /*swizzle_base=*/0,
-                                                        /*allow_tf32=*/false);
+    const auto tensor_map_l1_weights = make_tma_2d_desc(
+        l1_weights_bytes,
+        hidden / 2, num_experts_per_rank * intermediate_hidden * 2,
+        config.block_k / 2, config.block_n,
+        static_cast<int>(l1_weights_bytes.stride(-2)),
+        config.swizzle_weights_mode, /*swizzle_base=*/0,
+        /*allow_tf32=*/false);
 
     // L1 output (post-SwiGLU FP8): N is halved.
     // Mirror the FP8 split-N infrastructure: when BLOCK_M=64 and the host
@@ -368,12 +478,13 @@ static void sm90_fp8_fp4_mega_moe(
                                                         num_l2_sf_storage_tokens, intermediate_hidden,
                                                         config.block_m, kL2ActsSFGranK,
                                                         1, 0);
-    const auto tensor_map_l2_weights = make_tma_2d_desc(l2_weights_bytes,
-                                                        intermediate_hidden / 2, num_experts_per_rank * hidden,
-                                                        config.block_k / 2, config.block_n,
-                                                        static_cast<int>(l2_weights_bytes.stride(-2)),
-                                                        config.swizzle_weights_mode, /*swizzle_base=*/0,
-                                                        /*allow_tf32=*/false);
+    const auto tensor_map_l2_weights = make_tma_2d_desc(
+        l2_weights_bytes,
+        intermediate_hidden / 2, num_experts_per_rank * hidden,
+        config.block_k / 2, config.block_n,
+        static_cast<int>(l2_weights_bytes.stride(-2)),
+        config.swizzle_weights_mode, /*swizzle_base=*/0,
+        /*allow_tf32=*/false);
 
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;

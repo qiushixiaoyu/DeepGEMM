@@ -137,12 +137,10 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
          fp4_flash_split_n_mbarrier_shape_band or
          fp4_pro_mid_decode_assist_shape_band or fp4_pro_large_decode_assist_shape_band or
          fp4_bigband_lookahead_shape_band or fp4_2wg_decode_offload_shape_band);
-    const bool default_math_wg_decode =
-        fp4_shared_decode_assist_shape_band or
-        (expected_tokens_per_expert >= 1.0f and expected_tokens_per_expert < 2.0f) or
-        fp4_pro_two_tokens_per_expert_shape_band;
-    const bool math_wg_participates_in_decode =
-        !default_math_wg_decode;
+    // Keep math warpgroups dedicated to WGMMA, matching the FP8 execution
+    // model. Packed-FP4 weight decode is owned exclusively by the
+    // non-epilogue decode-assist warps.
+    constexpr bool math_wg_participates_in_decode = false;
     const bool default_skip_loader_decode_assist =
         fp4_shared_decode_assist_shape_band or
         fp4_pro_single_token_per_expert_shape_band or
@@ -152,12 +150,22 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
         fp4_flash_half_token_per_expert_shape_band or
         fp4_flash_two_tokens_per_expert_shape_band or
         fp4_flash_wide_load_decode_shape_band;
+    // At the first M128 density band, Pro-like shapes run one block per
+    // expert and already have four dedicated decode-assist warps.  Giving B
+    // its own early-decode barrier adds stage bookkeeping without exposing
+    // useful overlap; reuse the regular A/SFA/B full barrier in this band.
+    const bool fp4_pro_m128_boundary_shape_band =
+        fp4_pro_shape and
+        expected_tokens_per_expert >= 64.0f and
+        expected_tokens_per_expert < 128.0f;
     const bool default_ss_early_b_decode =
-        ((expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert <= 3.0f and
+        ((expected_tokens_per_expert >= 1.5f and
+          expected_tokens_per_expert <= 3.0f and
           !fp4_pro_two_tokens_per_expert_shape_band and
           !fp4_flash_two_tokens_per_expert_shape_band and
           !fp4_flash_decode_lookahead_shape_band) or
-         fp4_2wg_decode_offload_shape_band);
+         (fp4_2wg_decode_offload_shape_band and
+          !fp4_pro_m128_boundary_shape_band));
     const bool fp4_middle_decode_lookahead_mbarrier_shape_band =
         fp4_middle_shape and fp4_decode_lookahead_shape_band;
     const bool fp4_middle_bigband_mbarrier_shape_band =
@@ -182,17 +190,28 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     const bool weight_light =
         static_cast<int64_t>(hidden) * intermediate_hidden <
         kSwapAbMaxWeightElems;
+    // Match the FP8 workload-based split: light-weight shapes stop using
+    // swapAB once token padding is amortized, while weight-streaming shapes
+    // keep it through 24 expected rows/expert.  FP4 previously required
+    // `weight_light`, excluding Pro/Kimi-like shapes even though their large
+    // per-expert weight footprint makes padded M64 work especially costly.
+    constexpr float kLightWeightSwapAbMaxTokensPerExpert = 48.0f;
+    constexpr float kStreamingSwapAbMaxTokensPerExpert = 48.0f;
     const bool default_swap_ab =
-        weight_light and
         (fp4_flash_shape or fp4_pro_shape) and
-        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert <= 24.0f;
+         expected_tokens_per_expert > 0.0f and
+         (weight_light
+              ? expected_tokens_per_expert <=
+                    kLightWeightSwapAbMaxTokensPerExpert
+              : expected_tokens_per_expert <=
+                    kStreamingSwapAbMaxTokensPerExpert);
     const bool default_swap_ab_fast_amax =
-        weight_light and
-        fp4_pro_shape and
-        expected_tokens_per_expert >= 12.0f and expected_tokens_per_expert <= 24.0f;
+        weight_light and fp4_pro_shape and
+        expected_tokens_per_expert >= 12.0f and
+        expected_tokens_per_expert <= 24.0f;
     return {
         math_wg_participates_in_decode,
-        math_wg_participates_in_decode ? 4 : 0,
+        0,
         default_skip_loader_decode_assist ? 2 : 0,
         default_wide_load_decode,
         default_ss_early_b_decode,
@@ -617,17 +636,29 @@ static void fp8_fp4_mega_moe_sm90(
     auto fp4_defaults = get_fp4_sm90_api_defaults(
         num_experts_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden);
-    // The merged loader frees warp 1, so it must no longer be counted as an
-    // FP4 decode assistant -- otherwise the decode-done arrival count would
-    // include a warp that never arrives.  Under the dispatch-warp-publisher
-    // probe the async publisher moves to dispatch warp 1, and non-epilogue
-    // warp 1 rejoins decode assist.
+    const float fp4_expected_rows_per_local_expert =
+        static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
+    // On the first M128 band of a weight-heavy shape, let both dispatch warps
+    // finish remote pull before warp 1 changes role to async publisher.  This
+    // keeps the two-warp READ issue rate on the latency-sensitive first wave,
+    // then removes the otherwise permanently occupied publisher warp from the
+    // non-epilogue group.  The gate is workload based rather than model named.
+    const bool fp4_delayed_dispatch_warp_publisher =
+        fp4_internode and num_ranks > 8 and
+        num_experts_per_rank <= 32 and
+        intermediate_hidden >= 3072 and
+        fp4_expected_rows_per_local_expert >= 64.0f and
+        fp4_expected_rows_per_local_expert < 128.0f;
     const bool fp4_dispatch_warp_publisher =
         fp4_internode and
-        get_env<int>("DG_MEGA_MOE_DISPATCH_WARP_PUBLISHER", 0) != 0;
+        (fp4_delayed_dispatch_warp_publisher or
+         get_env<int>("DG_MEGA_MOE_DISPATCH_WARP_PUBLISHER", 0) != 0);
     const bool fp4_split_ab_loader =
         fp4_dispatch_warp_publisher and
         get_env<int>("DG_MEGA_MOE_SPLIT_AB_LOADER", 0) != 0;
+    // Keep the shape-selected four-assist topology at the M128 boundary.
+    // Promoting the freed warp 1 to a fifth decode assistant increased
+    // synchronization/resource contention and regressed the measured tail.
     fp4_defaults.first_decode_assist_warp =
         std::max(fp4_defaults.first_decode_assist_warp,
                  (fp4_dispatch_warp_publisher and not fp4_split_ab_loader)
