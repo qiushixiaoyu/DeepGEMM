@@ -384,7 +384,10 @@ static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
             {3.0f, 6.0f, true, 8, 8},
             {6.0f, 12.0f, true, 16, 16},
             {6.0f, 12.0f, true, 8, 8},
-            {12.0f, 24.0f, true, 24, 24},
+            // Eight experts still expose 8 * (2 * IH / BLOCK_N) L1 CTAs for
+            // Pro-like shapes, while allowing later dispatch arrivals to
+            // overlap the first wave's GEMMs instead of scheduling all 24
+            // local experts at once.
             {12.0f, 24.0f, true, 8, 8},
             {24.0f, 64.0f, true, 8, 8},
         };

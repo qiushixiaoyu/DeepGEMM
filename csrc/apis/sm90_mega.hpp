@@ -205,10 +205,14 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
                     kLightWeightSwapAbMaxTokensPerExpert
               : expected_tokens_per_expert <=
                     kStreamingSwapAbMaxTokensPerExpert);
+    // Warp-cooperative amax avoids the FP32 full-tile staging and serial
+    // per-token row scan in the swapAB L1 epilogue.  The 16--32 row window
+    // amortizes its two CTA reductions for both light and streaming-weight
+    // Pro shapes; sparser work did not show a repeatable gain.
     const bool default_swap_ab_fast_amax =
-        weight_light and fp4_pro_shape and
-        expected_tokens_per_expert >= 12.0f and
-        expected_tokens_per_expert <= 24.0f;
+        fp4_pro_shape and
+        expected_tokens_per_expert >= 16.0f and
+        expected_tokens_per_expert <= 32.0f;
     return {
         math_wg_participates_in_decode,
         0,
