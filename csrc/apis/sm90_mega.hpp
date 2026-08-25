@@ -81,147 +81,87 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     const int& hidden, const int& intermediate_hidden) {
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-    // Shape bands exclude kernel tile/thread constraints; JIT heuristics add those as kernel bands.
+    const float rows = expected_tokens_per_expert;
+    const bool has_rows = rows > 0.0f;
+    // Shape bands exclude kernel tile/thread constraints; JIT heuristics add
+    // those as kernel bands.  They remain broad workload classes rather than
+    // exact model identifiers.
     const bool fp4_flash_shape = intermediate_hidden <= 2048;
     const bool fp4_pro_shape = intermediate_hidden >= 3072;
     const bool fp4_middle_shape = !fp4_flash_shape and !fp4_pro_shape;
-    const bool fp4_decode_lookahead_shape_band =
-        expected_tokens_per_expert >= 3.0f and expected_tokens_per_expert <= 6.0f;
-    const bool fp4_bigband_lookahead_shape_band =
-        expected_tokens_per_expert >= 12.0f and expected_tokens_per_expert <= 24.0f;
-    const bool fp4_b4_skip_decode_shape_band =
-        expected_tokens_per_expert >= 0.5f and expected_tokens_per_expert < 1.0f;
-    const bool fp4_pro_single_token_per_expert_shape_band =
-        fp4_pro_shape and
-        expected_tokens_per_expert >= 1.0f and expected_tokens_per_expert < 1.5f and
-        num_experts_per_rank % 8 == 0;
-    const bool fp4_pro_split_n_mbarrier_shape_band =
-        fp4_pro_shape and
-        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 64.0f;
-    const bool fp4_pro_two_tokens_per_expert_shape_band =
-        fp4_pro_shape and
-        expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f;
-    const bool fp4_pro_mid_decode_assist_shape_band =
-        fp4_pro_shape and
-        expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 12.0f;
-    const bool fp4_pro_large_decode_assist_shape_band =
-        fp4_pro_shape and
-        expected_tokens_per_expert >= 24.0f and expected_tokens_per_expert < 64.0f;
-    const bool fp4_flash_two_tokens_per_expert_shape_band =
-        fp4_flash_shape and
-        expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 2.0f;
-    const bool fp4_flash_half_token_per_expert_shape_band =
-        fp4_flash_shape and
-        expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.5f;
-    const bool fp4_flash_decode_lookahead_shape_band =
-        fp4_flash_shape and
-        expected_tokens_per_expert >= 3.0f and expected_tokens_per_expert < 6.0f;
-    const bool fp4_flash_wide_load_decode_shape_band =
-        fp4_flash_shape and
-        expected_tokens_per_expert >= 6.0f and expected_tokens_per_expert < 64.0f;
-    const bool fp4_pro_wide_load_decode_shape_band =
-        fp4_pro_shape and
-        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 64.0f;
-    const bool fp4_flash_split_n_mbarrier_shape_band =
-        fp4_flash_shape and
-        expected_tokens_per_expert >= 0.75f and expected_tokens_per_expert < 64.0f;
-    const bool fp4_flash_small_mbarrier_shape_band =
-        fp4_flash_shape and
-        expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.5f;
-    const bool fp4_2wg_decode_offload_shape_band =
-        expected_tokens_per_expert >= 64.0f;
-    const bool fp4_shared_decode_assist_shape_band =
-        ((expected_tokens_per_expert > 0.0f and expected_tokens_per_expert < 0.375f) or
-         fp4_flash_half_token_per_expert_shape_band or
-         fp4_b4_skip_decode_shape_band or fp4_decode_lookahead_shape_band or
-         fp4_flash_split_n_mbarrier_shape_band or
-         fp4_pro_mid_decode_assist_shape_band or fp4_pro_large_decode_assist_shape_band or
-         fp4_bigband_lookahead_shape_band or fp4_2wg_decode_offload_shape_band);
+
+    const bool below_m128_crossover =
+        has_rows and rows < kFP4SM90M128CrossoverRows;
+    const bool m128_or_larger =
+        rows >= kFP4SM90M128CrossoverRows;
+
     // Keep math warpgroups dedicated to WGMMA, matching the FP8 execution
     // model. Packed-FP4 weight decode is owned exclusively by the
     // non-epilogue decode-assist warps.
     constexpr bool math_wg_participates_in_decode = false;
-    const bool default_skip_loader_decode_assist =
-        fp4_shared_decode_assist_shape_band or
-        fp4_pro_single_token_per_expert_shape_band or
-        (expected_tokens_per_expert >= 1.5f and expected_tokens_per_expert < 3.0f);
+
     const bool default_wide_load_decode =
-        fp4_pro_wide_load_decode_shape_band or
-        fp4_flash_half_token_per_expert_shape_band or
-        fp4_flash_two_tokens_per_expert_shape_band or
-        fp4_flash_wide_load_decode_shape_band;
-    // At the first M128 density band, Pro-like shapes run one block per
-    // expert and already have four dedicated decode-assist warps.  Giving B
-    // its own early-decode barrier adds stage bookkeeping without exposing
-    // useful overlap; reuse the regular A/SFA/B full barrier in this band.
-    const bool fp4_pro_m128_boundary_shape_band =
-        fp4_pro_shape and
-        expected_tokens_per_expert >= 64.0f and
-        expected_tokens_per_expert < 128.0f;
+        (fp4_pro_shape and below_m128_crossover) or
+        (fp4_flash_shape and
+         ((rows >= 0.375f and rows < 0.5f) or
+          (rows >= 1.5f and rows < 2.0f) or
+          (rows >= 6.0f and rows < kFP4SM90M128CrossoverRows)));
+
+    // Early-B remains useful only in the middle-shape 1.5--3 band, the
+    // Flash-like 2--3 band, and dense M128 shapes other than the first
+    // Pro-like M128 region.  Expressing those regions directly removes the
+    // previous chain of overlapping exclusion predicates.
     const bool default_ss_early_b_decode =
-        ((expected_tokens_per_expert >= 1.5f and
-          expected_tokens_per_expert <= 3.0f and
-          !fp4_pro_two_tokens_per_expert_shape_band and
-          !fp4_flash_two_tokens_per_expert_shape_band and
-          !fp4_flash_decode_lookahead_shape_band) or
-         (fp4_2wg_decode_offload_shape_band and
-          !fp4_pro_m128_boundary_shape_band));
-    const bool fp4_middle_decode_lookahead_mbarrier_shape_band =
-        fp4_middle_shape and fp4_decode_lookahead_shape_band;
-    const bool fp4_middle_bigband_mbarrier_shape_band =
-        fp4_middle_shape and fp4_bigband_lookahead_shape_band;
+        (fp4_middle_shape and rows >= 1.5f and rows <= 3.0f) or
+        (fp4_flash_shape and rows >= 2.0f and rows < 3.0f) or
+        (m128_or_larger and
+         !(fp4_pro_shape and rows < 128.0f));
+
+    // Pro-like shapes use the decode-done mbarrier throughout.  Flash-like
+    // shapes retain only their measured 0.5--0.75 hole; middle shapes keep the
+    // two validated bands and the M128 topology.
     const bool default_decode_done_mbarrier =
-        fp4_pro_split_n_mbarrier_shape_band or
-        fp4_flash_split_n_mbarrier_shape_band or
-        fp4_flash_small_mbarrier_shape_band or
-        fp4_middle_decode_lookahead_mbarrier_shape_band or
-        fp4_middle_bigband_mbarrier_shape_band or
-        fp4_2wg_decode_offload_shape_band;
+        (fp4_pro_shape and has_rows) or
+        (fp4_flash_shape and has_rows and
+         (rows < 0.5f or rows >= 0.75f)) or
+        (fp4_middle_shape and
+         ((rows >= 3.0f and rows <= 6.0f) or
+          (rows >= 12.0f and rows <= 24.0f) or
+          m128_or_larger));
+
+    // Arrival-counter selection remains intentionally narrow until the
+    // expanded EP/skew matrix validates a wider sparse region.
     const bool default_l2_arrival_counter =
         ((fp4_flash_shape and
-          expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f) or
+          rows >= 0.375f and rows < 0.75f) or
          (fp4_pro_shape and
-          expected_tokens_per_expert >= 0.25f and expected_tokens_per_expert < 0.375f));
-    // Weight traffic matters in addition to tokens/expert.  In particular,
-    // KimiK3 and DeepSeekV4Pro share intermediate=3072 but differ by 2x in
-    // hidden*intermediate.  Keep the calibrated 16M-element boundary used by
-    // the FP8 path so the two shapes no longer collapse into one swapAB band.
-    constexpr int64_t kSwapAbMaxWeightElems = 16ll * 1024 * 1024;
-    const bool weight_light =
-        static_cast<int64_t>(hidden) * intermediate_hidden <
-        kSwapAbMaxWeightElems;
-    // Match the FP8 workload-based split: light-weight shapes stop using
-    // swapAB once token padding is amortized, while weight-streaming shapes
-    // keep it through 24 expected rows/expert.  FP4 previously required
-    // `weight_light`, excluding Pro/Kimi-like shapes even though their large
-    // per-expert weight footprint makes padded M64 work especially costly.
-    constexpr float kLightWeightSwapAbMaxTokensPerExpert = 48.0f;
-    constexpr float kStreamingSwapAbMaxTokensPerExpert = 48.0f;
+          rows >= 0.25f and rows < 0.375f));
+
+    (void)hidden;
+    // All supported Flash/Pro-like M64 shapes use swapAB until the shared
+    // crossover.  M128 begins at the same boundary, so no M64/non-swap or
+    // M128/swap specialization can be selected.
     const bool default_swap_ab =
         (fp4_flash_shape or fp4_pro_shape) and
-         expected_tokens_per_expert > 0.0f and
-         (weight_light
-              ? expected_tokens_per_expert <=
-                    kLightWeightSwapAbMaxTokensPerExpert
-              : expected_tokens_per_expert <=
-                    kStreamingSwapAbMaxTokensPerExpert);
+        below_m128_crossover;
     // Warp-cooperative amax avoids the FP32 full-tile staging and serial
     // per-token row scan in the swapAB L1 epilogue.  The 16--32 row window
     // amortizes its two CTA reductions for both light and streaming-weight
     // Pro shapes; sparser work did not show a repeatable gain.
     const bool default_swap_ab_fast_amax =
         fp4_pro_shape and
-        expected_tokens_per_expert >= 16.0f and
-        expected_tokens_per_expert <= 32.0f;
+        rows >= 16.0f and rows <= 32.0f;
     return {
         math_wg_participates_in_decode,
         0,
-        default_skip_loader_decode_assist ? 2 : 0,
+        // The merged loader owns non-epilogue warps 0/1 in every production
+        // topology, so dedicated FP4 decode assistants always start at warp 2.
+        2,
         default_wide_load_decode,
         default_ss_early_b_decode,
         default_decode_done_mbarrier,
         default_l2_arrival_counter,
-        expected_tokens_per_expert >= 64.0f,
+        m128_or_larger,
         default_swap_ab,
         default_swap_ab_fast_amax
     };
@@ -651,22 +591,9 @@ static void fp8_fp4_mega_moe_sm90(
         fp4_internode and num_ranks > 8 and
         num_experts_per_rank <= 32 and
         intermediate_hidden >= 3072 and
-        fp4_expected_rows_per_local_expert >= 64.0f and
+        fp4_expected_rows_per_local_expert >=
+            kFP4SM90M128CrossoverRows and
         fp4_expected_rows_per_local_expert < 128.0f;
-    const bool fp4_dispatch_warp_publisher =
-        fp4_internode and
-        (fp4_delayed_dispatch_warp_publisher or
-         get_env<int>("DG_MEGA_MOE_DISPATCH_WARP_PUBLISHER", 0) != 0);
-    const bool fp4_split_ab_loader =
-        fp4_dispatch_warp_publisher and
-        get_env<int>("DG_MEGA_MOE_SPLIT_AB_LOADER", 0) != 0;
-    // Keep the shape-selected four-assist topology at the M128 boundary.
-    // Promoting the freed warp 1 to a fifth decode assistant increased
-    // synchronization/resource contention and regressed the measured tail.
-    fp4_defaults.first_decode_assist_warp =
-        std::max(fp4_defaults.first_decode_assist_warp,
-                 (fp4_dispatch_warp_publisher and not fp4_split_ab_loader)
-                     ? 1 : 2);
     // The protocol is shape-fixed: inter-node launches use expert-ready
     // dispatch, full-row async combine and one extra gateway QP; single-node
     // launches retain the NVLink count-sum data path.

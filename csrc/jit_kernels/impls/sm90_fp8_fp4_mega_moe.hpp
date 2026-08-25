@@ -173,7 +173,8 @@ public:
             use_delayed_dispatch_warp_publisher =
                 num_experts_per_rank <= 32 and
                 args.intermediate_hidden >= 3072 and
-                expected_rows_per_local_expert >= 64.0f and
+                expected_rows_per_local_expert >=
+                    kFP4SM90M128CrossoverRows and
                 expected_rows_per_local_expert < 128.0f;
             constexpr int64_t kPublisherBackoffMaxWeightElems =
                 16ll * 1024 * 1024;
@@ -196,9 +197,9 @@ public:
             // one N row and share its packed SFB word.  At middle density the
             // work per block amortizes one subgroup shuffle and benefits from
             // replacing four shared loads with one.  Very sparse work remains
-            // shuffle-latency sensitive, while >=64 rows switches execution
-            // topology and showed no benefit.  Use the same weight-footprint
-            // boundary as the other FP4 shape heuristics.
+            // shuffle-latency sensitive, while the shared M128 crossover
+            // switches execution topology and showed no benefit.  Use the
+            // same weight-footprint boundary as the other FP4 heuristics.
             const float min_sfb_broadcast_rows = weight_light ? 24.0f : 16.0f;
             const bool use_sfb_subgroup_broadcast =
                 expected_rows_per_local_expert >= min_sfb_broadcast_rows and
@@ -254,12 +255,6 @@ public:
         }
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE", 0) != 0)
             internode_prefix += "#define DG_MEGA_MOE_PHASE_PROFILE 1\n";
-        // Experimental L1 swapAB software pipeline: keep two temporary
-        // WGMMA fragments so the current K-block can execute on tensor cores
-        // while FP32 promotion consumes the previous fragment.
-        if (get_env<int>("DG_MEGA_MOE_FP4_SWAP_PROMOTE_PIPELINE", 0) != 0)
-            internode_prefix +=
-                "#define DG_MEGA_MOE_FP4_SWAP_PROMOTE_PIPELINE 1\n";
         // Match the FP8 production path: textual device diagnostics pull
         // vprintf and a call stack into every specialization, even though
         // they are only reachable after a protocol failure. Keep all traps
@@ -272,17 +267,9 @@ public:
         else if (args.num_ranks > kNvlPeers)
             internode_prefix +=
                 "#define DG_DEVICE_ASSERT_TRAP_ONLY 1\n";
-        // Keep the explicit switch for controlled A/B outside the automatic
-        // shape band.  The production band always selects delayed hand-off.
-        if (use_delayed_dispatch_warp_publisher or
-            get_env<int>("DG_MEGA_MOE_DISPATCH_WARP_PUBLISHER", 0) != 0)
-            internode_prefix += "#define DG_MEGA_MOE_DISPATCH_WARP_PUBLISHER 1\n";
         if (use_delayed_dispatch_warp_publisher)
             internode_prefix +=
                 "#define DG_MEGA_MOE_DELAYED_DISPATCH_WARP_PUBLISHER 1\n";
-        // EXPERIMENT (split-A/B loader probe; requires the dispatch publisher)
-        if (get_env<int>("DG_MEGA_MOE_SPLIT_AB_LOADER", 0) != 0)
-            internode_prefix += "#define DG_MEGA_MOE_SPLIT_AB_LOADER 1\n";
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE_SILENT", 0) != 0)
             internode_prefix +=
                 "#define DG_MEGA_MOE_PHASE_PROFILE_SILENT 1\n";

@@ -722,13 +722,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kSwapABFlashN24Dispatch =
         kSwapABEligible and kIntermediateHidden <= 2048 and kNumExpertsPerWave == 16;
     constexpr uint32_t kSwapABNSubtiles = WG_BLOCK_N / 64;
-#ifdef DG_MEGA_MOE_FP4_SWAP_PROMOTE_PIPELINE
-    constexpr bool kSwapABPromotePipeline =
-        kSwapABEligible and kSwapABNSubtiles == 1 and
-        kNumNonEpilogueThreads == 192;
-#else
-    constexpr bool kSwapABPromotePipeline = false;
-#endif
     constexpr uint32_t kSwapABTokenChunks = BLOCK_M / 8;
     DG_STATIC_ASSERT(not kSwapABEligible or (BLOCK_M % 8 == 0),
                      "swapAB epilogue token chunks assume BLOCK_M is a multiple of 8");
@@ -1049,11 +1042,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kEpilogueWGBarrierStartIdx       = 3;
     constexpr uint32_t kSchedulerCountCacheBarrierIdx   = 14;
     constexpr uint32_t kFP4DecodeBarrierIdx             = 15;
-#if defined(DG_MEGA_MOE_INTERNODE) and defined(DG_MEGA_MOE_DISPATCH_WARP_PUBLISHER)
-    // EXPERIMENT (dispatch-warp publisher probe): the async publisher runs on
-    // dispatch warp 1 during the pull window (which that warp otherwise
-    // spends idle), the non-epilogue warp 1 becomes a fifth decode assist
-    // warp, and the pull loop runs on dispatch warp 0 alone.
+#if defined(DG_MEGA_MOE_INTERNODE) and \
+    defined(DG_MEGA_MOE_DELAYED_DISPATCH_WARP_PUBLISHER)
+    // Both dispatch warps finish pulling before the last warp changes role to
+    // publisher in the first M128 density region.
     constexpr bool kDispatchWarpPublisher = true;
 #else
     constexpr bool kDispatchWarpPublisher = false;
@@ -1063,18 +1055,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         kDispatchWarpPublisher ? 0 : 32;
 #else
     constexpr uint32_t kNumAsyncPublisherThreads = 0;
-#endif
-#if defined(DG_MEGA_MOE_DISPATCH_WARP_PUBLISHER) and     defined(DG_MEGA_MOE_SPLIT_AB_LOADER)
-    // EXPERIMENT (split-A/B loader probe): with the publisher moved to
-    // dispatch warp 1, non-epilogue warps 0/1 return to the historical
-    // two-warp loader split (A/SFA vs packed-B/SFB).  Halving each loader
-    // warp's live state is aimed at the register-budget spill in the merged
-    // loader's TMA loop.  Only the early-B-decode shape has the separate
-    // packed-B barrier this split rides on.
-    constexpr bool kSplitABLoader =
-        kDispatchWarpPublisher and kUseEarlyBDecode;
-#else
-    constexpr bool kSplitABLoader = false;
 #endif
     constexpr uint32_t kNumDispatchEpilogueSyncThreads =
         kNumDispatchThreads + kNumEpilogueThreads +
@@ -1105,8 +1085,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kNumDispatchRegisters    = 48;
     constexpr uint32_t kNumNonEpilogueRegisters = 40;
     constexpr uint32_t kNumEpilogueRegisters =
-        kSwapABPromotePipeline ? 208 :
-        (kSplitNWarpgroups ? 160 : 208);
+        kSplitNWarpgroups ? 160 : 208;
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
                      kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
@@ -2071,18 +2050,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         }
 
         };
-#ifdef DG_MEGA_MOE_DELAYED_DISPATCH_WARP_PUBLISHER
-        DG_STATIC_ASSERT(kDispatchWarpPublisher,
-                         "Delayed publisher requires dispatch-warp publisher");
-        constexpr bool kRunPullOnThisDispatchWarp = true;
-#else
-        const bool kRunPullOnThisDispatchWarp =
-            not (kDispatchWarpPublisher and
-                 warp_idx == kNumDispatchWarps - 1);
-#endif
-        if (not kRunPullOnThisDispatchWarp) {
-            run_dispatch_warp_publisher();
-        } else {
         const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
         const auto pull_mbarrier = dispatch_barriers[warp_idx];
 
@@ -2105,12 +2072,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         uint32_t expert_start_idx = 0, expert_end_idx = 0;
         uint32_t expert_pool_block_offset = 0;
 
-#ifdef DG_MEGA_MOE_DELAYED_DISPATCH_WARP_PUBLISHER
         constexpr uint32_t kNumPullWarps = kNumDispatchWarps;
-#else
-        constexpr uint32_t kNumPullWarps = kDispatchWarpPublisher
-            ? kNumDispatchWarps - 1 : kNumDispatchWarps;
-#endif
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumPullWarps;
         for (uint32_t token_idx = sm_idx * kNumPullWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
             int old_expert_idx = current_expert_idx;
@@ -2403,7 +2365,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         if (warp_idx == kNumDispatchWarps - 1)
             run_dispatch_warp_publisher();
 #endif
-        }
 #endif
 
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
@@ -2640,21 +2601,18 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     // Producer arrivals for the merged path are deferred until
                     // after the SFB shared-memory writes below: SFB does not
                     // ride the TMA tx count, so an early arrival would let a
-                    // consumer read stale scale factors.  Under the split-A/B
-                    // probe the packed-B/SFB side lives on the next warp.
-                    if constexpr (not kSplitABLoader) {
-                        const uint32_t n_idx =
-                            local_expert_idx * shape_n + n_block_idx * BLOCK_N;
-                        auto b_full_barrier = kUseEarlyBDecode
-                            ? decode_full_barriers[stage_idx]
-                            : full_barriers[stage_idx];
-                        tma::copy<
-                            BLOCK_K / 2, LOAD_BLOCK_N,
-                            kSwizzleBPackedMode, b_packed_dtype_t>(
-                            tensor_map_b_ptr, b_full_barrier,
-                            smem_b_packed[stage_idx],
-                            k_block_idx * (BLOCK_K / 2), n_idx, 1);
-                    }
+                    // consumer read stale scale factors.
+                    const uint32_t n_idx =
+                        local_expert_idx * shape_n + n_block_idx * BLOCK_N;
+                    auto b_full_barrier = kUseEarlyBDecode
+                        ? decode_full_barriers[stage_idx]
+                        : full_barriers[stage_idx];
+                    tma::copy<
+                        BLOCK_K / 2, LOAD_BLOCK_N,
+                        kSwizzleBPackedMode, b_packed_dtype_t>(
+                        tensor_map_b_ptr, b_full_barrier,
+                        smem_b_packed[stage_idx],
+                        k_block_idx * (BLOCK_K / 2), n_idx, 1);
 
                     // TMA load SFA
                     if (block_phase == sched::BlockPhase::Linear1) {
@@ -2681,19 +2639,17 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
                 // Merged SFB load: the whole warp cooperates (one UE8M0 word
                 // per N row), exactly as loader warp 1 used to.
-                if constexpr (not kSplitABLoader) {
-                    const bool is_l1 = block_phase == sched::BlockPhase::Linear1;
-                    const uint32_t* sfb_base = is_l1 ? l1_weights_sf : l2_weights_sf;
-                    const uint32_t sfb_per_expert = is_l1 ? kL1SFBPerExpert : kL2SFBPerExpert;
-                    const uint32_t sfb_k_words = is_l1 ? kL1SFBKWords : kL2SFBKWords;
-                    #pragma unroll
-                    for (uint32_t row = lane_idx; row < LOAD_BLOCK_N; row += 32) {
-                        const uint32_t n_global = n_block_idx * BLOCK_N + row;
-                        smem_sfb[stage_idx][row] = __ldg(sfb_base
-                            + local_expert_idx * sfb_per_expert
-                            + n_global * sfb_k_words
-                            + k_block_idx);
-                    }
+                const bool is_l1 = block_phase == sched::BlockPhase::Linear1;
+                const uint32_t* sfb_base = is_l1 ? l1_weights_sf : l2_weights_sf;
+                const uint32_t sfb_per_expert = is_l1 ? kL1SFBPerExpert : kL2SFBPerExpert;
+                const uint32_t sfb_k_words = is_l1 ? kL1SFBKWords : kL2SFBKWords;
+                #pragma unroll
+                for (uint32_t row = lane_idx; row < LOAD_BLOCK_N; row += 32) {
+                    const uint32_t n_global = n_block_idx * BLOCK_N + row;
+                    smem_sfb[stage_idx][row] = __ldg(sfb_base
+                        + local_expert_idx * sfb_per_expert
+                        + n_global * sfb_k_words
+                        + k_block_idx);
                 }
                 __syncwarp();
 
@@ -2706,10 +2662,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             ? BLOCK_M * static_cast<uint32_t>(sizeof(float))
                             : kNumL2SFAPerBlockK * BLOCK_M *
                                   static_cast<uint32_t>(sizeof(float));
-                    if constexpr (kSplitABLoader) {
-                        full_barriers[stage_idx]->arrive_and_expect_tx(
-                            SMEM_A_SIZE_PER_STAGE + sfa_bytes);
-                    } else if constexpr (kUseEarlyBDecode) {
+                    if constexpr (kUseEarlyBDecode) {
                         decode_full_barriers[stage_idx]->arrive_and_expect_tx(
                             SMEM_B_PACKED_SIZE_PER_STAGE);
                         full_barriers[stage_idx]->arrive_and_expect_tx(
@@ -2735,86 +2688,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             phase_profile[kProfileLoaderPoolWait] =
                 profile_loader_pool_wait_cycles;
 #endif
-
-    } else if (kSplitABLoader and warp_idx == kNumDispatchWarps + 1) {
-        // === Split-A/B loader, packed-B/SFB side ===
-        // Owns the packed-FP4 weight TMA and the SFB shared-memory preload;
-        // the A/SFA side stays on the previous warp.  Arrival ordering is
-        // unchanged: the decode-full arrival is deferred until the SFB rows
-        // are in shared memory, so consumers still acquire both together.
-        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
-        cache_expert_recv_counts();
-
-        sm90_fp8_fp4_mega_moe_for_each_cached_block<
-            kNumExpertsPerRank, kNumExpertsPerLane, L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K>(
-            scheduler, [&]<sched::BlockPhase kBlockPhase, uint32_t kNumBlockKs>(
-                           const uint32_t& local_expert_idx,
-                           const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-            constexpr auto block_phase = kBlockPhase;
-            constexpr uint32_t num_k_blocks = kNumBlockKs;
-            const auto tensor_map_b_ptr = block_phase == sched::BlockPhase::Linear2
-                ? &tensor_map_l2_weights : &tensor_map_l1_weights;
-            const uint32_t shape_n =
-                block_phase == sched::BlockPhase::Linear2 ? L2_SHAPE_N : L1_SHAPE_N;
-            const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
-
-            // Wait for the pool to be ready (same gate as the A-side loader).
-            if (block_phase == sched::BlockPhase::Linear1) {
-                const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
-                const auto expected = scheduler.template get_valid_m<false>();
-                while (ptx::ld_acq(ptr) != expected);
-            } else {
-                constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
-                if constexpr (kL2ArrivalCounter) {
-                    const auto ptr = reinterpret_cast<const uint32_t*>(
-                        workspace.get_l2_arrival_mask_ptr(pool_block_idx));
-                    const uint32_t expected = kNumL1BlockNs * kNumEpilogueWarpgroups;
-                    while (ptx::ld_acq(ptr) != expected);
-                } else {
-                    const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
-                    const uint64_t expected = (kNumL1BlockNs >= 64)
-                        ? ~0ull : ((1ull << kNumL1BlockNs) - 1ull);
-                    while (ptx::ld_acq_gpu(ptr) != expected);
-                }
-            }
-            for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
-                empty_barriers[stage_idx]->wait(phase ^ 1);
-
-                if (cute::elect_one_sync()) {
-                    const uint32_t n_idx =
-                        local_expert_idx * shape_n + n_block_idx * BLOCK_N;
-                    tma::copy<BLOCK_K / 2, LOAD_BLOCK_N, kSwizzleBPackedMode, b_packed_dtype_t>(
-                        tensor_map_b_ptr, decode_full_barriers[stage_idx],
-                        smem_b_packed[stage_idx],
-                        k_block_idx * (BLOCK_K / 2), n_idx, 1);
-                }
-                __syncwarp();
-
-                // SFB preload: whole warp cooperates, one UE8M0 word per row.
-                {
-                    const bool is_l1 = block_phase == sched::BlockPhase::Linear1;
-                    const uint32_t* sfb_base = is_l1 ? l1_weights_sf : l2_weights_sf;
-                    const uint32_t sfb_per_expert = is_l1 ? kL1SFBPerExpert : kL2SFBPerExpert;
-                    const uint32_t sfb_k_words = is_l1 ? kL1SFBKWords : kL2SFBKWords;
-                    #pragma unroll
-                    for (uint32_t row = lane_idx; row < LOAD_BLOCK_N; row += 32) {
-                        const uint32_t n_global = n_block_idx * BLOCK_N + row;
-                        smem_sfb[stage_idx][row] = __ldg(sfb_base
-                            + local_expert_idx * sfb_per_expert
-                            + n_global * sfb_k_words
-                            + k_block_idx);
-                    }
-                }
-                __syncwarp();
-
-                // Deferred producer arrival (after the SFB stores).
-                if (cute::elect_one_sync()) {
-                    decode_full_barriers[stage_idx]->arrive_and_expect_tx(
-                        SMEM_B_PACKED_SIZE_PER_STAGE);
-                }
-                __syncwarp();
-            }
-        }, cached_recv_counts);
 
     } else if (not kDispatchWarpPublisher and warp_idx == kNumDispatchWarps + 1) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -3243,47 +3116,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 not kSwapABEligible and BLOCK_M == 128 and BLOCK_N == 128 and
                 WG_BLOCK_N == 128;
             float final_accum[kAccumPerThread] = {};
-#ifdef DG_MEGA_MOE_FP4_SWAP_PROMOTE_PIPELINE
-            // Two named register fragments avoid dynamic indexing (which
-            // would spill to local memory).  The current WGMMA writes one
-            // fragment while the previous completed fragment is promoted.
-            float swap_pipe_accum[2][kAccumPerThread];
-            const auto promote_swap_pipe_l1 =
-                [&]<uint32_t N_SWAP, uint32_t BUFFER>(
-                    const uint32_t& promote_stage_idx) {
-                    if constexpr (kSwapABPromotePipeline) {
-                        using SwapWGMMA = typename
-                            mma::sm90::FP8MMASelector<N_SWAP>::type;
-                        constexpr uint32_t kSwapAccum =
-                            SwapWGMMA::kNumAccum;
-                        DG_STATIC_ASSERT(
-                            kSwapABNSubtiles == 1,
-                            "promotion pipeline requires one N64 subtile");
-                        #pragma unroll
-                        for (uint32_t i = 0;
-                             i < kSwapAccum / 4; ++ i) {
-                            const uint32_t token_0 =
-                                i * 8 + col_idx * 2;
-                            const uint32_t token_1 = token_0 + 1;
-                            if (token_0 < valid_m) {
-                                const float2 scale = ptx::ld_shared(
-                                    reinterpret_cast<const float2*>(
-                                        smem_sfa[promote_stage_idx] + token_0));
-                                final_accum[i * 4 + 0] +=
-                                    scale.x * swap_pipe_accum[BUFFER][i * 4 + 0];
-                                final_accum[i * 4 + 2] +=
-                                    scale.x * swap_pipe_accum[BUFFER][i * 4 + 2];
-                                if (token_1 < valid_m) {
-                                    final_accum[i * 4 + 1] +=
-                                        scale.y * swap_pipe_accum[BUFFER][i * 4 + 1];
-                                    final_accum[i * 4 + 3] +=
-                                        scale.y * swap_pipe_accum[BUFFER][i * 4 + 3];
-                                }
-                            }
-                        }
-                    }
-                };
-#endif
             float direct_prev_scale_0 = 1.0f;
             float direct_prev_scale_1 = 1.0f;
             const auto direct_rescale_final = [&] (
@@ -3422,71 +3254,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 kSwapAccum <= kSwapAccumStride,
                                 "swap accumulator does not fit N64 subtile slot");
 
-                            if constexpr (kSwapABPromotePipeline) {
-#ifdef DG_MEGA_MOE_FP4_SWAP_PROMOTE_PIPELINE
-                                DG_STATIC_ASSERT(
-                                    kSwapABNSubtiles == 1,
-                                    "promotion pipeline requires one N64 subtile");
-                                const auto issue_swap_pipe =
-                                    [&]<uint32_t CURRENT>() {
-                                        constexpr uint32_t PREVIOUS =
-                                            1u - CURRENT;
-                                        #pragma unroll
-                                        for (uint32_t i = 0;
-                                             i < kSwapAccum; ++ i)
-                                            ptx::warpgroup_fence_operand(
-                                                swap_pipe_accum[CURRENT][i]);
-                                        ptx::warpgroup_arrive();
-                                        #pragma unroll
-                                        for (uint32_t k = 0;
-                                             k < BLOCK_K / SwapWGMMA::K; ++ k) {
-                                            auto desc_a =
-                                                mma::sm90::make_smem_desc(
-                                                    smem_b[stage_idx] +
-                                                        smem_b_wg_offset +
-                                                        k * SwapWGMMA::K,
-                                                    1);
-                                            auto desc_b =
-                                                mma::sm90::make_smem_desc(
-                                                    smem_a[stage_idx] +
-                                                        k * SwapWGMMA::K,
-                                                    1);
-                                            SwapWGMMA::wgmma(
-                                                desc_a, desc_b,
-                                                swap_pipe_accum[CURRENT], k);
-                                        }
-                                        ptx::warpgroup_commit_batch();
-
-                                        if (k_block_idx != 0) {
-                                            #pragma unroll
-                                            for (uint32_t i = 0;
-                                                 i < kSwapAccum; ++ i)
-                                                ptx::warpgroup_fence_operand(
-                                                    swap_pipe_accum[PREVIOUS][i]);
-                                            // Leave the just-issued current
-                                            // batch outstanding; only the
-                                            // previous fragment is consumed.
-                                            ptx::warpgroup_wait<1>();
-                                            const uint32_t prev_stage_idx =
-                                                stage_idx == 0 ?
-                                                    kNumStages - 1 :
-                                                    stage_idx - 1;
-                                            promote_swap_pipe_l1
-                                                .template operator()<
-                                                    N_SWAP, PREVIOUS>(
-                                                        prev_stage_idx);
-                                            if (lane_idx == 0)
-                                                empty_barriers[prev_stage_idx]
-                                                    ->arrive();
-                                        }
-                                    };
-
-                                if (k_block_idx & 1u)
-                                    issue_swap_pipe.template operator()<1>();
-                                else
-                                    issue_swap_pipe.template operator()<0>();
-#endif
-                            } else {
                             #pragma unroll
                             for (uint32_t sub = 0;
                                  sub < kSwapABNSubtiles; ++ sub) {
@@ -3563,7 +3330,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
                             if (lane_idx == 0)
                                 empty_barriers[stage_idx]->arrive();
-                            }
                         };
 
                         run_swap_ab_l1.template operator()<kNSwap>();
@@ -4088,88 +3854,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             } else {
                 run_k_stages.template operator()<0>();
             }
-#ifdef DG_MEGA_MOE_FP4_SWAP_PROMOTE_PIPELINE
-            if constexpr (kSwapABPromotePipeline) {
-                if (block_phase == sched::BlockPhase::Linear1 and
-                    num_k_blocks != 0 and wg_has_valid_rows) {
-                    const auto finish_swap_pipe =
-                        [&]<uint32_t N_SWAP>() {
-                            using SwapWGMMA = typename
-                                mma::sm90::FP8MMASelector<N_SWAP>::type;
-                            constexpr uint32_t kSwapAccum =
-                                SwapWGMMA::kNumAccum;
-                            constexpr uint32_t LAST =
-                                (num_k_blocks - 1u) & 1u;
-                            #pragma unroll
-                            for (uint32_t i = 0;
-                                 i < kSwapAccum; ++ i)
-                                ptx::warpgroup_fence_operand(
-                                    swap_pipe_accum[LAST][i]);
-                            ptx::warpgroup_wait<0>();
-                            const uint32_t last_stage_idx =
-                                stage_idx == 0 ?
-                                    kNumStages - 1 : stage_idx - 1;
-                            promote_swap_pipe_l1
-                                .template operator()<N_SWAP, LAST>(
-                                    last_stage_idx);
-                            if (lane_idx == 0)
-                                empty_barriers[last_stage_idx]->arrive();
-                        };
-
-                    const uint32_t n_swap =
-                        ((valid_m + 7u) / 8u) * 8u;
-                    if constexpr (kSwapABFlashN24Dispatch) {
-                        if (n_swap <= 8)
-                            finish_swap_pipe.template operator()<8>();
-                        else if (n_swap <= 16)
-                            finish_swap_pipe.template operator()<16>();
-                        else if (n_swap <= 24)
-                            finish_swap_pipe.template operator()<24>();
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 1
-                        else if (n_swap <= 32)
-                            finish_swap_pipe.template operator()<32>();
-                        else if (n_swap <= 40)
-                            finish_swap_pipe.template operator()<40>();
-#endif
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 2
-                        else if (n_swap <= 48)
-                            finish_swap_pipe.template operator()<48>();
-#endif
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 3
-                        else if (n_swap <= 56)
-                            finish_swap_pipe.template operator()<56>();
-#endif
-                        else
-                            finish_swap_pipe.template operator()<64>();
-                    } else {
-                        if (n_swap <= 8)
-                            finish_swap_pipe.template operator()<8>();
-                        else if (n_swap <= 16)
-                            finish_swap_pipe.template operator()<16>();
-#ifdef DG_MEGA_MOE_FP4_SWAP_AB_N24
-                        else if (n_swap <= 24)
-                            finish_swap_pipe.template operator()<24>();
-#endif
-                        else if (n_swap <= 32)
-                            finish_swap_pipe.template operator()<32>();
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 1
-                        else if (n_swap <= 40)
-                            finish_swap_pipe.template operator()<40>();
-#endif
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 2
-                        else if (n_swap <= 48)
-                            finish_swap_pipe.template operator()<48>();
-#endif
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 3
-                        else if (n_swap <= 56)
-                            finish_swap_pipe.template operator()<56>();
-#endif
-                        else
-                            finish_swap_pipe.template operator()<64>();
-                    }
-                }
-            }
-#endif
             if constexpr (kDirectAccumulator) {
                 if (num_k_blocks != 0 and wg_has_valid_rows)
                     direct_postscale_final(

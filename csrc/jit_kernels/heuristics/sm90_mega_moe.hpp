@@ -42,6 +42,12 @@ struct MegaMoESM90Config {
     }
 };
 
+// Keep the FP4 M64/swapAB and M128/non-swap regions contiguous.  Boundary
+// sweeps place the crossover between 54.9 and 59.4 expected rows/expert; 59
+// selects the lower-padding M64 path below that point and the lower-task-count
+// M128 path at and above it without leaving an M64/non-swap gap.
+constexpr float kFP4SM90M128CrossoverRows = 59.0f;
+
 static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
     const int& num_ranks, const int& num_experts,
     const int& num_topk, const int& num_tokens) {
@@ -203,7 +209,7 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
     const bool auto_split_mn =
-        expected_tokens_per_expert >= 64.0f;
+        expected_tokens_per_expert >= kFP4SM90M128CrossoverRows;
     const bool ultra_small_split_n =
         expected_tokens_per_expert > 0.0f and
         expected_tokens_per_expert < 0.375f;
@@ -221,73 +227,6 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
     return {block_m, num_epilogue_warpgroups * 128};
 }
 
-struct FP4SM90WaveRule {
-    float min_tokens_per_expert;
-    float max_tokens_per_expert;
-    bool include_min;
-    int required_expert_divisor;
-    int num_experts_per_wave;
-};
-
-enum class FP4SM90StageShape {
-    Any,
-    Flash,
-    Pro,
-    NotPro,
-};
-
-struct FP4SM90StageCapRule {
-    float min_tokens_per_expert;
-    float max_tokens_per_expert;
-    bool include_min;
-    bool include_max;
-    FP4SM90StageShape shape;
-    int num_stages_cap;
-};
-
-static bool try_get_num_experts_per_wave_for_sm90_fp4(
-    const FP4SM90WaveRule* rules, const int& num_rules,
-    const float& expected_tokens_per_expert, const int& num_experts_per_rank,
-    int& num_experts_per_wave) {
-    for (int i = 0; i < num_rules; ++ i) {
-        const auto& rule = rules[i];
-        const bool in_lower_bound = rule.include_min
-            ? expected_tokens_per_expert >= rule.min_tokens_per_expert
-            : expected_tokens_per_expert > rule.min_tokens_per_expert;
-        if (!in_lower_bound or expected_tokens_per_expert >= rule.max_tokens_per_expert)
-            continue;
-
-        if (rule.num_experts_per_wave == 0) {
-            if (num_experts_per_rank <= 0)
-                continue;
-            num_experts_per_wave = num_experts_per_rank;
-            return true;
-        }
-        DG_HOST_ASSERT(rule.required_expert_divisor > 0);
-        if (num_experts_per_rank % rule.required_expert_divisor == 0) {
-            num_experts_per_wave = rule.num_experts_per_wave;
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool fp4_sm90_stage_shape_matches(
-    const FP4SM90StageShape& shape, const bool& fp4_flash_shape, const bool& fp4_pro_shape) {
-    switch (shape) {
-        case FP4SM90StageShape::Any:
-            return true;
-        case FP4SM90StageShape::Flash:
-            return fp4_flash_shape;
-        case FP4SM90StageShape::Pro:
-            return fp4_pro_shape;
-        case FP4SM90StageShape::NotPro:
-            return !fp4_pro_shape;
-    }
-    DG_HOST_ASSERT(false);
-    return false;
-}
-
 static int get_default_num_stages_cap_for_mega_moe_sm90_fp4(
     const int& intermediate_hidden, const int& block_m, const int& block_n,
     const float& expected_tokens_per_expert) {
@@ -297,32 +236,42 @@ static int get_default_num_stages_cap_for_mega_moe_sm90_fp4(
 
     const bool fp4_flash_shape = intermediate_hidden <= 2048;
     const bool fp4_pro_shape = intermediate_hidden >= 3072;
-    // Ordered first-match rules preserve the historical stage-cap priority.
-    static constexpr FP4SM90StageCapRule stage_cap_rules[] = {
-        {6.0f, 12.0f, true, false, FP4SM90StageShape::Flash, 5},
-        {3.0f, 6.0f, false, false, FP4SM90StageShape::Flash, 4},
-        {0.0f, 0.25f, false, false, FP4SM90StageShape::Pro, 5},
-        {0.375f, 0.75f, true, false, FP4SM90StageShape::Pro, 5},
-        {1.5f, 3.0f, true, false, FP4SM90StageShape::Pro, 5},
-        {1.0f, 1.5f, true, false, FP4SM90StageShape::Pro, 5},
-        {24.0f, 64.0f, true, false, FP4SM90StageShape::Pro, 5},
-        {0.375f, 0.75f, true, false, FP4SM90StageShape::Any, 6},
-        {3.0f, 6.0f, false, false, FP4SM90StageShape::Flash, 6},
-        {1.5f, 3.0f, true, false, FP4SM90StageShape::NotPro, 6},
-        {1.5f, 24.0f, true, true, FP4SM90StageShape::Any, 5},
-    };
-    for (const auto& rule: stage_cap_rules) {
-        const bool in_lower_bound = rule.include_min
-            ? expected_tokens_per_expert >= rule.min_tokens_per_expert
-            : expected_tokens_per_expert > rule.min_tokens_per_expert;
-        const bool in_upper_bound = rule.include_max
-            ? expected_tokens_per_expert <= rule.max_tokens_per_expert
-            : expected_tokens_per_expert < rule.max_tokens_per_expert;
-        if (in_lower_bound and in_upper_bound and
-            fp4_sm90_stage_shape_matches(rule.shape, fp4_flash_shape, fp4_pro_shape)) {
-            return rule.num_stages_cap;
-        }
+    // Preserve the validated stage counts while expressing the disjoint
+    // density regions directly.  The previous ordered table contained a
+    // duplicate Flash (3, 6) rule whose cap=6 entry was unreachable after the
+    // cap=4 entry.
+    if (fp4_flash_shape) {
+        if (expected_tokens_per_expert > 3.0f and
+            expected_tokens_per_expert < 6.0f)
+            return 4;
+        if ((expected_tokens_per_expert >= 0.375f and
+             expected_tokens_per_expert < 0.75f) or
+            (expected_tokens_per_expert >= 1.5f and
+             expected_tokens_per_expert < 3.0f))
+            return 6;
+        if (expected_tokens_per_expert >= 3.0f and
+            expected_tokens_per_expert <= 24.0f)
+            return 5;
+        return 0;
     }
+    if (fp4_pro_shape) {
+        if ((expected_tokens_per_expert > 0.0f and
+             expected_tokens_per_expert < 0.25f) or
+            (expected_tokens_per_expert >= 0.375f and
+             expected_tokens_per_expert < 0.75f) or
+            (expected_tokens_per_expert >= 1.0f and
+             expected_tokens_per_expert < kFP4SM90M128CrossoverRows))
+            return 5;
+        return 0;
+    }
+    if ((expected_tokens_per_expert >= 0.375f and
+         expected_tokens_per_expert < 0.75f) or
+        (expected_tokens_per_expert >= 1.5f and
+         expected_tokens_per_expert < 3.0f))
+        return 6;
+    if (expected_tokens_per_expert >= 3.0f and
+        expected_tokens_per_expert <= 24.0f)
+        return 5;
     return 0;
 }
 
@@ -332,81 +281,78 @@ static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
     const int& num_ring_tokens, const int& num_max_tokens_per_rank, const int& num_ranks) {
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-    const bool fp4_small_block_n_kernel =
-        block_m == 64 and block_n == 128;
-    const bool fp4_flash_shape = intermediate_hidden <= 2048;
-    const bool fp4_pro_shape = intermediate_hidden >= 3072;
     const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
         num_ranks, num_max_tokens_per_rank, num_topk,
         num_experts_per_rank);
-    // The tuned FP4 wave table predates compact compute pools.  Cap every
-    // table result with the common ring-aware heuristic so a complete L1 wave
-    // fits before L2 must retire and recycle any physical slot.  Use the
-    // current launch size for this bound; the ring is sized from the buffer
-    // maximum, but inactive SymmBuffer capacity must not throttle decode.
-    const int ring_safe_num_experts_per_wave =
-        num_ring_tokens < num_max_pool_tokens ?
-            get_num_experts_per_wave_for_mega_moe(
-                num_experts_per_rank, num_tokens, num_topk,
-                intermediate_hidden, block_m, block_n, num_sms,
-                num_ring_tokens, align(num_tokens, block_m), num_ranks) :
-            num_experts_per_rank;
-    int fp4_num_experts_per_wave = 0;
-    if (fp4_small_block_n_kernel and fp4_flash_shape) {
-        static constexpr FP4SM90WaveRule flash_wave_rules[] = {
-            {0.75f, 1.0f, true, 16, 16},
-            {1.5f, 2.0f, true, 16, 16},
-            {3.0f, 6.0f, true, 16, 16},
-            {6.0f, 12.0f, true, 32, 32},
-            {6.0f, 12.0f, true, 8, 8},
-            {24.0f, 32.0f, true, 16, 16},
-            {12.0f, 24.0f, true, 32, 32},
-            {12.0f, 24.0f, true, 8, 8},
-            {32.0f, 64.0f, true, 16, 16},
-        };
-        if (try_get_num_experts_per_wave_for_sm90_fp4(
-                flash_wave_rules,
-                static_cast<int>(sizeof(flash_wave_rules) / sizeof(flash_wave_rules[0])),
-                expected_tokens_per_expert, num_experts_per_rank,
-                fp4_num_experts_per_wave)) {
-            return std::min(fp4_num_experts_per_wave,
-                            ring_safe_num_experts_per_wave);
+    // A wave must fit in the physical compute ring even when the SymmBuffer was
+    // allocated for a larger request.  Use this launch's aligned token count
+    // for the lifetime bound so an inactive max-token tail does not throttle
+    // the scheduler.
+    int max_ring_safe_experts = num_experts_per_rank;
+    if (num_ring_tokens < num_max_pool_tokens) {
+        const int active_max_tokens = align(num_tokens, block_m);
+        while (max_ring_safe_experts > 0 and
+               get_num_wave_pool_tokens(
+                   num_ranks, num_topk, active_max_tokens,
+                   max_ring_safe_experts, block_m) > num_ring_tokens)
+            -- max_ring_safe_experts;
+        DG_HOST_ASSERT(max_ring_safe_experts > 0 and
+                       "FP4 compute ring is too small for one expert wave");
+    }
+
+    // JIT cannot see the realized route histogram, but uniform routing gives
+    // a stable estimate of the number of non-empty local experts:
+    //   P(expert active) = 1 - exp(-expected rows/expert).
+    // Multiply the CTA count of an active expert by this probability to size
+    // the contiguous expert-ID span needed to expose four CTA waves.  This keeps
+    // sparse launches wide enough to find their scattered active experts while
+    // avoiding full-expert waves once a smaller set already saturates the GPU.
+    const float active_fraction = std::max(
+        1.0f / static_cast<float>(num_experts_per_rank),
+        1.0f - std::exp(-expected_tokens_per_expert));
+    const float expected_rows_per_active_expert =
+        expected_tokens_per_expert / active_fraction;
+    const int expected_m_blocks_per_active_expert = std::max(
+        ceil_div(static_cast<int>(std::ceil(expected_rows_per_active_expert)),
+                 block_m),
+        1);
+    const int l1_n_blocks_per_expert = (2 * intermediate_hidden) / block_n;
+    const float expected_l1_ctas_per_scheduled_expert =
+        active_fraction * expected_m_blocks_per_active_expert *
+        l1_n_blocks_per_expert;
+    constexpr int kTargetCTAsPerSM = 4;
+    int min_experts_to_fill_sms = static_cast<int>(std::ceil(
+        kTargetCTAsPerSM * static_cast<float>(num_sms) /
+        expected_l1_ctas_per_scheduled_expert));
+
+    // Four-expert granularity keeps CTA distribution stable without encoding
+    // model-local expert divisors such as 8/16/24/32 in a rule table.
+    constexpr int kExpertWaveGranularity = 4;
+    min_experts_to_fill_sms = std::max(1, min_experts_to_fill_sms);
+    if (min_experts_to_fill_sms >= kExpertWaveGranularity)
+        min_experts_to_fill_sms = align(
+            min_experts_to_fill_sms, kExpertWaveGranularity);
+    if (min_experts_to_fill_sms >= max_ring_safe_experts)
+        return max_ring_safe_experts;
+
+    // Among resource-sufficient waves, prefer a balanced final wave.  Search
+    // only up to 2x the minimum so tail balancing cannot silently turn the
+    // resource formula back into a full-expert model table.
+    const int sweep_max = std::min(
+        max_ring_safe_experts, 2 * min_experts_to_fill_sms);
+    int best_wave = min_experts_to_fill_sms;
+    float best_tail_ratio = -1.0f;
+    for (int wave = min_experts_to_fill_sms;
+         wave <= sweep_max; wave += kExpertWaveGranularity) {
+        const int remainder = num_experts_per_rank % wave;
+        const float tail_ratio = remainder == 0
+            ? 1.0f : static_cast<float>(remainder) / wave;
+        if (tail_ratio > best_tail_ratio) {
+            best_tail_ratio = tail_ratio;
+            best_wave = wave;
         }
     }
-    if (fp4_small_block_n_kernel and fp4_pro_shape) {
-        static constexpr FP4SM90WaveRule pro_wave_rules[] = {
-            {0.0f, 0.25f, false, 16, 16},
-            {0.25f, 0.375f, true, 16, 16},
-            {0.375f, 0.75f, true, 16, 16},
-            {0.25f, 1.0f, true, 24, 24},
-            {1.0f, 1.5f, true, 1, 0},
-            {1.5f, 3.0f, true, 16, 16},
-            {3.0f, 6.0f, true, 8, 8},
-            {6.0f, 12.0f, true, 16, 16},
-            {6.0f, 12.0f, true, 8, 8},
-            // Eight experts still expose 8 * (2 * IH / BLOCK_N) L1 CTAs for
-            // Pro-like shapes, while allowing later dispatch arrivals to
-            // overlap the first wave's GEMMs instead of scheduling all 24
-            // local experts at once.
-            {12.0f, 24.0f, true, 8, 8},
-            {24.0f, 64.0f, true, 8, 8},
-        };
-        if (try_get_num_experts_per_wave_for_sm90_fp4(
-                pro_wave_rules,
-                static_cast<int>(sizeof(pro_wave_rules) / sizeof(pro_wave_rules[0])),
-                expected_tokens_per_expert, num_experts_per_rank,
-                fp4_num_experts_per_wave)) {
-            return std::min(fp4_num_experts_per_wave,
-                            ring_safe_num_experts_per_wave);
-        }
-    }
-    if (expected_tokens_per_expert < 1.0f or expected_tokens_per_expert > 4.0f) {
-        return ring_safe_num_experts_per_wave;
-    }
-    return get_num_experts_per_wave_for_mega_moe(
-        num_experts_per_rank, num_tokens, num_topk,
-        intermediate_hidden, block_m, block_n, num_sms,
-        num_ring_tokens, num_max_tokens_per_rank, num_ranks);
+    return std::min(best_wave, max_ring_safe_experts);
 }
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
@@ -515,7 +461,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const bool fp4_split_n_shape_band =
         (fp4_flash_or_pro_shape and
          expected_tokens_per_expert > 0.0f and
-         expected_tokens_per_expert < 64.0f);
+         expected_tokens_per_expert < kFP4SM90M128CrossoverRows);
     if (fp4_split_n_eligible and fp4_split_n_shape_band) {
         fp4_num_epilogue_warpgroups = 2;
     }
@@ -544,7 +490,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         fp4_small_block_n_kernel and fp4_split_n_shape_band;
     const bool fp4_2wg_decode_offload_kernel_band =
         block_m == 128 and block_n == 128 and
-        fp4_num_epilogue_threads == 256 and expected_tokens_per_expert >= 64.0f;
+        fp4_num_epilogue_threads == 256 and
+        expected_tokens_per_expert >= kFP4SM90M128CrossoverRows;
     const bool fp4_decode_assist_thread_kernel_band =
         fp4_2wg_decode_offload_kernel_band or
         (fp4_small_block_n_kernel and
