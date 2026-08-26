@@ -227,54 +227,6 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
     return {block_m, num_epilogue_warpgroups * 128};
 }
 
-static int get_default_num_stages_cap_for_mega_moe_sm90_fp4(
-    const int& intermediate_hidden, const int& block_m, const int& block_n,
-    const float& expected_tokens_per_expert) {
-    if (!(block_m == 64 and block_n == 128)) {
-        return 0;
-    }
-
-    const bool fp4_flash_shape = intermediate_hidden <= 2048;
-    const bool fp4_pro_shape = intermediate_hidden >= 3072;
-    // Preserve the validated stage counts while expressing the disjoint
-    // density regions directly.  The previous ordered table contained a
-    // duplicate Flash (3, 6) rule whose cap=6 entry was unreachable after the
-    // cap=4 entry.
-    if (fp4_flash_shape) {
-        if (expected_tokens_per_expert > 3.0f and
-            expected_tokens_per_expert < 6.0f)
-            return 4;
-        if ((expected_tokens_per_expert >= 0.375f and
-             expected_tokens_per_expert < 0.75f) or
-            (expected_tokens_per_expert >= 1.5f and
-             expected_tokens_per_expert < 3.0f))
-            return 6;
-        if (expected_tokens_per_expert >= 3.0f and
-            expected_tokens_per_expert <= 24.0f)
-            return 5;
-        return 0;
-    }
-    if (fp4_pro_shape) {
-        if ((expected_tokens_per_expert > 0.0f and
-             expected_tokens_per_expert < 0.25f) or
-            (expected_tokens_per_expert >= 0.375f and
-             expected_tokens_per_expert < 0.75f) or
-            (expected_tokens_per_expert >= 1.0f and
-             expected_tokens_per_expert < kFP4SM90M128CrossoverRows))
-            return 5;
-        return 0;
-    }
-    if ((expected_tokens_per_expert >= 0.375f and
-         expected_tokens_per_expert < 0.75f) or
-        (expected_tokens_per_expert >= 1.5f and
-         expected_tokens_per_expert < 3.0f))
-        return 6;
-    if (expected_tokens_per_expert >= 3.0f and
-        expected_tokens_per_expert <= 24.0f)
-        return 5;
-    return 0;
-}
-
 static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
     const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms,
@@ -362,7 +314,6 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int& num_dispatch_warps, const int& num_epilogue_warps,
     const bool& use_early_b_decode = false,
     const bool& use_decode_done_mbarrier = false,
-    const int& default_num_stages_cap = 0,
     const bool& use_swap_ab = false,
     const bool& use_swap_ab_fast_amax = false) {
     constexpr int kSmemAlignment = 1024;
@@ -424,15 +375,14 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int smem_fixed =
         smem_dispatch_size + smem_cd + smem_amax_scratch + smem_barriers_fixed;
 
-    const int max_num_stages = (smem_capacity - smem_fixed) /
-                               (smem_per_stage + smem_barriers_per_stage);
-    int num_stages = max_num_stages;
-    if (default_num_stages_cap > 0) {
-        num_stages = std::min(num_stages, default_num_stages_cap);
-    }
+    // Fill the available shared-memory budget; no model/density stage cap.
+    const int num_stages = (smem_capacity - smem_fixed) /
+                           (smem_per_stage + smem_barriers_per_stage);
     DG_HOST_ASSERT(num_stages >= 2);
-    return {num_stages,
-            smem_fixed + num_stages * (smem_per_stage + smem_barriers_per_stage)};
+    const int smem_size =
+        smem_fixed + num_stages * (smem_per_stage + smem_barriers_per_stage);
+    DG_HOST_ASSERT(smem_size <= smem_capacity);
+    return {num_stages, smem_size};
 }
 
 static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
@@ -517,14 +467,12 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
                    num_non_epilogue_threads % 64 == 0);
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);
 
-    const int default_num_stages_cap = get_default_num_stages_cap_for_mega_moe_sm90_fp4(
-        intermediate_hidden, block_m, block_n, expected_tokens_per_expert);
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90_fp4(
         SM90ArchSpec::smem_capacity,
         num_experts, hidden,
         block_m, block_n, block_k,
         num_dispatch_threads / 32, fp4_num_epilogue_threads / 32,
-        use_early_b_decode, use_decode_done_mbarrier, default_num_stages_cap,
+        use_early_b_decode, use_decode_done_mbarrier,
         use_swap_ab, use_swap_ab_fast_amax);
 
     const auto config = MegaMoESM90Config {

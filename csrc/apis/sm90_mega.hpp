@@ -580,20 +580,6 @@ static void fp8_fp4_mega_moe_sm90(
     auto fp4_defaults = get_fp4_sm90_api_defaults(
         num_experts_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden);
-    const float fp4_expected_rows_per_local_expert =
-        static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-    // On the first M128 band of a weight-heavy shape, let both dispatch warps
-    // finish remote pull before warp 1 changes role to async publisher.  This
-    // keeps the two-warp READ issue rate on the latency-sensitive first wave,
-    // then removes the otherwise permanently occupied publisher warp from the
-    // non-epilogue group.  The gate is workload based rather than model named.
-    const bool fp4_delayed_dispatch_warp_publisher =
-        fp4_internode and num_ranks > 8 and
-        num_experts_per_rank <= 32 and
-        intermediate_hidden >= 3072 and
-        fp4_expected_rows_per_local_expert >=
-            kFP4SM90M128CrossoverRows and
-        fp4_expected_rows_per_local_expert < 128.0f;
     // The protocol is shape-fixed: inter-node launches use expert-ready
     // dispatch, full-row async combine and one extra gateway QP; single-node
     // launches retain the NVLink count-sum data path.

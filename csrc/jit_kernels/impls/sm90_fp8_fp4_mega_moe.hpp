@@ -121,7 +121,6 @@ public:
         std::string internode_prefix =
             "// sm90 fp4 mega-moe protocol revision 3\n"
             "// sm90 fp4 mega-moe support uses nvshmem device helpers\n";
-        bool use_delayed_dispatch_warp_publisher = false;
         if (args.num_ranks > kNvlPeers) {
             internode_prefix += fmt::format(
                 "// inter-node mega-moe: uses nvshmem device functions\n"
@@ -165,17 +164,6 @@ public:
             const float expected_rows_per_local_expert =
                 static_cast<float>(args.num_tokens) * args.num_topk /
                 num_experts_per_rank;
-            // Preserve two dispatch READ warps through remote pull, then
-            // transfer warp 1 to async publishing.  The first M128 band of a
-            // weight-heavy shape was the stable A-B-A win; sparse M64 shapes
-            // remain on the original topology because publisher latency and
-            // decode scheduling dominate there.
-            use_delayed_dispatch_warp_publisher =
-                num_experts_per_rank <= 32 and
-                args.intermediate_hidden >= 3072 and
-                expected_rows_per_local_expert >=
-                    kFP4SM90M128CrossoverRows and
-                expected_rows_per_local_expert < 128.0f;
             constexpr int64_t kPublisherBackoffMaxWeightElems =
                 16ll * 1024 * 1024;
             const bool weight_light =
@@ -267,9 +255,6 @@ public:
         else if (args.num_ranks > kNvlPeers)
             internode_prefix +=
                 "#define DG_DEVICE_ASSERT_TRAP_ONLY 1\n";
-        if (use_delayed_dispatch_warp_publisher)
-            internode_prefix +=
-                "#define DG_MEGA_MOE_DELAYED_DISPATCH_WARP_PUBLISHER 1\n";
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE_SILENT", 0) != 0)
             internode_prefix +=
                 "#define DG_MEGA_MOE_PHASE_PROFILE_SILENT 1\n";
