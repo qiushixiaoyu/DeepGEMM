@@ -716,11 +716,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr bool kSwapABL2Active = kSwapABEligible;
     constexpr bool kSwapABFastAmaxActive =
         kSwapABL1Active and kFP4SwapABFastAmax;
-    // Flash b4 is assigned a distinct epw16 kernel. Keep one intermediate
-    // swap bucket there so this band avoids unnecessary padding without
-    // making the ultra-small epw32 kernel heavier.
-    constexpr bool kSwapABFlashN24Dispatch =
-        kSwapABEligible and kIntermediateHidden <= 2048 and kNumExpertsPerWave == 16;
     constexpr uint32_t kSwapABNSubtiles = WG_BLOCK_N / 64;
     constexpr uint32_t kSwapABTokenChunks = BLOCK_M / 8;
     DG_STATIC_ASSERT(not kSwapABEligible or (BLOCK_M % 8 == 0),
@@ -3518,56 +3513,32 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
             if constexpr (kSwapABEligible) {
                 const uint32_t n_swap = ((valid_m + 7u) / 8u) * 8u;
-                if constexpr (kSwapABFlashN24Dispatch) {
-                    if (n_swap <= 8) {
-                        run_k_stages.template operator()<8>();
-                    } else if (n_swap <= 16) {
-                        run_k_stages.template operator()<16>();
-                    } else if (n_swap <= 24) {
-                        run_k_stages.template operator()<24>();
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 1
-                    } else if (n_swap <= 32) {
-                        run_k_stages.template operator()<32>();
-                    } else if (n_swap <= 40) {
-                        run_k_stages.template operator()<40>();
-#endif
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 2
-                    } else if (n_swap <= 48) {
-                        run_k_stages.template operator()<48>();
-#endif
-#if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 3
-                    } else if (n_swap <= 56) {
-                        run_k_stages.template operator()<56>();
-#endif
-                    } else {
-                        run_k_stages.template operator()<64>();
-                    }
-                } else {
-                    if (n_swap <= 8) {
-                        run_k_stages.template operator()<8>();
-                    } else if (n_swap <= 16) {
-                        run_k_stages.template operator()<16>();
+                // Bucket availability is a GEMM policy, independent of the
+                // number of experts scheduled in a wave.
+                if (n_swap <= 8) {
+                    run_k_stages.template operator()<8>();
+                } else if (n_swap <= 16) {
+                    run_k_stages.template operator()<16>();
 #ifdef DG_MEGA_MOE_FP4_SWAP_AB_N24
-                    } else if (n_swap <= 24) {
-                        run_k_stages.template operator()<24>();
+                } else if (n_swap <= 24) {
+                    run_k_stages.template operator()<24>();
 #endif
-                    } else if (n_swap <= 32) {
-                        run_k_stages.template operator()<32>();
+                } else if (n_swap <= 32) {
+                    run_k_stages.template operator()<32>();
 #if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 1
-                    } else if (n_swap <= 40) {
-                        run_k_stages.template operator()<40>();
+                } else if (n_swap <= 40) {
+                    run_k_stages.template operator()<40>();
 #endif
 #if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 2
-                    } else if (n_swap <= 48) {
-                        run_k_stages.template operator()<48>();
+                } else if (n_swap <= 48) {
+                    run_k_stages.template operator()<48>();
 #endif
 #if defined(DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS) && DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS >= 3
-                    } else if (n_swap <= 56) {
-                        run_k_stages.template operator()<56>();
+                } else if (n_swap <= 56) {
+                    run_k_stages.template operator()<56>();
 #endif
-                    } else {
-                        run_k_stages.template operator()<64>();
-                    }
+                } else {
+                    run_k_stages.template operator()<64>();
                 }
             } else {
                 run_k_stages.template operator()<0>();

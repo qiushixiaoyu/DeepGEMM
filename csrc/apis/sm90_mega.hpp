@@ -95,17 +95,20 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     const bool m128_or_larger =
         rows >= kFP4SM90M128CrossoverRows;
 
+    // All supported Flash/Pro-like M64 shapes use swapAB until the shared
+    // crossover. Reuse this topology decision for packed-weight load width
+    // rather than maintaining separate sparse-density exceptions.
+    const bool default_swap_ab =
+        (fp4_flash_shape or fp4_pro_shape) and below_m128_crossover;
+
     // Keep math warpgroups dedicated to WGMMA, matching the FP8 execution
     // model. Packed-FP4 weight decode is owned exclusively by the
     // non-epilogue decode-assist warps.
     constexpr bool math_wg_participates_in_decode = false;
 
-    const bool default_wide_load_decode =
-        (fp4_pro_shape and below_m128_crossover) or
-        (fp4_flash_shape and
-         ((rows >= 0.375f and rows < 0.5f) or
-          (rows >= 1.5f and rows < 2.0f) or
-          (rows >= 6.0f and rows < kFP4SM90M128CrossoverRows)));
+    // Wide loads are validated for this M64 swapAB topology. Do not expand
+    // them into M128 or the middle-shape non-swap kernels.
+    const bool default_wide_load_decode = default_swap_ab;
 
     // Early-B remains useful only in the middle-shape 1.5--3 band, the
     // Flash-like 2--3 band, and dense M128 shapes other than the first
@@ -117,17 +120,11 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
         (m128_or_larger and
          !(fp4_pro_shape and rows < 128.0f));
 
-    // Pro-like shapes use the decode-done mbarrier throughout.  Flash-like
-    // shapes retain only their measured 0.5--0.75 hole; middle shapes keep the
-    // two validated bands and the M128 topology.
+    // Dedicated decode assistants are independent producers. A one-way
+    // stage mbarrier lets them advance without a rendezvous with math
+    // consumers; no model or density window is needed for this topology.
     const bool default_decode_done_mbarrier =
-        (fp4_pro_shape and has_rows) or
-        (fp4_flash_shape and has_rows and
-         (rows < 0.5f or rows >= 0.75f)) or
-        (fp4_middle_shape and
-         ((rows >= 3.0f and rows <= 6.0f) or
-          (rows >= 12.0f and rows <= 24.0f) or
-          m128_or_larger));
+        has_rows and not math_wg_participates_in_decode;
 
     // Arrival-counter selection remains intentionally narrow until the
     // expanded EP/skew matrix validates a wider sparse region.
@@ -138,12 +135,6 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
           rows >= 0.25f and rows < 0.375f));
 
     (void)hidden;
-    // All supported Flash/Pro-like M64 shapes use swapAB until the shared
-    // crossover.  M128 begins at the same boundary, so no M64/non-swap or
-    // M128/swap specialization can be selected.
-    const bool default_swap_ab =
-        (fp4_flash_shape or fp4_pro_shape) and
-        below_m128_crossover;
     // Warp-cooperative amax avoids the FP32 full-tile staging and serial
     // per-token row scan in the swapAB L1 epilogue.  The 16--32 row window
     // amortizes its two CTA reductions for both light and streaming-weight
