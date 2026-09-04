@@ -5,7 +5,11 @@
 #include "../../jit/kernel_runtime.hpp"
 #include "../../utils/exception.hpp"
 #include "../../utils/format.hpp"
+#include "../../apis/sm90_mega_cpu_proxy.hpp"
 #include "runtime_utils.hpp"
+
+#include <array>
+#include <mutex>
 
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
@@ -89,6 +93,8 @@ public:
         int* cumulative_local_expert_recv_stats;
         int num_tokens;
         layout::SymBuffer<> sym_buffer_ptrs;
+        mega::SM90MegaMoECPUProxyLaunch cpu_proxy;
+        int sidecar_num_blocks;
 
         // Tensormaps for activations (FP8) and packed FP4 weights.
         // Weight UE8M0 SFB are passed as raw uint32* (no TMA descriptor).
@@ -126,6 +132,85 @@ public:
                 "// inter-node mega-moe: uses nvshmem device functions\n"
                 "#define DG_MEGA_MOE_INTERNODE\n"
                 "#define DG_MEGA_MOE_NVL_PEERS {}\n", kNvlPeers);
+            const bool use_cpu_proxy = get_env<int>(
+                "DG_MEGA_MOE_FP4_CPU_PROXY", 0) != 0;
+            const bool use_sidecar_publisher = get_env<int>(
+                "DG_MEGA_MOE_FP4_SIDECAR_PUBLISHER", 0) != 0;
+            DG_HOST_ASSERT(not (use_cpu_proxy and use_sidecar_publisher));
+            if (use_cpu_proxy) {
+                DG_HOST_ASSERT(
+                    mega::sm90_mega_moe_cpu_proxy_is_initialized());
+                internode_prefix +=
+                    "#define DG_MEGA_MOE_FP4_CPU_PROXY 1\n";
+                if (get_env<int>(
+                        "DG_MEGA_MOE_FP4_CPU_PROXY_ASYNC_CREDIT", 0) != 0)
+                    internode_prefix +=
+                        "#define "
+                        "DG_MEGA_MOE_FP4_CPU_PROXY_ASYNC_CREDIT 1\n";
+            }
+            if (use_sidecar_publisher) {
+                const int combine_stage_tokens =
+                    layout::get_num_sm90_combine_ring_tokens(
+                        args.num_ranks, args.num_max_tokens_per_rank,
+                        args.num_topk,
+                        args.num_experts / args.num_ranks);
+                DG_HOST_ASSERT(args.num_ranks == 16);
+                DG_HOST_ASSERT(args.num_experts / args.num_ranks <= 32);
+                DG_HOST_ASSERT(
+                    combine_stage_tokens == args.config.num_max_pool_tokens);
+                internode_prefix +=
+                    "#define DG_MEGA_MOE_FP4_SIDECAR_PUBLISHER 1\n";
+                const bool sidecar_dispatch_rdma = get_env<int>(
+                    "DG_MEGA_MOE_FP4_SIDECAR_DISPATCH_RDMA", 0) != 0;
+                if (sidecar_dispatch_rdma)
+                    internode_prefix +=
+                        "#define "
+                        "DG_MEGA_MOE_FP4_SIDECAR_DISPATCH_RDMA 1\n";
+                const bool aggregate_local = get_env<int>(
+                    "DG_MEGA_MOE_FP4_SIDECAR_AGGREGATE_LOCAL", 0) != 0;
+                const bool expert_centric = get_env<int>(
+                    "DG_MEGA_MOE_FP4_SIDECAR_EXPERT_CENTRIC", 0) != 0;
+                DG_HOST_ASSERT(
+                    not sidecar_dispatch_rdma or
+                    (not aggregate_local and not expert_centric));
+                const int shared_metadata_mode = get_env<int>(
+                    "DG_MEGA_MOE_FP4_SIDECAR_SHARED_METADATA", -1);
+                DG_HOST_ASSERT(
+                    shared_metadata_mode >= -1 and
+                    shared_metadata_mode <= 1);
+                const bool shared_metadata =
+                    shared_metadata_mode == 1 or
+                    (shared_metadata_mode == -1 and
+                     not aggregate_local and not expert_centric and
+                     args.num_tokens >= 8);
+                DG_HOST_ASSERT(
+                    static_cast<int>(aggregate_local) +
+                    static_cast<int>(expert_centric) +
+                    static_cast<int>(shared_metadata) <= 1);
+                if (aggregate_local)
+                    internode_prefix +=
+                        "#define "
+                        "DG_MEGA_MOE_FP4_SIDECAR_AGGREGATE_LOCAL 1\n";
+                if (shared_metadata)
+                    internode_prefix +=
+                        "#define "
+                        "DG_MEGA_MOE_FP4_SIDECAR_SHARED_METADATA 1\n";
+                if (expert_centric) {
+                    const int expert_peer_groups = get_env<int>(
+                        "DG_MEGA_MOE_FP4_SIDECAR_EXPERT_PEER_GROUPS", 2);
+                    DG_HOST_ASSERT(
+                        expert_peer_groups == 1 or
+                        expert_peer_groups == 2 or
+                        expert_peer_groups == 4);
+                    internode_prefix +=
+                        "#define "
+                        "DG_MEGA_MOE_FP4_SIDECAR_EXPERT_CENTRIC 1\n";
+                    internode_prefix += fmt::format(
+                        "#define "
+                        "DG_MEGA_MOE_FP4_SIDECAR_EXPERT_PEER_GROUPS {}\n",
+                        expert_peer_groups);
+                }
+            }
             const int dispatch_gateway =
                 args.requested_num_max_tokens_per_rank <=
                     layout::kGatewayDenseMaxRequestedTokens ? 4 : 3;
@@ -172,15 +257,100 @@ public:
                 kPublisherBackoffMaxWeightElems;
             const float max_backoff_rows_per_expert =
                 weight_light ? 16.0f : 8.0f;
-            const bool use_publisher_idle_backoff =
+            const bool auto_publisher_idle_backoff =
                 num_experts_per_rank <= 32 and
                 expected_rows_per_local_expert >= 1.0f and
                 expected_rows_per_local_expert <=
                     max_backoff_rows_per_expert;
-            if (use_publisher_idle_backoff)
+            // Diagnostic override for isolating the outer ready-polling loop:
+            // 0 keeps the density heuristic, 1 forces eager polling, and 2
+            // forces adaptive idle backoff for every inter-node shape.
+            // A sidecar runs on reserved SMs, so sleeping no longer protects
+            // math/decode issue bandwidth and only adds publish latency.
+            // Default it to eager polling while preserving the diagnostic
+            // override and the fused-kernel density heuristic.
+            const int publisher_backoff_mode = get_env<int>(
+                "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_MODE",
+                use_sidecar_publisher ? 1 : 0);
+            DG_HOST_ASSERT(
+                publisher_backoff_mode >= 0 and
+                publisher_backoff_mode <= 2);
+            const bool use_publisher_idle_backoff =
+                publisher_backoff_mode == 2 or
+                (publisher_backoff_mode == 0 and
+                 auto_publisher_idle_backoff);
+            const int use_publish_row_mask = get_env<int>(
+                "DG_MEGA_MOE_FP4_PUBLISH_ROW_MASK", 0);
+            DG_HOST_ASSERT(
+                use_publish_row_mask == 0 or use_publish_row_mask == 1);
+            if (use_publish_row_mask != 0)
                 internode_prefix +=
+                    "#define DG_MEGA_MOE_FP4_PUBLISH_ROW_MASK 1\n";
+            if (use_publisher_idle_backoff) {
+                const int publisher_backoff_initial_ns = get_env<int>(
+                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS", 64);
+                const int publisher_backoff_max_ns = get_env<int>(
+                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_MAX_NS", 512);
+                const int publisher_few_pending_chains = get_env<int>(
+                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_FEW_PENDING_CHAINS", 0);
+                const int publisher_few_pending_max_ns = get_env<int>(
+                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_FEW_PENDING_MAX_NS",
+                    publisher_backoff_max_ns);
+                const int publisher_long_idle_threshold = get_env<int>(
+                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_THRESHOLD", 0);
+                const int publisher_long_idle_max_ns = get_env<int>(
+                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_MAX_NS",
+                    publisher_backoff_max_ns);
+                const int publisher_progress_block_budget = get_env<int>(
+                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_PROGRESS_BLOCK_BUDGET", 0);
+                const int publisher_progress_yield_ns = get_env<int>(
+                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_PROGRESS_YIELD_NS", 64);
+                DG_HOST_ASSERT(publisher_backoff_initial_ns > 0 and
+                               publisher_backoff_max_ns >=
+                                   publisher_backoff_initial_ns and
+                               publisher_backoff_max_ns <= 1000000 and
+                               publisher_few_pending_chains >= 0 and
+                               publisher_few_pending_chains <= 32 and
+                               publisher_few_pending_max_ns >=
+                                   publisher_backoff_initial_ns and
+                               publisher_few_pending_max_ns <= 1000000 and
+                               publisher_long_idle_threshold >= 0 and
+                               publisher_long_idle_threshold <= 1000000 and
+                               publisher_long_idle_max_ns >=
+                                   publisher_backoff_max_ns and
+                               publisher_long_idle_max_ns <= 1000000 and
+                               publisher_progress_block_budget >= 0 and
+                               publisher_progress_block_budget <= 1024 and
+                               publisher_progress_yield_ns > 0 and
+                               publisher_progress_yield_ns <= 1000000);
+                internode_prefix += fmt::format(
                     "#define "
-                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_IDLE_NANOSLEEP 128\n";
+                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS {}\n"
+                    "#define "
+                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_MAX_NS {}\n"
+                    "#define "
+                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_FEW_PENDING_CHAINS {}\n"
+                    "#define "
+                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_FEW_PENDING_MAX_NS {}\n"
+                    "#define "
+                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_THRESHOLD {}\n"
+                    "#define "
+                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_MAX_NS {}\n",
+                    publisher_backoff_initial_ns,
+                    publisher_backoff_max_ns,
+                    publisher_few_pending_chains,
+                    publisher_few_pending_max_ns,
+                    publisher_long_idle_threshold,
+                    publisher_long_idle_max_ns);
+                if (publisher_progress_block_budget > 0)
+                    internode_prefix += fmt::format(
+                        "#define "
+                        "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_PROGRESS_BLOCK_BUDGET {}\n"
+                        "#define "
+                        "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_PROGRESS_YIELD_NS {}\n",
+                        publisher_progress_block_budget,
+                        publisher_progress_yield_ns);
+            }
             // Four neighboring decode lanes consume the four K groups of
             // one N row and share its packed SFB word.  At middle density the
             // work per block amortizes one subgroup shuffle and benefits from
@@ -277,6 +447,18 @@ public:
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
+#ifdef DG_MEGA_MOE_FP4_SIDECAR_ONLY
+    auto ptr = reinterpret_cast<void*>(
+        &sm90_fp8_fp4_mega_moe_sidecar_publisher<
+            {},
+            {}, {},
+            {}, {},
+            {}, {},
+            {},
+            {}, {}, {}, {}, {},
+            {}
+        >);
+#else
     auto ptr = reinterpret_cast<void*>(&sm90_fp8_fp4_mega_moe_impl<
         {},
         {}, {},
@@ -292,8 +474,24 @@ static void __instantiate_kernel() {{
         {}, {}, {}, {},
         {}, {}, {}, {}, {}, {}
     >);
+#endif
 }};
 )",
+    args.num_max_tokens_per_rank,
+    args.hidden, args.intermediate_hidden,
+    args.num_experts, args.num_topk,
+    args.config.block_m, args.config.block_n,
+    args.config.num_max_pool_tokens,
+    args.num_l1_ring_tokens,
+    args.num_l1_sf_storage_tokens,
+    args.num_l2_ring_tokens,
+    args.num_l2_sf_storage_tokens,
+    args.num_ranks > kNvlPeers ?
+        layout::get_num_sm90_combine_ring_tokens(
+            args.num_ranks, args.num_max_tokens_per_rank, args.num_topk,
+            args.num_experts / args.num_ranks) :
+        args.config.num_max_pool_tokens,
+    args.num_ranks,
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_topk,
@@ -340,8 +538,82 @@ static void __instantiate_kernel() {{
             args.tensor_map_l2_acts,
             args.tensor_map_l2_acts_sf,
             args.tensor_map_l2_weights,
-            args.l2_weights_sf
+            args.l2_weights_sf,
+            args.cpu_proxy.buffer,
+            args.cpu_proxy.dev_comms,
+            args.cpu_proxy.windows,
+            args.cpu_proxy.combine_offset,
+            args.cpu_proxy.staging_offset,
+            args.cpu_proxy.signal_epoch_offset,
+            args.cpu_proxy.completion_request_offset,
+            args.cpu_proxy.combine_slot_bytes,
+            args.cpu_proxy.staging_slot_bytes,
+            args.cpu_proxy.num_slots
         ));
+    }
+
+    static cudaStream_t get_sidecar_stream() {
+        constexpr int kMaxCUDADevices = 64;
+        static std::array<cudaStream_t, kMaxCUDADevices> streams{};
+        static std::mutex streams_mutex;
+        int device_idx = 0;
+        DG_CUDA_RUNTIME_CHECK(cudaGetDevice(&device_idx));
+        DG_HOST_ASSERT(device_idx >= 0 and device_idx < kMaxCUDADevices);
+        std::lock_guard<std::mutex> lock(streams_mutex);
+        auto& stream = streams[device_idx];
+        if (stream == nullptr) {
+            int least_priority = 0;
+            int greatest_priority = 0;
+            DG_CUDA_RUNTIME_CHECK(cudaDeviceGetStreamPriorityRange(
+                &least_priority, &greatest_priority));
+            DG_CUDA_RUNTIME_CHECK(cudaStreamCreateWithPriority(
+                &stream, cudaStreamNonBlocking, greatest_priority));
+        }
+        return stream;
+    }
+
+    static void launch_sidecar(
+            const std::shared_ptr<KernelRuntime>& kernel_runtime,
+            const Args& args) {
+        const bool aggregate_local = get_env<int>(
+            "DG_MEGA_MOE_FP4_SIDECAR_AGGREGATE_LOCAL", 0) != 0;
+        const bool expert_centric = get_env<int>(
+            "DG_MEGA_MOE_FP4_SIDECAR_EXPERT_CENTRIC", 0) != 0;
+        const int shared_metadata_mode = get_env<int>(
+            "DG_MEGA_MOE_FP4_SIDECAR_SHARED_METADATA", -1);
+        DG_HOST_ASSERT(
+            shared_metadata_mode >= -1 and shared_metadata_mode <= 1);
+        const bool shared_metadata =
+            shared_metadata_mode == 1 or
+            (shared_metadata_mode == -1 and
+             not aggregate_local and not expert_centric and
+             args.num_tokens >= 8);
+        DG_HOST_ASSERT(
+            static_cast<int>(aggregate_local) +
+            static_cast<int>(expert_centric) +
+            static_cast<int>(shared_metadata) <= 1);
+        const int expert_peer_groups = expert_centric ? get_env<int>(
+            "DG_MEGA_MOE_FP4_SIDECAR_EXPERT_PEER_GROUPS", 2) : 1;
+        DG_HOST_ASSERT(
+            expert_peer_groups == 1 or
+            expert_peer_groups == 2 or
+            expert_peer_groups == 4);
+        const int expert_warps_per_cta = math::ceil_div(
+            args.num_experts / args.num_ranks,
+            args.sidecar_num_blocks);
+        const int sidecar_threads = expert_centric ?
+            expert_warps_per_cta * expert_peer_groups * 32 :
+            (aggregate_local ? 288 : 512);
+        DG_HOST_ASSERT(sidecar_threads > 0 and sidecar_threads <= 512);
+        constexpr int kSidecarDynamicSmemBytes = 128 * 1024;
+        const auto kernel = kernel_runtime->kernel;
+        const auto stream = get_sidecar_stream();
+        const auto config = construct_launch_config(
+            kernel, stream, kSidecarDynamicSmemBytes,
+            dim3(args.sidecar_num_blocks), dim3(sidecar_threads), 1, false);
+        auto sym_buffer = args.sym_buffer_ptrs;
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(
+            kernel, config, sym_buffer));
     }
 };
 
@@ -390,6 +662,22 @@ static void sm90_fp8_fp4_mega_moe(
         num_max_pool_tokens;
     const int num_compute_ring_tokens = std::min(
         num_l1_ring_tokens, num_l2_ring_tokens);
+    const bool use_cpu_proxy = num_ranks > 8 and
+        get_env<int>("DG_MEGA_MOE_FP4_CPU_PROXY", 0) != 0;
+    const bool use_sidecar_publisher = num_ranks > 8 and
+        get_env<int>("DG_MEGA_MOE_FP4_SIDECAR_PUBLISHER", 0) != 0;
+    DG_HOST_ASSERT(not (use_cpu_proxy and use_sidecar_publisher));
+    const int sidecar_num_blocks = use_sidecar_publisher ?
+        get_env<int>("DG_MEGA_MOE_FP4_SIDECAR_BLOCKS", 4) : 0;
+    DG_HOST_ASSERT(
+        not use_sidecar_publisher or
+        (sidecar_num_blocks > 0 and
+         sidecar_num_blocks <= num_experts_per_rank));
+    const auto cpu_proxy = use_cpu_proxy ?
+        mega::sm90_mega_moe_cpu_proxy_get_launch(
+            num_ranks, num_experts, num_topk,
+            num_max_tokens_per_rank, hidden) :
+        mega::SM90MegaMoECPUProxyLaunch{};
 
     // Sanity: SFB tensors must be uint32 (UE8M0 packed) and weight tensors
     // must use byte-addressable packed FP4 storage (1 byte = 2 nibbles).
@@ -493,6 +781,12 @@ static void sm90_fp8_fp4_mega_moe(
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
     // Launch
     const auto num_sms = device_runtime->get_num_sms();
+    const int compute_num_sms =
+        num_sms - sidecar_num_blocks;
+    DG_HOST_ASSERT(
+        not use_sidecar_publisher or compute_num_sms >= num_ranks);
+    DG_HOST_ASSERT(
+        not use_sidecar_publisher or compute_num_sms % 2 == 0);
     const SM90FP8FP4MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .requested_num_max_tokens_per_rank =
@@ -521,6 +815,8 @@ static void sm90_fp8_fp4_mega_moe(
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
         .num_tokens = num_tokens,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
+        .cpu_proxy = cpu_proxy,
+        .sidecar_num_blocks = sidecar_num_blocks,
         .tensor_map_l1_acts = tensor_map_l1_acts,
         .tensor_map_l1_acts_sf = tensor_map_l1_acts_sf,
         .tensor_map_l1_weights = tensor_map_l1_weights,
@@ -530,12 +826,19 @@ static void sm90_fp8_fp4_mega_moe(
         .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
         .tensor_map_l2_weights = tensor_map_l2_weights,
         .l2_weights_sf = reinterpret_cast<const uint32_t*>(l2_weights_sf.data_ptr()),
-        .launch_args = LaunchArgs(num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
+        .launch_args = LaunchArgs(compute_num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, config.cluster_size)
     };
     const auto code = SM90FP8FP4MegaMoERuntime::generate(args);
     const auto runtime_name = "sm90_fp8_fp4_mega_moe";
     const auto runtime = compiler->build(runtime_name, code);
+    if (use_sidecar_publisher) {
+        const auto sidecar_code =
+            "#define DG_MEGA_MOE_FP4_SIDECAR_ONLY 1\n" + code;
+        const auto sidecar_runtime = compiler->build(
+            "sm90_fp8_fp4_mega_moe_sidecar", sidecar_code);
+        SM90FP8FP4MegaMoERuntime::launch_sidecar(sidecar_runtime, args);
+    }
     SM90FP8FP4MegaMoERuntime::launch(runtime, args);
 }
 

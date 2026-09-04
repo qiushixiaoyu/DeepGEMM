@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "mega.hpp"
+#include "sm90_mega_cpu_proxy.hpp"
 #include "../jit/device_runtime.hpp"
 #include "../jit_kernels/impls/sm90_fp8_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mega_moe.hpp"
@@ -275,8 +276,25 @@ get_symm_buffer_size_for_sm90_mega_moe_impl(
         const auto combine_full_row_arrival_buffer = layout::Buffer(
             layout::Data(sizeof(uint32_t), false), 1,
             workspace.num_max_pool_blocks, symm_buffer_end);
+        // Phase-profile builds record the local ready publication timestamp so
+        // the publisher can report ready-to-observe latency.  Reserve it in
+        // every build to keep the public size calculation JIT-independent.
+        const auto combine_full_row_ready_timestamp_buffer = layout::Buffer(
+            layout::Data(sizeof(uint64_t), false), 1,
+            workspace.num_max_pool_blocks,
+            combine_full_row_arrival_buffer.get_end_ptr());
+        // One 32-bit mask word covers 32 output rows.  Reserve four words per
+        // destination so both BLOCK_M=64 and BLOCK_M=128 JIT specializations
+        // use the same physical stride and subsequent buffer offsets.
+        constexpr int kPublishRowMaskStorageWords = 4;
+        const auto combine_publish_row_mask_buffer = layout::Buffer(
+            layout::Data(
+                num_ranks * kPublishRowMaskStorageWords * sizeof(uint32_t),
+                false),
+            1, workspace.num_max_pool_blocks,
+            combine_full_row_ready_timestamp_buffer.get_end_ptr());
         const auto combine_full_row_staging_base = reinterpret_cast<void*>(math::align(
-            reinterpret_cast<uint64_t>(combine_full_row_arrival_buffer.get_end_ptr()),
+            reinterpret_cast<uint64_t>(combine_publish_row_mask_buffer.get_end_ptr()),
             static_cast<uint64_t>(128)));
         const auto combine_full_row_staging_buffer = layout::Buffer(
             bf16_token_layout, 1, num_combine_staging_tokens,

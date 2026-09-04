@@ -179,6 +179,24 @@ The library also provides some environment variables, which may be useful:
     - `DG_JIT_DUMP_SASS`: `0` or `1`, dump SASS output, `0` by default
     - `DG_COMM_KERNEL_DEBUG`: `0` or `1`, zero symmetric buffer before each Mega MoE call for debugging, `0` by default
     - `DG_USE_NVIDIA_TOOLS`: `0` or `1`, skip internal profiling when running under external NVIDIA tools, `0` by default
+- FP4 inter-node MegaMoE publisher
+    - `DG_MEGA_MOE_FP4_SIDECAR_PUBLISHER`: move the GPU publisher out of the fused kernel and launch it concurrently on reserved SMs; disabled by default
+    - `DG_MEGA_MOE_FP4_SIDECAR_BLOCKS`: number of reserved sidecar publisher CTAs/SMs; `4` by default
+    - `DG_MEGA_MOE_FP4_SIDECAR_DISPATCH_RDMA`: additionally move inter-node activation/scale/top-k-weight RDMA GETs to the existing sidecar while the fused kernel retains route metadata and local NVLink pulls; disabled by default
+    - `DG_MEGA_MOE_FP4_SIDECAR_AGGREGATE_LOCAL`: let one warp aggregate all eight same-node ready notifications, leaving eight warps for inter-node RDMA destinations; disabled by default while being tuned
+    - `DG_MEGA_MOE_FP4_SIDECAR_SHARED_METADATA`: cooperatively load each ready block's token metadata once into shared memory while preserving eight parallel remote-destination sender warps; `-1` (the default) enables it automatically for batch >= 8, while `0`/`1` force it off/on
+    - `DG_MEGA_MOE_FP4_SIDECAR_EXPERT_CENTRIC`: assign a small warp group per expert so token metadata is reused across subsets of remote destinations; disabled by default while being tuned
+    - `DG_MEGA_MOE_FP4_SIDECAR_EXPERT_PEER_GROUPS`: expert-centric warps per expert; `1`, `2`, or `4`, with `2` by default
+    - `DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_MODE`: `0` uses the density-based automatic policy, `1` forces eager polling, and `2` forces adaptive idle backoff; fused publishing defaults to `0`, while sidecar publishing defaults to `1` because it no longer shares an SM with math/decode warps
+    - `DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS`: initial idle-poll nanosleep duration, `64` ns by default
+    - `DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_MAX_NS`: maximum exponential idle-poll nanosleep duration, `512` ns by default; must be at least the initial duration
+    - `DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_FEW_PENDING_CHAINS`: treat this many remaining expert-pair chains owned by one publisher CTA as tail work and cap their sleep separately; this is not a destination-rank count, and `0` disables the tail cap by default
+    - `DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_FEW_PENDING_MAX_NS`: maximum sleep while at or below the few-pending chain count; defaults to the regular maximum
+    - `DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_THRESHOLD`: consecutive empty passes before the maximum sleep may grow beyond the regular cap; `0` disables long-idle escalation by default
+    - `DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_MAX_NS`: maximum sleep after the long-idle threshold; defaults to the regular maximum
+    - `DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_PROGRESS_BLOCK_BUDGET`: yield after publishing this many ready output blocks; `0` disables productive-path yielding by default
+    - `DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_PROGRESS_YIELD_NS`: productive-path nanosleep duration, `64` ns by default
+    - `DG_MEGA_MOE_FP4_PUBLISH_ROW_MASK`: build per-destination 32-row masks during dispatch so the async publisher skips empty blocks/halves and only loads active-row metadata; disabled by default after the initial batch-16/64 A/B, set to `1` to enable the experimental path
 - Build options
     - `DG_SKIP_CUDA_BUILD`: `0` or `1`, skip CUDA extension build during installation, `0` by default
     - `DG_FORCE_BUILD`: `0` or `1`, force local build instead of downloading pre-built wheels, `0` by default

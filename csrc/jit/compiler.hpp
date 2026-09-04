@@ -206,6 +206,9 @@ public:
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
                             "-O3 --expt-relaxed-constexpr --expt-extended-lambda",
                             flags, library_include_path.c_str(), arch);
+        if (const auto nccl_home = get_env<std::string>("DG_NCCL_HOME");
+            not nccl_home.empty())
+            flags += fmt::format(" -I{}/include", nccl_home);
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path,

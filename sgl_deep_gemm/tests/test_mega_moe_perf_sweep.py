@@ -6,6 +6,7 @@ weight construction/quantization and process-group startup at every point.
 """
 
 import argparse
+import json
 import math
 import os
 import random
@@ -14,6 +15,7 @@ import torch
 import torch.distributed as dist
 
 import test_mega_moe_hopper as base
+import test_mega_moe_fp4_hopper as fp4_base
 
 
 def _global_stats(seconds: float) -> tuple[float, float, float]:
@@ -34,6 +36,52 @@ def _global_stats(seconds: float) -> tuple[float, float, float]:
 def _print_rank0(rank: int, message: str) -> None:
     if rank == 0:
         print(message, flush=True)
+
+
+def _bench_kineto_all_cuda_kernels(fn, num_warmup: int, num_tests: int):
+    """Measure the sum of CUDA kernels in one complete DeepEP invocation."""
+    for _ in range(num_warmup):
+        fn()
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA],
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+    ) as profiler:
+        for _ in range(num_tests):
+            fn()
+        torch.cuda.synchronize()
+
+    by_name = {}
+    total_us = 0.0
+    total_events = 0
+    for event in profiler.events():
+        if "cuda" not in str(event.device_type).lower():
+            continue
+        lower_name = event.name.lower()
+        if "memcpy" in lower_name or "memset" in lower_name:
+            continue
+        duration_us = float(event.time_range.elapsed_us())
+        total_us += duration_us
+        total_events += 1
+        count, duration = by_name.get(event.name, (0, 0.0))
+        by_name[event.name] = (count + 1, duration + duration_us)
+
+    if total_events == 0:
+        raise RuntimeError("Kineto did not capture any DeepEP CUDA kernels")
+    breakdown = [
+        {
+            "name": name,
+            "calls_per_iter": count / num_tests,
+            "us_per_iter": duration_us / num_tests,
+        }
+        for name, (count, duration_us) in by_name.items()
+    ]
+    breakdown.sort(key=lambda item: item["us_per_iter"], reverse=True)
+    return total_us / num_tests / 1e6, breakdown, total_events
 
 
 def _make_world_size_matched_route(
@@ -211,6 +259,11 @@ def _make_legacy_normal_buffer(deep_ep, group, hidden: int):
 
 
 def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None:
+    use_fp4_execution = args.fp4_runtime
+    if args.fp4_runtime:
+        base.SM90_KERNEL_NAME = fp4_base.SM90_FP4_KERNEL_NAME
+    else:
+        base.SM90_KERNEL_NAME = "sm90_fp8_mega_moe_impl"
     if args.row_combine:
         os.environ["DG_MEGA_MOE_ROW_COMBINE"] = "1"
     if args.phase_profile:
@@ -267,10 +320,30 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         f"[CONFIG] model={args.model_name} mode={args.mode} path={args.path} world_size={world_size} "
         f"hidden={hidden} intermediate={intermediate} experts={num_experts} "
         f"topk={topk} local_experts={local_experts} batches={','.join(map(str, batches))} "
+        f"mega_dtype={'fp4_runtime' if args.fp4_runtime else 'fp8'} "
         f"fuse_shared={int(args.fuse_shared)} "
         f"deep_ep_phase_profile={int(args.deep_ep_phase_profile)} "
         f"normal_impl={'legacy_scatter_gather' if args.mode == 'normal' else 'n/a'} "
         f"row_combine={int(args.row_combine)} "
+        f"cpu_proxy={os.environ.get('DG_MEGA_MOE_FP4_CPU_PROXY', '0')} "
+        f"cpu_proxy_async_credit="
+        f"{os.environ.get('DG_MEGA_MOE_FP4_CPU_PROXY_ASYNC_CREDIT', '0')} "
+        f"cpu_proxy_slots="
+        f"{os.environ.get('DG_MEGA_MOE_FP4_CPU_PROXY_SLOTS', '1')} "
+        f"sidecar_publisher="
+        f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_PUBLISHER', '0')} "
+        f"sidecar_blocks="
+        f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_BLOCKS', '4')} "
+        f"sidecar_dispatch_rdma="
+        f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_DISPATCH_RDMA', '0')} "
+        f"sidecar_aggregate_local="
+        f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_AGGREGATE_LOCAL', '0')} "
+        f"sidecar_shared_metadata="
+        f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_SHARED_METADATA', 'auto')} "
+        f"sidecar_expert_centric="
+        f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_EXPERT_CENTRIC', '0')} "
+        f"sidecar_expert_peer_groups="
+        f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_EXPERT_PEER_GROUPS', '2')} "
         f"warmup={args.num_warmup} repeat={args.num_repeat} "
         f"fused_tests={args.num_bench_tests} l2_flush_gb={args.l2_flush_gb}",
     )
@@ -281,7 +354,16 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         dtype=torch.bfloat16,
         device="cuda",
     ) * 0.05
-    l1_weights = base._quantize_grouped_fp8_block_128_128(l1_bf16)
+    l1_weights = (
+        base._quantize_grouped_fp8_block_128_128(l1_bf16)
+        if need_deep_ep or not use_fp4_execution
+        else None
+    )
+    l1_fp4 = (
+        fp4_base._quantize_grouped_fp4_per32(l1_bf16)
+        if need_fused and use_fp4_execution
+        else None
+    )
     del l1_bf16
     torch.cuda.empty_cache()
 
@@ -290,7 +372,16 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         dtype=torch.bfloat16,
         device="cuda",
     ) * 0.05
-    l2_weights = base._quantize_grouped_fp8_block_128_128(l2_bf16)
+    l2_weights = (
+        base._quantize_grouped_fp8_block_128_128(l2_bf16)
+        if need_deep_ep or not use_fp4_execution
+        else None
+    )
+    l2_fp4 = (
+        fp4_base._quantize_grouped_fp4_per32(l2_bf16)
+        if need_fused and use_fp4_execution
+        else None
+    )
     del l2_bf16
     torch.cuda.empty_cache()
 
@@ -317,9 +408,18 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
     transformed_l1 = transformed_l2 = None
     transformed_shared_l1 = transformed_shared_l2 = None
     if need_fused:
-        transformed_l1, transformed_l2 = base.deep_gemm.transform_weights_for_mega_moe_sm90(
-            l1_weights, l2_weights
-        )
+        if args.fp4_runtime:
+            transformed_l1, transformed_l2 = (
+                base.deep_gemm.transform_weights_for_mega_moe_sm90_fp4(
+                    l1_fp4, l2_fp4
+                )
+            )
+        else:
+            transformed_l1, transformed_l2 = (
+                base.deep_gemm.transform_weights_for_mega_moe_sm90(
+                    l1_weights, l2_weights
+                )
+            )
         if args.fuse_shared:
             transformed_shared_l1, transformed_shared_l2 = (
                 base.deep_gemm.transform_weights_for_mega_moe_sm90(
@@ -380,6 +480,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         f"sym_buffer_gib={(sym_buffer.buffer.nbytes/2**30 if sym_buffer is not None else 0):.3f}",
     )
 
+    kineto_primed = False
     for batch in batches:
         # Each point gets deterministic but independent routing and inputs.
         torch.manual_seed(20260721 + rank * 100000 + batch)
@@ -454,12 +555,18 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
                 )
                 return shared_y
 
-        def run_fused():
+        def prepare_fused_input():
             sym_buffer.x[:batch].copy_(x_fp8[0])
             sym_buffer.x_sf[:batch].copy_(x_fp8[1])
             sym_buffer.topk_idx[:batch].copy_(topk_idx)
             sym_buffer.topk_weights[:batch].copy_(topk_weights)
+
+        def run_fused_kernel_only():
             if args.fuse_shared:
+                if use_fp4_execution:
+                    raise RuntimeError(
+                        "FP4 runtime/cache sweep does not support --fuse-shared"
+                    )
                 base.deep_gemm.fp8_mega_moe_with_shared(
                     fused_out,
                     transformed_l1,
@@ -469,6 +576,18 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
                     sym_buffer,
                     cumulative_local_expert_recv_stats=cumulative_fused,
                     recipe=(128, 128, 128),
+                    activation="swiglu",
+                    activation_clamp=clamp,
+                    fast_math=bool(args.fast_math),
+                )
+            elif args.fp4_runtime:
+                base.deep_gemm.fp8_fp4_mega_moe(
+                    fused_out,
+                    transformed_l1,
+                    transformed_l2,
+                    sym_buffer,
+                    cumulative_local_expert_recv_stats=cumulative_fused,
+                    recipe=(1, 1, 32),
                     activation="swiglu",
                     activation_clamp=clamp,
                     fast_math=bool(args.fast_math),
@@ -486,6 +605,10 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
                     fast_math=bool(args.fast_math),
                 )
             return fused_out
+
+        def run_fused():
+            prepare_fused_input()
+            return run_fused_kernel_only()
 
         if args.phase_profile:
             # The first launch can include per-rank JIT and CUDA context skew,
@@ -814,6 +937,51 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
             assert torch.isfinite(output).all(), (
                 f"non-finite output: path={args.path} mode={args.mode} batch={batch} rank={rank}"
             )
+            if args.check_fp4_reference:
+                assert need_fused and use_fp4_execution
+                reference_rows = torch.linspace(
+                    0,
+                    batch - 1,
+                    min(batch, args.reference_max_local_tokens),
+                    device="cuda",
+                ).round().long().unique()
+                reference = fp4_base._reference_fused(
+                    x_fp8[0][reference_rows],
+                    x_fp8[1][reference_rows],
+                    topk_idx[reference_rows],
+                    topk_weights[reference_rows],
+                    l1_fp4[0],
+                    l1_fp4[1],
+                    l2_fp4[0],
+                    l2_fp4[1],
+                    rank,
+                    world_size,
+                    group,
+                    num_experts,
+                    topk,
+                    hidden,
+                    intermediate,
+                    args.activation_clamp,
+                )
+                local_diff = float(
+                    fp4_base.calc_diff(output[reference_rows], reference)
+                )
+                global_diff = torch.tensor(
+                    local_diff if math.isfinite(local_diff) else float("inf"),
+                    dtype=torch.float64,
+                    device="cuda",
+                )
+                dist.all_reduce(global_diff, op=dist.ReduceOp.MAX)
+                max_diff = float(global_diff.item())
+                _print_rank0(
+                    rank,
+                    f"[FP4_REFERENCE] model={args.model_name} batch={batch} "
+                    f"sampled_rows_per_rank={len(reference_rows)} "
+                    f"diff_max={max_diff:.8f} tol={args.diff_tol} "
+                    f"ok={int(max_diff < args.diff_tol)}",
+                )
+                assert max_diff < args.diff_tol
+                del reference
             if args.dump_output_dir:
                 output_path = os.path.join(
                     args.dump_output_dir,
@@ -828,13 +996,44 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
             dist.barrier()
             continue
 
+        if args.kineto_kernel_only and not kineto_primed:
+            if need_fused:
+                prepare_fused_input()
+                base.bench_kineto(
+                    run_fused_kernel_only,
+                    base.SM90_KERNEL_NAME,
+                    barrier=lambda: dist.barrier(),
+                    num_tests=2,
+                    suppress_kineto_output=True,
+                    flush_l2=False,
+                )
+            if need_deep_ep:
+                _bench_kineto_all_cuda_kernels(
+                    run_deep_ep, args.num_warmup, 2
+                )
+            kineto_primed = True
+            _print_rank0(rank, "[KINETO_PRIMED]")
+
         fused_stats = None
         deep_ep_stats = None
+        deep_ep_breakdown = None
         if need_fused:
             # DG_FUSED_EVENT_TIMING=1 times the fused kernel with the same
             # free-running CUDA-event method as the DeepEP baseline, so the
             # two are not compared across different timing methodologies.
-            if os.environ.get("DG_FUSED_EVENT_TIMING", "0") == "1":
+            if args.kineto_kernel_only:
+                prepare_fused_input()
+                torch.cuda.synchronize()
+                dist.barrier()
+                fused_seconds = base.bench_kineto(
+                    run_fused_kernel_only,
+                    base.SM90_KERNEL_NAME,
+                    barrier=lambda: dist.barrier(),
+                    num_tests=args.num_bench_tests,
+                    suppress_kineto_output=True,
+                    flush_l2=False,
+                )
+            elif os.environ.get("DG_FUSED_EVENT_TIMING", "0") == "1":
                 fused_seconds = base._bench_cuda_events(
                     run_fused,
                     num_warmup=args.num_warmup,
@@ -857,12 +1056,26 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
             # Read the LAST launch's counters without device-side printf.
             _dump_fp8_phase_profile(sym_buffer, args.model_name, batch, rank)
         if need_deep_ep:
-            deep_ep_seconds = base._bench_cuda_events(
-                run_deep_ep,
-                num_warmup=args.num_warmup,
-                num_repeat=args.num_repeat,
-                l2_flush_gb=args.l2_flush_gb,
-            )
+            if args.kineto_kernel_only:
+                deep_ep_seconds, deep_ep_breakdown, deep_ep_num_events = (
+                    _bench_kineto_all_cuda_kernels(
+                        run_deep_ep, args.num_warmup, args.num_bench_tests
+                    )
+                )
+                print(
+                    f"[KINETO_DEEP_EP_BREAKDOWN] model={args.model_name} "
+                    f"batch={batch} rank={rank} "
+                    f"num_events={deep_ep_num_events} "
+                    f"kernels={json.dumps(deep_ep_breakdown, separators=(',', ':'))}",
+                    flush=True,
+                )
+            else:
+                deep_ep_seconds = base._bench_cuda_events(
+                    run_deep_ep,
+                    num_warmup=args.num_warmup,
+                    num_repeat=args.num_repeat,
+                    l2_flush_gb=args.l2_flush_gb,
+                )
             deep_ep_stats = _global_stats(deep_ep_seconds)
 
         if args.path == "both":
@@ -929,9 +1142,22 @@ if __name__ == "__main__":
     parser.add_argument("--num-bench-tests", type=int, default=30)
     parser.add_argument("--num-warmup", type=int, default=5)
     parser.add_argument("--num-repeat", type=int, default=20)
+    parser.add_argument(
+        "--kineto-kernel-only",
+        action="store_true",
+        help=(
+            "compare the fused MegaMoE kernel with the sum of CUDA kernels "
+            "in one DeepEP low-latency invocation"
+        ),
+    )
     parser.add_argument("--l2-flush-gb", type=float, default=1.0)
     parser.add_argument("--activation-clamp", type=float, default=10.0)
     parser.add_argument("--fast-math", type=int, default=1)
+    parser.add_argument(
+        "--fp4-runtime",
+        action="store_true",
+        help="run the online SM90 FP4 software-decode MegaMoE kernel",
+    )
     parser.add_argument(
         "--fuse-shared",
         action="store_true",
@@ -949,5 +1175,13 @@ if __name__ == "__main__":
         "--dump-output-dir",
         help="optional per-rank output directory used for isolated-path accuracy comparison",
     )
+    parser.add_argument(
+        "--check-fp4-reference",
+        action="store_true",
+        help="compare sampled output rows with the original FP4 reference",
+    )
+    parser.add_argument("--reference-max-local-tokens", type=int, default=16)
+    parser.add_argument("--diff-tol", type=float, default=0.10)
     args = parser.parse_args()
+    assert not args.check_fp4_reference or args.accuracy_only
     torch.multiprocessing.spawn(run, args=(args.num_processes, args), nprocs=args.num_processes)

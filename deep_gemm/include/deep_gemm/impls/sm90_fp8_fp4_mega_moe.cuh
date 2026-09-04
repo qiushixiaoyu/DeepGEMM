@@ -25,6 +25,10 @@
 #include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>
 
+#ifdef DG_MEGA_MOE_FP4_CPU_PROXY
+#include <nccl_device.h>
+#endif
+
 namespace deep_gemm {
 
 __forceinline__ __device__ void sm90_fp8_fp4_mega_moe_get_e4m3_sf_and_sf_inv(
@@ -342,6 +346,1122 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_dispatch(
 }
 
 // ============================================================================
+// Optional SM90 FP4 GPU sidecar publisher.
+// ----------------------------------------------------------------------------
+// This kernel owns only combine publication.  Each 16-warp CTA covers all
+// destinations for one strided subset of local experts.  The host gives every
+// CTA enough dynamic shared memory to prevent co-residency with a compute CTA
+// and reserves the same number of SMs from the fused grid.
+//
+// The first experiment deliberately keeps the established full-pool metadata
+// traversal and IBGDA protocol.  It therefore isolates code/register/scheduler
+// interference from descriptor-queue and row-coalescing changes.  Compact
+// combine-ring support is left to a later change after this causal A/B.
+// ============================================================================
+template <
+    uint32_t kNumMaxTokensPerRank,
+    uint32_t kHidden, uint32_t kIntermediateHidden,
+    uint32_t kNumExperts, uint32_t kNumTopk,
+    uint32_t BLOCK_M, uint32_t BLOCK_N,
+    uint32_t kNumMaxPoolTokens,
+    uint32_t kNumL1RingTokens,
+    uint32_t kNumL1SFStorageTokens,
+    uint32_t kNumL2RingTokens,
+    uint32_t kNumL2SFStorageTokens,
+    uint32_t kNumCombineStageTokens,
+    uint32_t kNumRanks,
+    uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks>
+CUTLASS_GLOBAL __launch_bounds__(512, 1) void
+sm90_fp8_fp4_mega_moe_sidecar_publisher(
+    const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1000)) or defined(__CLION_IDE__)
+#ifdef DG_MEGA_MOE_INTERNODE
+#ifdef DG_MEGA_MOE_FP4_SIDECAR_AGGREGATE_LOCAL
+    constexpr uint32_t kLocalRanks = DG_MEGA_MOE_NVL_PEERS;
+    constexpr uint32_t kRemotePublisherWarps = kLocalRanks;
+    constexpr uint32_t kLocalAggregatorWarp = kRemotePublisherWarps;
+    constexpr uint32_t kPublisherWarpsPerCTA =
+        kRemotePublisherWarps + 1;
+#else
+    constexpr uint32_t kPublisherWarpsPerCTA = 16;
+#endif
+    constexpr uint32_t kPublishRowsPerBatch = 32;
+    constexpr uint32_t kCombineFullRowPublishReadyBit = 1u << 31;
+    constexpr uint32_t kNumL1RingBlocks = kNumL1RingTokens / BLOCK_M;
+    constexpr uint32_t kNumL2RingBlocks = kNumL2RingTokens / BLOCK_M;
+    constexpr uint32_t SF_BLOCK_M = math::constexpr_align(BLOCK_M, 128u);
+    constexpr bool kL1RingStorageCompact =
+        kNumL1RingTokens < kNumMaxPoolTokens;
+    constexpr bool kL2RingStorageCompact =
+        kNumL2RingTokens < kNumMaxPoolTokens;
+#ifdef DG_MEGA_MOE_L1_RING_ACTIVE
+    constexpr bool kL1RingEnabled = kL1RingStorageCompact;
+#else
+    constexpr bool kL1RingEnabled = false;
+#endif
+    constexpr uint32_t kNumL2StorageTokens =
+        kNumL2RingTokens + (kL2RingStorageCompact ? 128u : 0u);
+    constexpr uint32_t kL2ActsSFGranK = BLOCK_N == 64 ? 32 : 64;
+
+    DG_STATIC_ASSERT(kNumRanks == 16,
+                     "The first sidecar A/B targets the two-node 16-rank topology");
+    DG_STATIC_ASSERT(kNumExpertsPerRank <= 32,
+                     "Sidecar pending mask supports at most 32 local experts");
+    DG_STATIC_ASSERT(kNumCombineStageTokens == kNumMaxPoolTokens,
+                     "Sidecar A/B currently requires full-pool combine staging");
+    DG_STATIC_ASSERT(kNumL1RingTokens % BLOCK_M == 0 and
+                         kNumL2RingTokens % BLOCK_M == 0,
+                     "Invalid SM90 FP4 ring capacity");
+    DG_STATIC_ASSERT(kNumL1SFStorageTokens >=
+                         kNumL1RingBlocks * math::constexpr_align(BLOCK_M, 128u),
+                     "Invalid L1 scale storage");
+    DG_STATIC_ASSERT(kNumL2SFStorageTokens >=
+                         kNumL2RingBlocks * math::constexpr_align(BLOCK_M, 128u),
+                     "Invalid L2 scale storage");
+
+    const auto get_l1_ring_block_idx = [](const uint32_t& pool_block_idx) {
+        if constexpr (kL1RingEnabled)
+            return pool_block_idx % kNumL1RingBlocks;
+        return pool_block_idx;
+    };
+    const auto get_l1_ring_token_idx = [&](const uint32_t& pool_token_idx) {
+        const uint32_t pool_block_idx = pool_token_idx / BLOCK_M;
+        return get_l1_ring_block_idx(pool_block_idx) * BLOCK_M +
+            pool_token_idx % BLOCK_M;
+    };
+    const auto get_l1_ring_wave_idx = [](const uint32_t& pool_block_idx) {
+        if constexpr (kL1RingEnabled)
+            return pool_block_idx / kNumL1RingBlocks;
+        return 0u;
+    };
+
+    const uint32_t lane_idx = ptx::get_lane_idx();
+    const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
+#ifdef DG_MEGA_MOE_FP4_SIDECAR_AGGREGATE_LOCAL
+    DG_STATIC_ASSERT(kNumRanks == 2 * kLocalRanks,
+                     "Local aggregation requires exactly two NVLink domains");
+    const uint32_t local_rank_base =
+        sym_buffer.rank_idx / kLocalRanks * kLocalRanks;
+    const uint32_t remote_rank_base = local_rank_base ^ kLocalRanks;
+    const bool is_local_aggregator = warp_idx == kLocalAggregatorWarp;
+    const uint32_t dst_rank_idx = is_local_aggregator ?
+        local_rank_base : remote_rank_base + warp_idx;
+#else
+    const uint32_t dst_rank_idx = warp_idx;
+#endif
+
+    // The dynamic region is intentionally touched: launch-time allocation is
+    // what pins each sidecar CTA to its own SM instead of allowing both CTAs
+    // to share one SM and leave a compute CTA unschedulable.
+    extern __shared__ __align__(16) uint8_t sidecar_sm_reservation[];
+    if (threadIdx.x == 0)
+        sidecar_sm_reservation[0] = 0;
+    __syncthreads();
+
+    const auto workspace = layout::SM90Workspace(
+        sym_buffer.get_base_ptr(), kNumRanks, kNumExperts,
+        kNumMaxTokensPerRank, kNumTopk);
+
+    // Recreate the host-agreed symmetric-buffer layout only as far as the
+    // combine destination and full-row staging regions used by publication.
+    constexpr auto fp8_token_layout = SM90FP8FP4MegaMoEData(kHidden);
+    constexpr auto bf16_token_layout =
+        SM90FP8FP4MegaMoEData(kHidden * sizeof(nv_bfloat16));
+    constexpr auto fp8_intermediate_token_layout =
+        SM90FP8FP4MegaMoEData(kIntermediateHidden);
+    constexpr auto fp8_sf_layout = SM90FP8FP4MegaMoEData(kHidden / 32);
+    constexpr auto fp8_intermediate_sf_layout = SM90FP8FP4MegaMoEData(
+        kIntermediateHidden * sizeof(float) / kL2ActsSFGranK);
+    constexpr auto input_topk_idx_layout =
+        SM90FP8FP4MegaMoEData(kNumTopk * sizeof(int64_t), false);
+    constexpr auto input_topk_weights_layout =
+        SM90FP8FP4MegaMoEData(kNumTopk * sizeof(float), false);
+    constexpr auto l1_topk_weights_layout =
+        SM90FP8FP4MegaMoEData(sizeof(float), false);
+
+    const auto input_token_buffer = SM90FP8FP4MegaMoEBuffer(
+        fp8_token_layout, 1, kNumMaxTokensPerRank, workspace.get_end_ptr());
+    const auto input_sf_buffer = SM90FP8FP4MegaMoEBuffer(
+        fp8_sf_layout, 1, kNumMaxTokensPerRank,
+        input_token_buffer.get_end_ptr());
+    const auto input_topk_idx_buffer = SM90FP8FP4MegaMoEBuffer(
+        input_topk_idx_layout, 1, kNumMaxTokensPerRank,
+        input_sf_buffer.get_end_ptr());
+    const auto input_topk_weights_buffer = SM90FP8FP4MegaMoEBuffer(
+        input_topk_weights_layout, 1, kNumMaxTokensPerRank,
+        input_topk_idx_buffer.get_end_ptr());
+    const auto l1_token_buffer = SM90FP8FP4MegaMoEBuffer(
+        fp8_token_layout, 1, kNumL1RingTokens,
+        input_topk_weights_buffer.get_end_ptr());
+    const auto l1_sf_buffer = SM90FP8FP4MegaMoEBuffer(
+        fp8_sf_layout, 1, kNumL1SFStorageTokens,
+        l1_token_buffer.get_end_ptr());
+    const auto l1_topk_weights_buffer = SM90FP8FP4MegaMoEBuffer(
+        l1_topk_weights_layout, 1, kNumL1RingTokens,
+        l1_sf_buffer.get_end_ptr());
+    const auto l2_token_buffer = SM90FP8FP4MegaMoEBuffer(
+        fp8_intermediate_token_layout, 1, kNumL2StorageTokens,
+        l1_topk_weights_buffer.get_end_ptr());
+    const auto l2_sf_buffer = SM90FP8FP4MegaMoEBuffer(
+        fp8_intermediate_sf_layout, 1, kNumL2SFStorageTokens,
+        l2_token_buffer.get_end_ptr());
+    const auto combine_token_buffer = SM90FP8FP4MegaMoEBuffer(
+        bf16_token_layout, kNumTopk, kNumMaxTokensPerRank,
+        l2_sf_buffer.get_end_ptr());
+    constexpr auto dispatch_staging_layout = SM90FP8FP4MegaMoEData(
+        math::constexpr_align<uint32_t>(
+            kHidden / 32 + sizeof(float), 128u), false);
+    const auto dispatch_staging_buffer = SM90FP8FP4MegaMoEBuffer(
+        dispatch_staging_layout, 1, kNumMaxPoolTokens,
+        combine_token_buffer.get_end_ptr());
+    const auto combine_full_row_arrival_buffer = SM90FP8FP4MegaMoEBuffer(
+        SM90FP8FP4MegaMoEData(sizeof(uint32_t), false), 1,
+        kNumMaxPoolTokens / layout::kMinCandidateBlockM,
+        dispatch_staging_buffer.get_end_ptr());
+    const auto combine_full_row_ready_timestamp_buffer =
+        SM90FP8FP4MegaMoEBuffer(
+            SM90FP8FP4MegaMoEData(sizeof(uint64_t), false), 1,
+            kNumMaxPoolTokens / layout::kMinCandidateBlockM,
+            combine_full_row_arrival_buffer.get_end_ptr());
+    constexpr uint32_t kPublishRowMaskStorageWords = 4;
+    const auto combine_publish_row_mask_buffer = SM90FP8FP4MegaMoEBuffer(
+        SM90FP8FP4MegaMoEData(
+            kNumRanks * kPublishRowMaskStorageWords * sizeof(uint32_t),
+            false),
+        1, kNumMaxPoolTokens / layout::kMinCandidateBlockM,
+        combine_full_row_ready_timestamp_buffer.get_end_ptr());
+    const auto get_combine_publish_row_mask_ptr =
+        [&](const uint32_t& pool_block_idx, const uint32_t& dst_rank_idx,
+            const uint32_t& mask_word_idx = 0) {
+            return combine_publish_row_mask_buffer
+                       .get_data_buffer(pool_block_idx)
+                       .get_base_ptr<uint32_t>() +
+                dst_rank_idx * kPublishRowMaskStorageWords + mask_word_idx;
+        };
+    const auto combine_full_row_staging_base = reinterpret_cast<void*>(
+        math::align(
+            reinterpret_cast<uint64_t>(
+                combine_publish_row_mask_buffer.get_end_ptr()),
+            static_cast<uint64_t>(128)));
+    const auto combine_full_row_staging_buffer = SM90FP8FP4MegaMoEBuffer(
+        SM90FP8FP4MegaMoEData(kHidden * sizeof(nv_bfloat16)), 1,
+        kNumCombineStageTokens, combine_full_row_staging_base);
+
+    // Arm exactly the next epoch only after every publisher CTA is resident
+    // and has observed the same current epoch.  The fused kernel waits for
+    // this release before incrementing launch_epoch, so no late sidecar block
+    // can accidentally attach itself to the following invocation.
+    __shared__ uint64_t sidecar_previous_epoch;
+    if (threadIdx.x == 0) {
+        sidecar_previous_epoch =
+            ptx::ld_acq_sys(workspace.get_launch_epoch_ptr());
+        const auto arrival_ptr =
+            workspace.get_sidecar_publisher_arrival_count_ptr();
+        const uint32_t old_arrivals =
+            ptx::atomic_add_acq_rel_sys(arrival_ptr, 1);
+        DG_TRAP_ONLY_DEVICE_ASSERT(old_arrivals < gridDim.x);
+        if (old_arrivals + 1 == gridDim.x) {
+            ptx::st_release_sys(arrival_ptr, 0u);
+            ptx::st_release_sys(
+                workspace.get_sidecar_publisher_armed_epoch_ptr(),
+                sidecar_previous_epoch + 1);
+        }
+    }
+    __syncthreads();
+    const uint64_t target_epoch = sidecar_previous_epoch + 1;
+    constexpr uint64_t kTimeoutCycles = 60ull * 2000000000ull;
+    const uint64_t epoch_wait_start = clock64();
+    uint64_t armed_epoch = ptx::ld_acq_sys(
+        workspace.get_sidecar_publisher_armed_epoch_ptr());
+    while (armed_epoch != target_epoch) {
+        DG_TRAP_ONLY_DEVICE_ASSERT(
+            clock64() - epoch_wait_start < kTimeoutCycles);
+        armed_epoch = ptx::ld_acq_sys(
+            workspace.get_sidecar_publisher_armed_epoch_ptr());
+    }
+    uint64_t launch_epoch = ptx::ld_acq_sys(workspace.get_launch_epoch_ptr());
+    while (launch_epoch != target_epoch) {
+        DG_TRAP_ONLY_DEVICE_ASSERT(
+            clock64() - epoch_wait_start < kTimeoutCycles);
+        launch_epoch = ptx::ld_acq_sys(workspace.get_launch_epoch_ptr());
+    }
+    __syncwarp();
+
+    if (warp_idx >= kPublisherWarpsPerCTA or dst_rank_idx >= kNumRanks)
+        return;
+
+    __shared__ uint32_t expert_pair_tokens
+        [kNumExpertsPerRank][kNumRanks];
+    __shared__ uint32_t expert_total_tokens[kNumExpertsPerRank];
+    __shared__ uint32_t expert_blocks[kNumExpertsPerRank];
+    __shared__ uint32_t expert_pool[kNumExpertsPerRank];
+#ifdef DG_MEGA_MOE_FP4_SIDECAR_EXPERT_CENTRIC
+    __shared__ uint32_t expert_publish_group_done[kNumExpertsPerRank];
+#endif
+    __shared__ uint32_t chain_cursor
+        [kPublisherWarpsPerCTA][kNumExpertsPerRank];
+#ifdef DG_MEGA_MOE_FP4_SIDECAR_SHARED_METADATA
+    __shared__ layout::TokenSrcMetadata
+        shared_publish_metadata[BLOCK_M];
+    __shared__ uint32_t shared_publish_cursor[kNumExpertsPerRank];
+    __shared__ uint32_t shared_publish_pending;
+    __shared__ uint32_t shared_publish_selected_expert;
+    __shared__ uint32_t shared_publish_selected_cursor;
+    __shared__ uint32_t shared_publish_selected_has_block;
+#endif
+
+    const auto wait_dispatch_count =
+        [&](const uint32_t& src_rank_idx,
+            const uint32_t& expert_idx) -> uint32_t {
+        constexpr uint64_t kCountTimeoutCycles = 60ull * 2000000000ull;
+        const uint32_t expected_epoch = static_cast<uint32_t>(launch_epoch);
+        const uint32_t epoch_slot = expected_epoch & 1u;
+        const uint64_t wait_start = clock64();
+        const uint64_t* slot_ptr = nullptr;
+#ifdef DG_MEGA_MOE_DISPATCH_GATEWAY_DENSE_V3
+        slot_ptr = workspace.get_dispatch_epoch_count_ptr(
+            epoch_slot, src_rank_idx, expert_idx);
+#else
+#ifdef DG_MEGA_MOE_DISPATCH_GATEWAY_PACKED
+        const uint32_t local_node_idx =
+            sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS;
+        const uint32_t src_node_idx =
+            src_rank_idx / DG_MEGA_MOE_NVL_PEERS;
+        if (src_node_idx != local_node_idx) {
+            const uint32_t rel_src_node = layout::gateway_rel_node(
+                src_node_idx, local_node_idx);
+            const uint32_t cell_idx =
+                src_rank_idx % DG_MEGA_MOE_NVL_PEERS *
+                    kNumExpertsPerRank + expert_idx;
+            if constexpr (kNumTopk >= 8) {
+                const auto header = workspace.get_gateway_packed_header_ptr(
+                    true, rel_src_node, epoch_slot);
+                uint64_t header_epoch = ptx::ld_acq_sys(&header->epoch);
+                while (static_cast<uint32_t>(header_epoch) !=
+                       expected_epoch) {
+                    DG_TRAP_ONLY_DEVICE_ASSERT(
+                        clock64() - wait_start < kCountTimeoutCycles);
+                    header_epoch = ptx::ld_acq_sys(&header->epoch);
+                }
+                const uint32_t total_entries = ptx::ld_acq_sys(
+                    &header->total_entries);
+                DG_TRAP_ONLY_DEVICE_ASSERT(
+                    total_entries <=
+                    workspace.get_gateway_max_packed_entries());
+                slot_ptr =
+                    workspace.get_gateway_packed_compact_manifest_ptr(
+                        true, rel_src_node, epoch_slot,
+                        total_entries, cell_idx);
+            } else {
+                slot_ptr = workspace.get_gateway_packed_manifest_ptr(
+                    true, rel_src_node, epoch_slot, cell_idx);
+            }
+        } else {
+            slot_ptr = workspace.get_dispatch_epoch_count_ptr(
+                epoch_slot, src_rank_idx, expert_idx);
+        }
+#endif
+#endif
+        DG_TRAP_ONLY_DEVICE_ASSERT(slot_ptr != nullptr);
+        uint64_t value = ptx::ld_acq_sys(slot_ptr);
+        while (static_cast<uint32_t>(value >> 32) != expected_epoch) {
+            DG_TRAP_ONLY_DEVICE_ASSERT(
+                clock64() - wait_start < kCountTimeoutCycles);
+            value = ptx::ld_acq_sys(slot_ptr);
+        }
+        return static_cast<uint32_t>(value);
+    };
+
+    // Counts are destination-independent.  Spread experts across all resident
+    // publisher warps so the 16 source-rank epoch loads for different experts
+    // can overlap; the old single-warp loop serialized all 256 system loads.
+    const uint32_t active_publisher_warps = blockDim.x / 32;
+    for (uint32_t expert = warp_idx; expert < kNumExpertsPerRank;
+         expert += active_publisher_warps) {
+        uint32_t source_count = 0;
+        if (lane_idx < kNumRanks) {
+            source_count = wait_dispatch_count(lane_idx, expert);
+            expert_pair_tokens[expert][lane_idx] = source_count;
+        }
+        const uint32_t expert_total =
+            __reduce_add_sync(0xffffffffu, source_count);
+        if (lane_idx == 0) {
+            expert_total_tokens[expert] = expert_total;
+            expert_blocks[expert] = math::ceil_div(expert_total, BLOCK_M);
+        }
+    }
+    __syncthreads();
+
+    // Only the short 16-element prefix sum remains serial.
+    if (threadIdx.x == 0) {
+        uint32_t pool_block_offset = 0;
+        #pragma unroll
+        for (uint32_t expert = 0; expert < kNumExpertsPerRank; ++ expert) {
+            expert_pool[expert] = pool_block_offset;
+            pool_block_offset += expert_blocks[expert];
+#ifdef DG_MEGA_MOE_FP4_SIDECAR_EXPERT_CENTRIC
+            expert_publish_group_done[expert] = 0;
+#endif
+        }
+    }
+#if !defined(DG_MEGA_MOE_FP4_SIDECAR_EXPERT_CENTRIC) && \
+    !defined(DG_MEGA_MOE_FP4_SIDECAR_SHARED_METADATA)
+    for (uint32_t expert = lane_idx; expert < kNumExpertsPerRank;
+         expert += 32)
+        chain_cursor[warp_idx][expert] = 0;
+#endif
+    __syncthreads();
+
+#ifdef DG_MEGA_MOE_FP4_SIDECAR_DISPATCH_RDMA
+    // Move only the inter-node token/SF/top-k-weight pulls out of the fused
+    // kernel.  The fused dispatch warps retain route/count production and the
+    // NVLink-local pull path.  Sidecar warps reproduce the scheduler's
+    // round-robin source ordering so both producers address exactly the same
+    // logical pool without a descriptor queue.
+    const uint32_t global_dispatch_warp =
+        blockIdx.x * kPublisherWarpsPerCTA + warp_idx;
+    const uint32_t num_global_dispatch_warps =
+        gridDim.x * kPublisherWarpsPerCTA;
+    const uint32_t local_node_idx =
+        sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS;
+    const uint32_t dispatch_epoch_slot =
+        static_cast<uint32_t>(launch_epoch) & 1u;
+
+    for (uint32_t expert = 0; expert < kNumExpertsPerRank; ++expert) {
+        const uint32_t expert_total = expert_total_tokens[expert];
+        for (uint32_t token_idx_in_expert = global_dispatch_warp;
+             token_idx_in_expert < expert_total;
+             token_idx_in_expert += num_global_dispatch_warps) {
+            uint32_t remaining[kNumRanks];
+            #pragma unroll
+            for (uint32_t rank = 0; rank < kNumRanks; ++rank)
+                remaining[rank] = expert_pair_tokens[expert][rank];
+
+            uint32_t slot_idx = token_idx_in_expert;
+            uint32_t round_offset = 0;
+            uint32_t src_rank_idx = 0;
+            uint32_t token_idx_in_rank = 0;
+            while (true) {
+                uint32_t num_active_ranks = 0;
+                uint32_t round_length = 0xffffffffu;
+                #pragma unroll
+                for (uint32_t rank = 0; rank < kNumRanks; ++rank) {
+                    if (remaining[rank] != 0) {
+                        ++num_active_ranks;
+                        round_length = cute::min(
+                            round_length, remaining[rank]);
+                    }
+                }
+                DG_TRAP_ONLY_DEVICE_ASSERT(num_active_ranks != 0);
+                const uint32_t round_tokens =
+                    round_length * num_active_ranks;
+                if (slot_idx < round_tokens) {
+                    uint32_t selected = slot_idx % num_active_ranks;
+                    #pragma unroll
+                    for (uint32_t rank = 0; rank < kNumRanks; ++rank) {
+                        if (remaining[rank] != 0) {
+                            if (selected == 0) {
+                                src_rank_idx = rank;
+                                break;
+                            }
+                            --selected;
+                        }
+                    }
+                    token_idx_in_rank =
+                        round_offset + slot_idx / num_active_ranks;
+                    break;
+                }
+                slot_idx -= round_tokens;
+                round_offset += round_length;
+                #pragma unroll
+                for (uint32_t rank = 0; rank < kNumRanks; ++rank)
+                    remaining[rank] -=
+                        cute::min(remaining[rank], round_length);
+            }
+
+            if (src_rank_idx / DG_MEGA_MOE_NVL_PEERS == local_node_idx)
+                continue;
+
+            uint32_t src_token_topk_idx = 0;
+            if (lane_idx == 0) {
+#ifdef DG_MEGA_MOE_DISPATCH_GATEWAY_PACKED
+                src_token_topk_idx =
+                    *workspace.get_gateway_packed_landing_entry_ptr(
+                        layout::gateway_rel_node(
+                            src_rank_idx / DG_MEGA_MOE_NVL_PEERS,
+                            local_node_idx),
+                        dispatch_epoch_slot,
+                        src_rank_idx % DG_MEGA_MOE_NVL_PEERS,
+                        expert, token_idx_in_rank);
+#else
+                src_token_topk_idx =
+                    *workspace.get_gateway_dense_landing_entry_ptr(
+                        layout::gateway_rel_node(
+                            src_rank_idx / DG_MEGA_MOE_NVL_PEERS,
+                            local_node_idx),
+                        dispatch_epoch_slot,
+                        src_rank_idx % DG_MEGA_MOE_NVL_PEERS,
+                        expert, token_idx_in_rank);
+#endif
+            }
+            src_token_topk_idx = __shfl_sync(
+                0xffffffffu, src_token_topk_idx, 0);
+            const uint32_t src_token_idx =
+                src_token_topk_idx / kNumTopk;
+            const uint32_t src_topk_idx =
+                src_token_topk_idx % kNumTopk;
+            const uint32_t pool_token_idx =
+                expert_pool[expert] * BLOCK_M + token_idx_in_expert;
+            const uint32_t pool_block_idx = pool_token_idx / BLOCK_M;
+            const uint32_t token_idx_in_block = pool_token_idx % BLOCK_M;
+            if constexpr (kL1RingEnabled) {
+                const uint32_t empty_target =
+                    get_l1_ring_wave_idx(pool_block_idx) *
+                    (kHidden / BLOCK_N);
+                const auto empty_ptr = workspace.get_l1_ring_empty_count_ptr(
+                    get_l1_ring_block_idx(pool_block_idx));
+                while (ptx::ld_acq(empty_ptr) < empty_target);
+            }
+            const uint32_t l1_ring_token_idx =
+                get_l1_ring_token_idx(pool_token_idx);
+            const auto inter_staging = dispatch_staging_buffer
+                .get_data_buffer(pool_token_idx).get_base_ptr<float>();
+
+            if (cute::elect_one_sync()) {
+                const comm::ibgda::GetRequest read_requests[3] = {
+                    {
+                        reinterpret_cast<uint64_t>(
+                            l1_token_buffer
+                                .get_data_buffer(l1_ring_token_idx)
+                                .get_base_ptr()),
+                        reinterpret_cast<uint64_t>(
+                            input_token_buffer
+                                .get_data_buffer(src_token_idx)
+                                .get_base_ptr()),
+                        kHidden
+                    },
+                    {
+                        reinterpret_cast<uint64_t>(inter_staging),
+                        reinterpret_cast<uint64_t>(
+                            input_sf_buffer
+                                .get_data_buffer(src_token_idx)
+                                .get_base_ptr<float>()),
+                        (kHidden / 128) * sizeof(float)
+                    },
+                    {
+                        reinterpret_cast<uint64_t>(
+                            inter_staging + kHidden / 128),
+                        reinterpret_cast<uint64_t>(
+                            input_topk_weights_buffer
+                                .get_base_ptr<float>() +
+                            src_token_topk_idx),
+                        sizeof(float)
+                    }
+                };
+                const int dispatch_qp_id = static_cast<int>(expert);
+                const auto completion_idx =
+                    comm::ibgda::get_batch_thread(
+                        read_requests, static_cast<int>(src_rank_idx),
+                        dispatch_qp_id);
+                comm::ibgda::wait_until(
+                    static_cast<int>(src_rank_idx), dispatch_qp_id,
+                    completion_idx);
+            }
+            __syncwarp();
+
+            constexpr uint32_t kNumSFFloats = kHidden / 128;
+            #pragma unroll
+            for (uint32_t sf_idx = lane_idx; sf_idx < kNumSFFloats;
+                 sf_idx += 32) {
+                const uint32_t sf_pool_token_idx =
+                    get_l1_ring_block_idx(pool_block_idx) * SF_BLOCK_M +
+                    token_idx_in_block;
+                l1_sf_buffer.get_base_ptr<float>()[
+                    sf_idx * kNumL1SFStorageTokens + sf_pool_token_idx] =
+                    __ldcv(inter_staging + sf_idx);
+            }
+            __syncwarp();
+
+            if (cute::elect_one_sync()) {
+                *l1_topk_weights_buffer
+                     .get_data_buffer(l1_ring_token_idx)
+                     .get_base_ptr<float>() =
+                    __ldcv(inter_staging + kHidden / 128);
+                *workspace.get_token_src_metadata_ptr(pool_token_idx) =
+                    {src_rank_idx, src_token_idx, src_topk_idx};
+#ifdef DG_MEGA_MOE_FP4_PUBLISH_ROW_MASK
+                atomicOr(
+                    get_combine_publish_row_mask_ptr(
+                        pool_block_idx, src_rank_idx,
+                        token_idx_in_block / 32),
+                    1u << (token_idx_in_block % 32));
+#endif
+                ptx::red_add_rel(
+                    workspace.get_l1_arrival_count_ptr(pool_block_idx), 1);
+            }
+            __syncwarp();
+        }
+    }
+    __syncthreads();
+#endif
+
+#ifdef DG_MEGA_MOE_FP4_SIDECAR_SHARED_METADATA
+    // Cooperatively load one ready expert block's metadata once, then let the
+    // eight remote-destination warps issue their PUTs in parallel from shared
+    // memory.  The other eight warps publish same-node ready epochs, so every
+    // warp has exactly one destination and the original peer parallelism is
+    // retained without dispatch-side row-mask atomics.
+    constexpr uint32_t kLocalRanks = DG_MEGA_MOE_NVL_PEERS;
+    DG_STATIC_ASSERT(kNumRanks == 2 * kLocalRanks,
+                     "Shared metadata publication requires two NVLink domains");
+    DG_STATIC_ASSERT(kPublisherWarpsPerCTA == kNumRanks,
+                     "Shared metadata publication requires one warp per rank");
+    const uint32_t local_rank_base =
+        sym_buffer.rank_idx / kLocalRanks * kLocalRanks;
+    const uint32_t remote_rank_base = local_rank_base ^ kLocalRanks;
+    const bool shared_publish_is_inter = warp_idx < kLocalRanks;
+    const uint32_t shared_publish_dst_rank = shared_publish_is_inter ?
+        remote_rank_base + warp_idx :
+        local_rank_base + warp_idx - kLocalRanks;
+    constexpr uint32_t kNoSelectedExpert = 0xffffffffu;
+
+    if (threadIdx.x == 0) {
+        uint32_t pending = 0;
+        #pragma unroll
+        for (uint32_t expert = 0; expert < kNumExpertsPerRank; ++ expert) {
+            shared_publish_cursor[expert] = 0;
+            if (expert % gridDim.x == blockIdx.x)
+                pending |= 1u << expert;
+        }
+        shared_publish_pending = pending;
+    }
+    __syncthreads();
+
+    uint32_t scan_start = blockIdx.x;
+    const uint64_t shared_publish_wait_start = clock64();
+    while (true) {
+        if (threadIdx.x == 0) {
+            uint32_t selected_expert = kNoSelectedExpert;
+            uint32_t selected_cursor = 0;
+            uint32_t selected_has_block = 0;
+            while (shared_publish_pending != 0 and
+                   selected_expert == kNoSelectedExpert) {
+                DG_TRAP_ONLY_DEVICE_ASSERT(
+                    clock64() - shared_publish_wait_start < kTimeoutCycles);
+                #pragma unroll
+                for (uint32_t offset = 0;
+                     offset < kNumExpertsPerRank; ++ offset) {
+                    const uint32_t expert =
+                        (scan_start + offset) % kNumExpertsPerRank;
+                    if ((shared_publish_pending & (1u << expert)) == 0)
+                        continue;
+                    const uint32_t cursor =
+                        shared_publish_cursor[expert];
+                    if (cursor == expert_blocks[expert]) {
+                        selected_expert = expert;
+                        selected_cursor = cursor;
+                        break;
+                    }
+                    const uint32_t pool_block_idx =
+                        expert_pool[expert] + cursor;
+                    const auto arrival_ptr = combine_full_row_arrival_buffer
+                        .get_data_buffer(pool_block_idx)
+                        .get_base_ptr<uint32_t>();
+                    if ((ptx::ld_acq(arrival_ptr) &
+                         kCombineFullRowPublishReadyBit) != 0) {
+                        selected_expert = expert;
+                        selected_cursor = cursor;
+                        selected_has_block = 1;
+                        scan_start = (expert + 1) % kNumExpertsPerRank;
+                        break;
+                    }
+                }
+            }
+            shared_publish_selected_expert = selected_expert;
+            shared_publish_selected_cursor = selected_cursor;
+            shared_publish_selected_has_block = selected_has_block;
+        }
+        __syncthreads();
+
+        const uint32_t expert = shared_publish_selected_expert;
+        if (expert == kNoSelectedExpert)
+            return;
+        const uint32_t cursor = shared_publish_selected_cursor;
+        const bool has_block = shared_publish_selected_has_block != 0;
+        const uint32_t expert_total = expert_total_tokens[expert];
+        uint32_t valid_m = 0;
+        uint32_t m_idx = 0;
+        if (has_block) {
+            const uint32_t pool_block_idx =
+                expert_pool[expert] + cursor;
+            m_idx = pool_block_idx * BLOCK_M;
+            valid_m = cute::min(
+                expert_total - cursor * BLOCK_M, BLOCK_M);
+            for (uint32_t row = threadIdx.x; row < valid_m;
+                 row += blockDim.x)
+                shared_publish_metadata[row] =
+                    *workspace.get_token_src_metadata_ptr(m_idx + row);
+        }
+        __syncthreads();
+
+        if (has_block and shared_publish_is_inter) {
+            const int scatter_qp_id = static_cast<int>(expert);
+            for (uint32_t row_base = 0; row_base < valid_m;
+                 row_base += kPublishRowsPerBatch) {
+                const uint32_t row = row_base + lane_idx;
+                bool row_active = false;
+                uint64_t req_rptr = 0;
+                uint64_t req_lptr = 0;
+                if (row < valid_m) {
+                    const auto src_metadata = shared_publish_metadata[row];
+                    row_active =
+                        src_metadata.rank_idx == shared_publish_dst_rank;
+                    if (row_active) {
+                        const auto staging_row =
+                            combine_full_row_staging_buffer
+                                .get_data_buffer(m_idx + row);
+                        const auto dst_row = combine_token_buffer
+                            .get_rank_buffer(src_metadata.topk_idx)
+                            .get_data_buffer(src_metadata.token_idx);
+                        req_rptr = reinterpret_cast<uint64_t>(
+                            dst_row.get_base_ptr());
+                        req_lptr = reinterpret_cast<uint64_t>(
+                            staging_row.get_base_ptr());
+                    }
+                }
+                comm::ibgda::put_nbi_warp_batch_rows(
+                    req_rptr, req_lptr,
+                    kHidden * sizeof(nv_bfloat16), row_active,
+                    static_cast<int>(shared_publish_dst_rank),
+                    scatter_qp_id, static_cast<int>(lane_idx));
+            }
+        }
+
+        const bool expert_complete =
+            not has_block or cursor + 1 == expert_blocks[expert];
+        if (expert_complete) {
+            __threadfence_system();
+            __syncwarp();
+            if (lane_idx == 0 and
+                expert_pair_tokens[expert][shared_publish_dst_rank] != 0) {
+                const uint32_t global_expert_idx =
+                    sym_buffer.rank_idx * kNumExpertsPerRank + expert;
+                const auto ready_ptr =
+                    workspace.get_combine_ready_epoch_ptr(global_expert_idx);
+                if (shared_publish_is_inter) {
+                    comm::ibgda::put_inline_with_credit<uint64_t>(
+                        ready_ptr, launch_epoch,
+                        static_cast<int>(shared_publish_dst_rank),
+                        static_cast<int>(expert));
+                } else {
+                    ptx::st_relaxed_sys(
+                        sym_buffer.map(
+                            ready_ptr, shared_publish_dst_rank),
+                        launch_epoch);
+                }
+            }
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            if (has_block)
+                shared_publish_cursor[expert] = cursor + 1;
+            if (expert_complete) {
+                ptx::st_release_sys(
+                    workspace.get_combine_publish_done_epoch_ptr(expert),
+                    launch_epoch);
+                shared_publish_pending &= ~(1u << expert);
+            }
+        }
+        __syncthreads();
+    }
+#endif
+
+#ifdef DG_MEGA_MOE_FP4_SIDECAR_EXPERT_CENTRIC
+    // A small, tunable group of warps owns one expert.  Every group warp reads
+    // each row's metadata once and serves a disjoint subset of remote peers.
+    // Two groups reduce metadata traffic 4x while retaining four-way peer
+    // submission parallelism; four groups trade another metadata copy for a
+    // shorter two-peer serial chain.
+    constexpr uint32_t kPeerGroups =
+        DG_MEGA_MOE_FP4_SIDECAR_EXPERT_PEER_GROUPS;
+    const uint32_t expert_warp_idx = warp_idx / kPeerGroups;
+    const uint32_t peer_group_idx = warp_idx % kPeerGroups;
+    const uint32_t expert = blockIdx.x + expert_warp_idx * gridDim.x;
+    if (expert >= kNumExpertsPerRank)
+        return;
+
+    constexpr uint32_t kLocalRanks = DG_MEGA_MOE_NVL_PEERS;
+    DG_STATIC_ASSERT(kNumRanks == 2 * kLocalRanks,
+                     "Expert-centric publication requires two NVLink domains");
+    DG_STATIC_ASSERT(
+        kLocalRanks % kPeerGroups == 0,
+        "Peer groups must evenly divide the remote NVLink domain");
+    constexpr uint32_t kPeersPerGroup = kLocalRanks / kPeerGroups;
+    const uint32_t local_rank_base =
+        sym_buffer.rank_idx / kLocalRanks * kLocalRanks;
+    const uint32_t remote_rank_base = local_rank_base ^ kLocalRanks;
+    const uint32_t group_remote_begin =
+        remote_rank_base + peer_group_idx * kPeersPerGroup;
+    const uint32_t expert_total = expert_total_tokens[expert];
+    const uint32_t num_blocks = expert_blocks[expert];
+    const int scatter_qp_id = static_cast<int>(expert);
+
+    for (uint32_t cursor = 0; cursor < num_blocks;) {
+        const uint32_t pool_block_idx = expert_pool[expert] + cursor;
+        const auto arrival_ptr = combine_full_row_arrival_buffer
+            .get_data_buffer(pool_block_idx)
+            .get_base_ptr<uint32_t>();
+        uint32_t arrival = 0;
+        if (lane_idx == 0)
+            arrival = ptx::ld_acq(arrival_ptr);
+        arrival = __shfl_sync(0xffffffffu, arrival, 0);
+        if ((arrival & kCombineFullRowPublishReadyBit) == 0)
+            continue;
+
+        const uint32_t m_idx = pool_block_idx * BLOCK_M;
+        const uint32_t valid_m = cute::min(
+            expert_total - cursor * BLOCK_M, BLOCK_M);
+        for (uint32_t row_base = 0; row_base < valid_m;
+             row_base += kPublishRowsPerBatch) {
+            const uint32_t row = row_base + lane_idx;
+            bool valid_row = row < valid_m;
+            layout::TokenSrcMetadata src_metadata{};
+            uint64_t req_rptr = 0;
+            uint64_t req_lptr = 0;
+            if (valid_row) {
+                src_metadata =
+                    *workspace.get_token_src_metadata_ptr(m_idx + row);
+                const bool row_is_remote =
+                    src_metadata.rank_idx >= remote_rank_base and
+                    src_metadata.rank_idx < remote_rank_base + kLocalRanks;
+                if (row_is_remote) {
+                    const auto staging_row = combine_full_row_staging_buffer
+                        .get_data_buffer(m_idx + row);
+                    const auto dst_row = combine_token_buffer
+                        .get_rank_buffer(src_metadata.topk_idx)
+                        .get_data_buffer(src_metadata.token_idx);
+                    req_rptr = reinterpret_cast<uint64_t>(
+                        dst_row.get_base_ptr());
+                    req_lptr = reinterpret_cast<uint64_t>(
+                        staging_row.get_base_ptr());
+                }
+            }
+
+            #pragma unroll
+            for (uint32_t remote = 0; remote < kPeersPerGroup; ++ remote) {
+                const uint32_t dst_rank_idx = group_remote_begin + remote;
+                const bool row_active = valid_row and
+                    src_metadata.rank_idx == dst_rank_idx;
+                comm::ibgda::put_nbi_warp_batch_rows(
+                    req_rptr, req_lptr,
+                    kHidden * sizeof(nv_bfloat16), row_active,
+                    static_cast<int>(dst_rank_idx), scatter_qp_id,
+                    static_cast<int>(lane_idx));
+            }
+        }
+        ++ cursor;
+        __syncwarp();
+    }
+
+    __threadfence_system();
+    __syncwarp();
+    if (lane_idx == 0) {
+        const uint32_t old_groups = atomicAdd(
+            &expert_publish_group_done[expert], 1u);
+        DG_TRAP_ONLY_DEVICE_ASSERT(old_groups < kPeerGroups);
+        if (old_groups + 1 == kPeerGroups) {
+            const uint32_t global_expert_idx =
+                sym_buffer.rank_idx * kNumExpertsPerRank + expert;
+            const auto ready_ptr = workspace.get_combine_ready_epoch_ptr(
+                global_expert_idx);
+            #pragma unroll
+            for (uint32_t dst_rank_idx = 0;
+                 dst_rank_idx < kNumRanks; ++ dst_rank_idx) {
+                if (expert_pair_tokens[expert][dst_rank_idx] == 0)
+                    continue;
+                const bool is_inter =
+                    dst_rank_idx / kLocalRanks !=
+                    sym_buffer.rank_idx / kLocalRanks;
+                if (is_inter) {
+                    comm::ibgda::put_inline_with_credit<uint64_t>(
+                        ready_ptr, launch_epoch,
+                        static_cast<int>(dst_rank_idx), scatter_qp_id);
+                } else {
+                    ptx::st_relaxed_sys(
+                        sym_buffer.map(ready_ptr, dst_rank_idx),
+                        launch_epoch);
+                }
+            }
+            ptx::st_release_sys(
+                workspace.get_combine_publish_done_epoch_ptr(expert),
+                launch_epoch);
+        }
+    }
+    return;
+#endif
+
+    const bool chain_is_inter =
+        dst_rank_idx / DG_MEGA_MOE_NVL_PEERS !=
+        sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS;
+    uint32_t chain_pending = 0;
+    #pragma unroll
+    for (uint32_t expert = 0; expert < kNumExpertsPerRank; ++ expert) {
+        if (expert % gridDim.x == blockIdx.x)
+            chain_pending |= 1u << expert;
+    }
+#ifdef DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS
+    uint32_t publisher_backoff_ns =
+        DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS;
+    uint32_t publisher_idle_passes = 0;
+#endif
+    const uint64_t publish_wait_start = clock64();
+    while (chain_pending != 0) {
+        bool made_progress = false;
+        DG_TRAP_ONLY_DEVICE_ASSERT(
+            clock64() - publish_wait_start < kTimeoutCycles);
+
+        #pragma unroll
+        for (uint32_t expert = 0; expert < kNumExpertsPerRank; ++ expert) {
+            if ((chain_pending & (1u << expert)) == 0)
+                continue;
+            const uint32_t expert_total = expert_total_tokens[expert];
+            const uint32_t num_blocks = expert_blocks[expert];
+            uint32_t cursor = chain_cursor[warp_idx][expert];
+            const int scatter_qp_id = static_cast<int>(expert);
+
+#ifdef DG_MEGA_MOE_FP4_SIDECAR_AGGREGATE_LOCAL
+            if (is_local_aggregator) {
+                const bool local_lane = lane_idx < kLocalRanks;
+                const uint32_t local_dst_rank =
+                    local_rank_base + lane_idx;
+                const uint32_t local_pair_tokens = local_lane ?
+                    expert_pair_tokens[expert][local_dst_rank] : 0;
+                const uint32_t local_active_mask = __ballot_sync(
+                    0xffffffffu, local_pair_tokens != 0);
+
+                if (local_active_mask != 0) {
+                    while (cursor < num_blocks) {
+                        const uint32_t pool_block_idx =
+                            expert_pool[expert] + cursor;
+                        const auto arrival_ptr =
+                            combine_full_row_arrival_buffer
+                                .get_data_buffer(pool_block_idx)
+                                .get_base_ptr<uint32_t>();
+                        uint32_t arrival = 0;
+                        if (lane_idx == 0)
+                            arrival = ptx::ld_acq(arrival_ptr);
+                        arrival = __shfl_sync(
+                            0xffffffffu, arrival, 0);
+                        if ((arrival &
+                             kCombineFullRowPublishReadyBit) == 0)
+                            break;
+
+                        made_progress = true;
+                        ++ cursor;
+                        if (lane_idx == 0)
+                            chain_cursor[warp_idx][expert] = cursor;
+                        __syncwarp();
+                    }
+                    if (cursor != num_blocks)
+                        continue;
+
+                    __threadfence_system();
+                    __syncwarp();
+                    if (local_lane and local_pair_tokens != 0) {
+                        const uint32_t global_expert_idx =
+                            sym_buffer.rank_idx *
+                                kNumExpertsPerRank + expert;
+                        const auto ready_ptr =
+                            workspace.get_combine_ready_epoch_ptr(
+                                global_expert_idx);
+                        ptx::st_relaxed_sys(
+                            sym_buffer.map(ready_ptr, local_dst_rank),
+                            launch_epoch);
+                    }
+                    __syncwarp();
+                }
+
+                if (local_lane) {
+                    const auto old_pair_done =
+                        ptx::atomic_add_acq_rel_sys(
+                            workspace
+                                .get_combine_publish_pair_done_count_ptr(
+                                    expert),
+                            1);
+                    DG_TRAP_ONLY_DEVICE_ASSERT(
+                        old_pair_done < kNumRanks);
+                    if (old_pair_done + 1 == kNumRanks) {
+                        ptx::st_release_sys(
+                            workspace
+                                .get_combine_publish_done_epoch_ptr(
+                                    expert),
+                            launch_epoch);
+                    }
+                }
+                __syncwarp();
+                chain_pending &= ~(1u << expert);
+                made_progress = true;
+                continue;
+            }
+#endif
+
+            const uint32_t pair_tokens =
+                expert_pair_tokens[expert][dst_rank_idx];
+            if (pair_tokens != 0) {
+                while (cursor < num_blocks) {
+                    const uint32_t pool_block_idx =
+                        expert_pool[expert] + cursor;
+                    const auto arrival_ptr = combine_full_row_arrival_buffer
+                        .get_data_buffer(pool_block_idx)
+                        .get_base_ptr<uint32_t>();
+                    uint32_t arrival = 0;
+                    if (lane_idx == 0)
+                        arrival = ptx::ld_acq(arrival_ptr);
+                    arrival = __shfl_sync(0xffffffffu, arrival, 0);
+                    if ((arrival & kCombineFullRowPublishReadyBit) == 0)
+                        break;
+
+                    made_progress = true;
+                    const uint32_t m_idx = pool_block_idx * BLOCK_M;
+                    const uint32_t valid_m = cute::min(
+                        expert_total - cursor * BLOCK_M, BLOCK_M);
+                    // Same-node combine rows are written directly by the
+                    // fused kernel.  Their publisher warp only needs to wait
+                    // until every expert block is complete before releasing
+                    // the destination-ready epoch; it must not reload and
+                    // classify every row's metadata.
+                    if (chain_is_inter) {
+                        for (uint32_t row_base = 0; row_base < valid_m;
+                             row_base += kPublishRowsPerBatch) {
+                            const uint32_t row = row_base + lane_idx;
+                            bool row_active = false;
+                            uint64_t req_rptr = 0;
+                            uint64_t req_lptr = 0;
+                            if (row < valid_m) {
+                                const auto src_metadata =
+                                    *workspace.get_token_src_metadata_ptr(
+                                        m_idx + row);
+                                row_active =
+                                    src_metadata.rank_idx == dst_rank_idx;
+                                if (row_active) {
+                                    const auto staging_row =
+                                        combine_full_row_staging_buffer
+                                            .get_data_buffer(m_idx + row);
+                                    const auto dst_row = combine_token_buffer
+                                        .get_rank_buffer(src_metadata.topk_idx)
+                                        .get_data_buffer(src_metadata.token_idx);
+                                    req_rptr = reinterpret_cast<uint64_t>(
+                                        dst_row.get_base_ptr());
+                                    req_lptr = reinterpret_cast<uint64_t>(
+                                        staging_row.get_base_ptr());
+                                }
+                            }
+                            comm::ibgda::put_nbi_warp_batch_rows(
+                                req_rptr, req_lptr,
+                                kHidden * sizeof(nv_bfloat16), row_active,
+                                static_cast<int>(dst_rank_idx),
+                                scatter_qp_id,
+                                static_cast<int>(lane_idx));
+                        }
+                    }
+                    ++ cursor;
+                    if (lane_idx == 0)
+                        chain_cursor[warp_idx][expert] = cursor;
+                    __syncwarp();
+                }
+                if (cursor != num_blocks)
+                    continue;
+
+                __threadfence_system();
+                __syncwarp();
+                if (lane_idx == 0) {
+                    const uint32_t global_expert_idx =
+                        sym_buffer.rank_idx * kNumExpertsPerRank + expert;
+                    const auto ready_ptr =
+                        workspace.get_combine_ready_epoch_ptr(
+                            global_expert_idx);
+                    if (chain_is_inter) {
+                        comm::ibgda::put_inline_with_credit<uint64_t>(
+                            ready_ptr, launch_epoch,
+                            static_cast<int>(dst_rank_idx), scatter_qp_id);
+                    } else {
+                        ptx::st_relaxed_sys(
+                            sym_buffer.map(ready_ptr, dst_rank_idx),
+                            launch_epoch);
+                    }
+                }
+                __syncwarp();
+            }
+
+            if (lane_idx == 0) {
+                const auto old_pair_done = ptx::atomic_add_acq_rel_sys(
+                    workspace.get_combine_publish_pair_done_count_ptr(
+                        expert),
+                    1);
+                DG_TRAP_ONLY_DEVICE_ASSERT(old_pair_done < kNumRanks);
+                if (old_pair_done + 1 == kNumRanks) {
+                    ptx::st_release_sys(
+                        workspace.get_combine_publish_done_epoch_ptr(expert),
+                        launch_epoch);
+                }
+            }
+            __syncwarp();
+            chain_pending &= ~(1u << expert);
+            made_progress = true;
+        }
+
+#ifdef DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS
+        if (made_progress) {
+            publisher_backoff_ns =
+                DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS;
+            publisher_idle_passes = 0;
+        } else if (chain_pending != 0) {
+            publisher_idle_passes +=
+                publisher_idle_passes != 0xffffffffu;
+            uint32_t max_backoff_ns =
+                DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_MAX_NS;
+            if constexpr (
+                DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_FEW_PENDING_CHAINS > 0) {
+                if (__popc(chain_pending) <=
+                    DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_FEW_PENDING_CHAINS)
+                    max_backoff_ns =
+                        DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_FEW_PENDING_MAX_NS;
+                else if constexpr (
+                    DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_THRESHOLD > 0) {
+                    if (publisher_idle_passes >=
+                        DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_THRESHOLD)
+                        max_backoff_ns =
+                            DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_MAX_NS;
+                }
+            } else if constexpr (
+                DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_THRESHOLD > 0) {
+                if (publisher_idle_passes >=
+                    DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_THRESHOLD)
+                    max_backoff_ns =
+                        DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_MAX_NS;
+            }
+            publisher_backoff_ns = cute::min(
+                publisher_backoff_ns, max_backoff_ns);
+            __nanosleep(publisher_backoff_ns);
+            publisher_backoff_ns = cute::min(
+                publisher_backoff_ns * 2u, max_backoff_ns);
+        }
+#endif
+    }
+#else
+    if (blockIdx.x == 0 and threadIdx.x == 0)
+        DG_TRAP_ONLY_DEVICE_ASSERT(false and
+            "Sidecar publisher requires the inter-node specialization");
+#endif
+#else
+    if (blockIdx.x == 0 and threadIdx.x == 0)
+        DG_TRAP_ONLY_DEVICE_ASSERT(false and
+            "This kernel only supports sm_90");
+#endif
+}
+
+// ============================================================================
 // SM90 (Hopper) FP8 x FP4 MegaMoE - software-dequant path.
 // ----------------------------------------------------------------------------
 // Variant of `sm90_fp8_mega_moe_impl` for DSV4-style packed FP4 expert weights.
@@ -411,7 +1531,17 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
-                           const uint32_t* __restrict__ l2_weights_sf) {
+                           const uint32_t* __restrict__ l2_weights_sf,
+                           void* cpu_proxy_buffer,
+                           const void* cpu_proxy_dev_comms_ptr,
+                           const void* cpu_proxy_windows_ptr,
+                           const uint64_t cpu_proxy_combine_offset,
+                           const uint64_t cpu_proxy_staging_offset,
+                           const uint64_t cpu_proxy_signal_epoch_offset,
+                           const uint64_t cpu_proxy_completion_request_offset,
+                           const uint64_t cpu_proxy_combine_slot_bytes,
+                           const uint64_t cpu_proxy_staging_slot_bytes,
+                           const uint32_t cpu_proxy_num_slots) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900) and (__CUDA_ARCH__ < 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
@@ -486,6 +1616,30 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     const uint32_t thread_idx = threadIdx.x;
     const uint32_t warp_idx   = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx   = ptx::get_lane_idx();
+
+#ifdef DG_MEGA_MOE_FP4_CPU_PROXY
+    DG_TRAP_ONLY_DEVICE_ASSERT(cpu_proxy_buffer != nullptr);
+    DG_TRAP_ONLY_DEVICE_ASSERT(cpu_proxy_dev_comms_ptr != nullptr);
+    DG_TRAP_ONLY_DEVICE_ASSERT(cpu_proxy_windows_ptr != nullptr);
+    const auto cpu_proxy_dev_comms =
+        reinterpret_cast<const ncclDevComm*>(cpu_proxy_dev_comms_ptr);
+    const auto cpu_proxy_windows =
+        reinterpret_cast<const ncclWindow_t*>(cpu_proxy_windows_ptr);
+    constexpr uint32_t kCPUProxyPeersPerNode = 8;
+    const int cpu_proxy_peer =
+        sym_buffer.rank_idx / kCPUProxyPeersPerNode == 0 ? 1 : 0;
+#else
+    (void)cpu_proxy_buffer;
+    (void)cpu_proxy_dev_comms_ptr;
+    (void)cpu_proxy_windows_ptr;
+    (void)cpu_proxy_combine_offset;
+    (void)cpu_proxy_staging_offset;
+    (void)cpu_proxy_signal_epoch_offset;
+    (void)cpu_proxy_completion_request_offset;
+    (void)cpu_proxy_combine_slot_bytes;
+    (void)cpu_proxy_staging_slot_bytes;
+    (void)cpu_proxy_num_slots;
+#endif
 
     // Prefetch all TMA descriptors at the very beginning
     if (warp_idx == 0 and cute::elect_one_sync()) {
@@ -608,14 +1762,49 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kNumMaxPoolBlocks =
         kNumMaxPoolTokens / layout::kMinCandidateBlockM;
     constexpr uint32_t kCombineFullRowPublishReadyBit = 1u << 31;
+    constexpr uint32_t kPublishRowsPerMaskWord = 32;
+    constexpr uint32_t kPublishRowMaskWords =
+        BLOCK_M / kPublishRowsPerMaskWord;
+    // Keep the per-destination stride independent of the selected BLOCK_M so
+    // all FP4 specializations agree with the shared host-side buffer layout.
+    constexpr uint32_t kPublishRowMaskStorageWords = 4;
+    DG_STATIC_ASSERT(kPublishRowMaskWords <=
+                         kPublishRowMaskStorageWords,
+                     "Publish row mask does not cover BLOCK_M");
     constexpr auto combine_full_row_arrival_layout = SM90FP8FP4MegaMoEData(
         kCombineFullRow ? sizeof(uint32_t) : 0u, false);
     const auto combine_full_row_arrival_buffer = SM90FP8FP4MegaMoEBuffer(
         combine_full_row_arrival_layout, 1, kNumMaxPoolBlocks,
         dispatch_staging_buffer.get_end_ptr());
+    constexpr auto combine_full_row_ready_timestamp_layout =
+        SM90FP8FP4MegaMoEData(
+            kCombineFullRow ? sizeof(uint64_t) : 0u, false);
+    const auto combine_full_row_ready_timestamp_buffer =
+        SM90FP8FP4MegaMoEBuffer(
+            combine_full_row_ready_timestamp_layout, 1,
+            kNumMaxPoolBlocks,
+            combine_full_row_arrival_buffer.get_end_ptr());
+    constexpr auto combine_publish_row_mask_layout =
+        SM90FP8FP4MegaMoEData(
+            kCombineFullRow ?
+                kNumRanks * kPublishRowMaskStorageWords *
+                    sizeof(uint32_t) :
+                0u,
+            false);
+    const auto combine_publish_row_mask_buffer = SM90FP8FP4MegaMoEBuffer(
+        combine_publish_row_mask_layout, 1, kNumMaxPoolBlocks,
+        combine_full_row_ready_timestamp_buffer.get_end_ptr());
+    const auto get_combine_publish_row_mask_ptr =
+        [&](const uint32_t& pool_block_idx, const uint32_t& dst_rank_idx,
+            const uint32_t& mask_word_idx = 0) {
+            return combine_publish_row_mask_buffer
+                       .get_data_buffer(pool_block_idx)
+                       .get_base_ptr<uint32_t>() +
+                dst_rank_idx * kPublishRowMaskStorageWords + mask_word_idx;
+        };
     const auto combine_full_row_staging_base = reinterpret_cast<void*>(
         kCombineFullRow ? math::align(
-            reinterpret_cast<uint64_t>(combine_full_row_arrival_buffer.get_end_ptr()),
+            reinterpret_cast<uint64_t>(combine_publish_row_mask_buffer.get_end_ptr()),
             static_cast<uint64_t>(128)) :
             reinterpret_cast<uint64_t>(dispatch_staging_buffer.get_end_ptr()));
     constexpr auto combine_full_row_staging_layout = SM90FP8FP4MegaMoEData(
@@ -624,9 +1813,69 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         combine_full_row_staging_layout, 1, kNumCombineStageTokens,
         combine_full_row_staging_base);
 
+#ifdef DG_MEGA_MOE_FP4_CPU_PROXY
+    constexpr uint64_t kCPUProxyRowBytes =
+        kHidden * sizeof(nv_bfloat16);
+    DG_TRAP_ONLY_DEVICE_ASSERT(cpu_proxy_num_slots > 0);
+    uint32_t cpu_proxy_slot_idx = 0;
+    const auto get_cpu_proxy_combine_row_offset =
+        [&](const uint32_t& topk_slot_idx, const uint32_t& token_idx) {
+            return cpu_proxy_combine_offset +
+                static_cast<uint64_t>(cpu_proxy_slot_idx) *
+                    cpu_proxy_combine_slot_bytes +
+                (static_cast<uint64_t>(topk_slot_idx) *
+                     kNumMaxTokensPerRank + token_idx) *
+                    kCPUProxyRowBytes;
+        };
+    const auto get_cpu_proxy_staging_row_offset =
+        [&](const uint32_t& staging_row_idx) {
+            return cpu_proxy_staging_offset +
+                static_cast<uint64_t>(cpu_proxy_slot_idx) *
+                    cpu_proxy_staging_slot_bytes +
+                static_cast<uint64_t>(staging_row_idx) *
+                    kCPUProxyRowBytes;
+        };
+    const auto get_cpu_proxy_combine_row_ptr =
+        [&](const uint32_t& topk_slot_idx, const uint32_t& token_idx) {
+            return math::advance_ptr<uint8_t>(
+                cpu_proxy_buffer,
+                get_cpu_proxy_combine_row_offset(
+                    topk_slot_idx, token_idx));
+        };
+    const auto get_cpu_proxy_staging_row_ptr =
+        [&](const uint32_t& staging_row_idx) {
+            return math::advance_ptr<uint8_t>(
+                cpu_proxy_buffer,
+                get_cpu_proxy_staging_row_offset(staging_row_idx));
+        };
+    const auto get_cpu_proxy_signal_epoch_ptr =
+        [&](const uint32_t& local_expert_idx,
+            const uint32_t& dst_rank_idx) {
+            return math::advance_ptr<uint64_t>(
+                cpu_proxy_buffer,
+                cpu_proxy_signal_epoch_offset +
+                (static_cast<uint64_t>(local_expert_idx) * kNumRanks +
+                 dst_rank_idx) * sizeof(uint64_t));
+        };
+    const auto get_cpu_proxy_completion_request_ptr =
+        [&](const uint32_t& slot_idx,
+            const uint32_t& remote_local_rank) {
+            return math::advance_ptr<ncclGinRequest_t>(
+                cpu_proxy_buffer,
+                cpu_proxy_completion_request_offset) +
+                static_cast<uint64_t>(slot_idx) *
+                    kCPUProxyPeersPerNode + remote_local_rank;
+        };
+#endif
+
     constexpr bool kCombineStageRing =
         kCombineFullRow and kCombineExpertReady and
         kNumCombineStageTokens < kNumMaxPoolTokens;
+#ifdef DG_MEGA_MOE_FP4_CPU_PROXY_ASYNC_CREDIT
+    DG_STATIC_ASSERT(
+        not kCombineStageRing,
+        "Async CPU proxy credit requires full-pool combine staging");
+#endif
     const auto combine_stage_ring = SM90CombineStageRing<
         kCombineStageRing, kNumCombineStageTokens,
         kNumExpertsPerRank, kNumRanks>(workspace);
@@ -664,9 +1913,19 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         kProfileDecodeWait = 19,
         kProfileAWait = 20,
         kProfileLoaderPoolWait = 21,
+        kProfilePublishTotalBlocks = 22,
+        kProfilePublishEmptyDstBlocks = 23,
+        kProfilePublishMetadataLoads = 24,
+        kProfilePublishRDMABatches = 25,
+        kProfilePublishOuterLoops = 26,
+        kProfilePublishReadyChecks = 27,
+        kProfilePublishEmptyPasses = 28,
+        kProfilePublishSleepStats = 29,
+        kProfilePublishReadyObserveStats = 30,
         kProfileEntryGlobaltimer = 31,
         kProfileCountsSentGlobaltimer = 32,
         kProfileCountsReadyGlobaltimer = 33,
+        kProfilePublishMaxRequestedSleepNs = 34,
     };
     auto phase_profile = phase_profile_buffer.get_data_buffer(sm_idx)
         .get_base_ptr<unsigned long long>();
@@ -928,8 +2187,23 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     if constexpr (kDispatchExpertReady or kCombineExpertReady) {
         // One launch epoch governs dispatch metadata, combine ready, and ring
         // lifetime.  Only SM 0 advances it, exactly once per kernel launch.
-        if (sm_idx == 0 and thread_idx == 0)
+        if (sm_idx == 0 and thread_idx == 0) {
+#ifdef DG_MEGA_MOE_FP4_SIDECAR_PUBLISHER
+            const uint64_t next_epoch =
+                ptx::ld_acq_sys(workspace.get_launch_epoch_ptr()) + 1;
+            constexpr uint64_t kSidecarArmTimeoutCycles =
+                60ull * 2000000000ull;
+            const uint64_t arm_wait_start = clock64();
+            while (ptx::ld_acq_sys(
+                       workspace.get_sidecar_publisher_armed_epoch_ptr()) !=
+                   next_epoch) {
+                DG_TRAP_ONLY_DEVICE_ASSERT(
+                    clock64() - arm_wait_start <
+                        kSidecarArmTimeoutCycles);
+            }
+#endif
             ptx::atomic_add_sys(workspace.get_launch_epoch_ptr(), 1ull);
+        }
     }
     if (warp_idx == 0) {
         // Clean expert-count shared memory
@@ -992,6 +2266,32 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             workspace.get_launch_epoch_ptr());
         DG_TRAP_ONLY_DEVICE_ASSERT(kernel_launch_epoch != 0);
     }
+
+#ifdef DG_MEGA_MOE_FP4_CPU_PROXY
+    cpu_proxy_slot_idx = static_cast<uint32_t>(
+        (kernel_launch_epoch - 1) % cpu_proxy_num_slots);
+#ifdef DG_MEGA_MOE_FP4_CPU_PROXY_ASYNC_CREDIT
+    // Every publisher has stopped posting when the previous kernel returns.
+    // Before a physical slot wraps, consume the completion snapshots recorded
+    // after that slot's prior launch.  Other CTAs stay behind a local grid
+    // barrier so no producer can overwrite staging while the proxy still owns
+    // it.  Launches that use a fresh slot pay neither a CQ wait nor this sync.
+    if (kernel_launch_epoch > cpu_proxy_num_slots) {
+        if (sm_idx == 0 and warp_idx == 0 and
+            lane_idx < kCPUProxyPeersPerNode) {
+            const auto& pair_dev_comm = cpu_proxy_dev_comms[lane_idx];
+            ncclGin net(
+                pair_dev_comm, 0, NCCL_GIN_RESOURCE_SHARING_GPU);
+            net.wait(
+                *get_cpu_proxy_completion_request_ptr(
+                    cpu_proxy_slot_idx, lane_idx),
+                ncclCoopThread());
+        }
+        comm::grid_sync<kNumSMs, 3>(
+            workspace, sm_idx, thread_idx, [&]() { __syncthreads(); });
+    }
+#endif
+#endif
 
     if constexpr (kCombineStageRing) {
         if (sm_idx == 0 and warp_idx == 0) {
@@ -1937,6 +3237,13 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 .get_data_buffer(pool_token_idx).get_base_ptr<float>();
 #endif
 
+#ifdef DG_MEGA_MOE_FP4_SIDECAR_DISPATCH_RDMA
+            // The sidecar owns every inter-node token in this mode.  This is
+            // warp-uniform because source-rank selection is broadcast above.
+            if (tok_is_inter)
+                continue;
+#endif
+
             // Pull token data into SMEM (NVLink TMA), or RDMA READ the
             // token/SF/weight triplet straight into pool + staging rows.
             if (cute::elect_one_sync()) {
@@ -2037,6 +3344,14 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     // metadata and the arrival.
                     *workspace.get_token_src_metadata_ptr(pool_token_idx) =
                         {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
+#ifdef DG_MEGA_MOE_FP4_PUBLISH_ROW_MASK
+                    atomicOr(
+                        get_combine_publish_row_mask_ptr(
+                            pool_block_idx, current_rank_in_expert_idx,
+                            token_idx_in_block / kPublishRowsPerMaskWord),
+                        1u << (token_idx_in_block %
+                               kPublishRowsPerMaskWord));
+#endif
                     if constexpr (kCombineStageRing)
                         combine_stage_ring.mark_internode_rows(
                             current_expert_idx);
@@ -2054,6 +3369,14 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
                     *workspace.get_token_src_metadata_ptr(pool_token_idx) =
                         {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
+#ifdef DG_MEGA_MOE_FP4_PUBLISH_ROW_MASK
+                    atomicOr(
+                        get_combine_publish_row_mask_ptr(
+                            pool_block_idx, current_rank_in_expert_idx,
+                            token_idx_in_block / kPublishRowsPerMaskWord),
+                        1u << (token_idx_in_block %
+                               kPublishRowsPerMaskWord));
+#endif
 
                     cute::tma_store_arrive();
                     ptx::tma_store_wait<0>();
@@ -2185,6 +3508,18 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                              .get_data_buffer(expert_pool_block_offset + j)
                              .get_base_ptr<uint32_t>() = 0;
                 }
+#ifdef DG_MEGA_MOE_FP4_PUBLISH_ROW_MASK
+                const uint32_t num_publish_row_mask_words =
+                    num_recv_m_blocks * kNumRanks *
+                    kPublishRowMaskStorageWords;
+                auto publish_row_mask = combine_publish_row_mask_buffer
+                    .get_data_buffer(expert_pool_block_offset)
+                    .get_base_ptr<uint32_t>();
+                for (uint32_t j = thread_idx;
+                     j < num_publish_row_mask_words;
+                     j += kNumDispatchThreads)
+                    publish_row_mask[j] = 0;
+#endif
                 __syncwarp();
             }
         }
@@ -2223,6 +3558,23 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     },
                     true, false);
         }
+#ifdef DG_MEGA_MOE_FP4_CPU_PROXY_ASYNC_CREDIT
+        // All expert/destination publishers have submitted their final strong
+        // signal before the cleanup rendezvous above can complete.  Capture
+        // one queue completion target per remote pair without waiting for it;
+        // the target is consumed only when this launch slot is reused.
+        if (sm_idx == 0 and warp_idx == 0 and
+            lane_idx < kCPUProxyPeersPerNode) {
+            const auto& pair_dev_comm = cpu_proxy_dev_comms[lane_idx];
+            ncclGin net(
+                pair_dev_comm, 0, NCCL_GIN_RESOURCE_SHARING_GPU);
+            net.flushAsync(
+                ncclTeamWorld(pair_dev_comm), cpu_proxy_peer,
+                get_cpu_proxy_completion_request_ptr(
+                    cpu_proxy_slot_idx, lane_idx),
+                ncclCoopThread());
+        }
+#endif
         if constexpr (kCombineStageRing) {
             if (sm_idx == 0 and warp_idx == 0) {
                 combine_stage_ring.finish_launch(kernel_launch_epoch);
@@ -2417,6 +3769,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             kNumDispatchEpilogueSyncThreads,
             kDispatchWithEpilogueBarrierIdx);
 
+#ifndef DG_MEGA_MOE_FP4_SIDECAR_PUBLISHER
         sm90_fp8_fp4_mega_moe_fetch_cached_expert_recv_count<
             kNumExpertsPerRank, kNumExpertsPerLane>(
                 scheduler, cached_recv_counts);
@@ -2448,6 +3801,20 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         uint32_t chain_stage_ready[kMaxChainPairs];
         uint32_t chain_cursor[kMaxChainPairs];
         uint32_t chain_lane_rows[kMaxChainPairs];
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+        uint64_t publisher_total_blocks = 0;
+        uint64_t publisher_empty_dst_blocks = 0;
+        uint64_t publisher_metadata_loads = 0;
+        uint64_t publisher_rdma_batches = 0;
+        uint64_t publisher_outer_loops = 0;
+        uint64_t publisher_ready_checks = 0;
+        uint64_t publisher_empty_passes = 0;
+        uint64_t publisher_sleep_calls = 0;
+        uint64_t publisher_requested_sleep_ns = 0;
+        uint64_t publisher_max_requested_sleep_ns = 0;
+        uint64_t publisher_ready_observe_ns = 0;
+        uint64_t publisher_ready_observe_samples = 0;
+#endif
         #pragma unroll
         for (uint32_t idx = 0; idx < kMaxChainPairs; ++ idx) {
             const uint32_t e = grouped_slot_idx + idx * grouped_num_slots;
@@ -2470,13 +3837,46 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             chain_blocks[idx] = math::ceil_div(
                 scheduler.get_num_tokens(e), BLOCK_M);
             chain_pool[idx] = scheduler.get_pool_block_offset(e);
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+            if (lane_idx == 0) {
+                publisher_total_blocks += chain_blocks[idx];
+                if (chain_tokens[idx] == 0)
+                    publisher_empty_dst_blocks += chain_blocks[idx];
+            }
+#endif
             chain_pending |= 1u << idx;
         }
 
         const uint64_t chain_wait_start = clock64();
         constexpr int64_t kPublishTimeoutCycles = 60ll * 2000000000ll;
+#ifdef DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS
+        DG_STATIC_ASSERT(
+            DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS > 0,
+            "Publisher backoff must start above zero");
+        DG_STATIC_ASSERT(
+            DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_MAX_NS >=
+                DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS,
+            "Publisher backoff maximum must not be below its initial value");
+        uint32_t publisher_backoff_ns =
+            DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS;
+        uint32_t publisher_idle_passes = 0;
+#ifdef DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_PROGRESS_BLOCK_BUDGET
+        DG_STATIC_ASSERT(
+            DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_PROGRESS_BLOCK_BUDGET > 0,
+            "Publisher progress block budget must be positive when enabled");
+        DG_STATIC_ASSERT(
+            DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_PROGRESS_YIELD_NS > 0,
+            "Publisher progress yield must be positive when enabled");
+        uint32_t publisher_progress_blocks = 0;
+#endif
+#endif
         while (chain_pending != 0) {
-#ifdef DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_IDLE_NANOSLEEP
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+            if (lane_idx == 0)
+                ++ publisher_outer_loops;
+#endif
+#if defined(DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS) || \
+    defined(DG_MEGA_MOE_PHASE_PROFILE)
             bool chain_made_progress = false;
 #endif
             if (clock64() - chain_wait_start >= kPublishTimeoutCycles) {
@@ -2510,10 +3910,26 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             combine_full_row_arrival_buffer
                                 .get_data_buffer(pool_block_idx)
                                 .get_base_ptr<uint32_t>();
-                        if ((ptx::ld_acq(arrival_ptr) &
-                             kCombineFullRowPublishReadyBit) == 0)
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                        if (lane_idx == 0)
+                            ++ publisher_ready_checks;
+#endif
+                        const uint32_t arrival = ptx::ld_acq(arrival_ptr);
+                        if ((arrival & kCombineFullRowPublishReadyBit) == 0)
                             break;
-#ifdef DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_IDLE_NANOSLEEP
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                        if (lane_idx == 0) {
+                            const uint64_t ready_timestamp =
+                                *combine_full_row_ready_timestamp_buffer
+                                     .get_data_buffer(pool_block_idx)
+                                     .get_base_ptr<uint64_t>();
+                            publisher_ready_observe_ns +=
+                                ptx::get_globaltimer() - ready_timestamp;
+                            ++ publisher_ready_observe_samples;
+                        }
+#endif
+#if defined(DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS) || \
+    defined(DG_MEGA_MOE_PHASE_PROFILE)
                         chain_made_progress = true;
 #endif
                         if constexpr (kCombineStageRing) {
@@ -2534,12 +3950,150 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             expert_num_tokens -
                                 chain_cursor[idx] * BLOCK_M,
                             BLOCK_M);
+                        uint32_t block_active_rows = 0;
                         for (uint32_t row_base = 0; row_base < valid_m;
                              row_base += kPublishRowsPerBatch) {
                             const uint32_t row = row_base + lane_idx;
                             bool row_active = false;
                             uint64_t req_rptr = 0;
                             uint64_t req_lptr = 0;
+#ifdef DG_MEGA_MOE_FP4_CPU_PROXY
+                            uint64_t req_roffset = 0;
+                            uint64_t req_loffset = 0;
+#endif
+#ifdef DG_MEGA_MOE_FP4_PUBLISH_ROW_MASK
+                            uint32_t row_mask = 0;
+                            if (lane_idx == 0)
+                                row_mask = ptx::ld_acq(
+                                    get_combine_publish_row_mask_ptr(
+                                        pool_block_idx, dst_rank_idx,
+                                        row_base /
+                                            kPublishRowsPerMaskWord));
+                            row_mask = __shfl_sync(
+                                0xffffffff, row_mask, 0);
+                            const uint32_t valid_batch_rows = cute::min(
+                                valid_m - row_base,
+                                kPublishRowsPerBatch);
+                            const uint32_t valid_row_mask =
+                                valid_batch_rows == kPublishRowsPerBatch ?
+                                    0xffffffffu :
+                                    (1u << valid_batch_rows) - 1u;
+#ifdef DG_MEGA_MOE_DEVICE_DIAGNOSTICS
+                            if (lane_idx == 0 and
+                                (row_mask & ~valid_row_mask) != 0) {
+                                printf(
+                                    "FP4_PUBLISH_ROW_MASK_OOB "
+                                    "rank=%u sm=%u expert=%u dst=%u "
+                                    "block=%u half=%u mask=0x%x "
+                                    "valid_mask=0x%x\n",
+                                    sym_buffer.rank_idx, sm_idx,
+                                    local_expert_idx, dst_rank_idx,
+                                    pool_block_idx,
+                                    row_base / kPublishRowsPerBatch,
+                                    row_mask, valid_row_mask);
+                                DG_TRAP_ONLY_DEVICE_ASSERT(false);
+                            }
+#endif
+                            row_mask &= valid_row_mask;
+                            block_active_rows |= row_mask;
+                            row_active =
+                                (row_mask & (1u << lane_idx)) != 0;
+                            if (row_active) {
+                                ++ chain_lane_rows[idx];
+                                if (chain_is_inter) {
+                                    const auto src_metadata =
+                                        *workspace
+                                             .get_token_src_metadata_ptr(
+                                                 m_idx + row);
+#ifdef DG_MEGA_MOE_DEVICE_DIAGNOSTICS
+                                    if (src_metadata.rank_idx !=
+                                        dst_rank_idx) {
+                                        printf(
+                                            "FP4_PUBLISH_ROW_MASK_MISMATCH "
+                                            "rank=%u sm=%u expert=%u "
+                                            "dst=%u row=%u metadata_dst=%u\n",
+                                            sym_buffer.rank_idx, sm_idx,
+                                            local_expert_idx, dst_rank_idx,
+                                            m_idx + row,
+                                            src_metadata.rank_idx);
+                                        DG_TRAP_ONLY_DEVICE_ASSERT(false);
+                                    }
+#endif
+                                    const uint32_t staging_row_idx =
+                                        kCombineStageRing ?
+                                            chain_stage_base[idx] +
+                                                chain_cursor[idx] * BLOCK_M +
+                                                row :
+                                            m_idx + row;
+#ifdef DG_MEGA_MOE_FP4_CPU_PROXY
+                                    req_roffset =
+                                        get_cpu_proxy_combine_row_offset(
+                                            src_metadata.topk_idx,
+                                            src_metadata.token_idx);
+                                    req_loffset =
+                                        get_cpu_proxy_staging_row_offset(
+                                            staging_row_idx);
+#else
+                                    const auto staging_row =
+                                        combine_full_row_staging_buffer
+                                            .get_data_buffer(
+                                                staging_row_idx);
+                                    const auto dst_row =
+                                        combine_token_buffer
+                                            .get_rank_buffer(
+                                                src_metadata.topk_idx)
+                                            .get_data_buffer(
+                                                src_metadata.token_idx);
+                                    req_rptr = reinterpret_cast<uint64_t>(
+                                        dst_row.get_base_ptr());
+                                    req_lptr = reinterpret_cast<uint64_t>(
+                                        staging_row.get_base_ptr());
+#endif
+                                }
+                            }
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                            if (lane_idx == 0) {
+                                if (chain_is_inter)
+                                    publisher_metadata_loads +=
+                                        __popc(row_mask);
+                                if (chain_is_inter and row_mask != 0)
+                                    ++ publisher_rdma_batches;
+                            }
+#endif
+                            if (chain_is_inter and row_mask != 0) {
+#ifdef DG_MEGA_MOE_FP4_CPU_PROXY
+                                if (row_active) {
+                                    const uint32_t remote_local_rank =
+                                        dst_rank_idx %
+                                        kCPUProxyPeersPerNode;
+                                    const auto& pair_dev_comm =
+                                        cpu_proxy_dev_comms[
+                                            remote_local_rank];
+                                    ncclGin net(
+                                        pair_dev_comm, 0,
+                                        NCCL_GIN_RESOURCE_SHARING_GPU);
+                                    net.put(
+                                        ncclTeamWorld(pair_dev_comm),
+                                        cpu_proxy_peer,
+                                        cpu_proxy_windows[remote_local_rank],
+                                        req_roffset,
+                                        cpu_proxy_windows[remote_local_rank],
+                                        req_loffset,
+                                        kCPUProxyRowBytes,
+                                        ncclGin_None{}, ncclGin_None{},
+                                        ncclCoopThread());
+                                }
+#else
+                                comm::ibgda::put_nbi_warp_batch_rows(
+                                    req_rptr, req_lptr,
+                                    kHidden * sizeof(nv_bfloat16),
+                                    row_active,
+                                    static_cast<int>(dst_rank_idx),
+                                    scatter_qp_id,
+                                    static_cast<int>(lane_idx));
+#endif
+                            }
+#else
                             if (row < valid_m) {
                                 const auto src_metadata =
                                     *workspace.get_token_src_metadata_ptr(
@@ -2555,6 +4109,15 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                                     chain_cursor[idx] *
                                                         BLOCK_M + row :
                                                 m_idx + row;
+#ifdef DG_MEGA_MOE_FP4_CPU_PROXY
+                                        req_roffset =
+                                            get_cpu_proxy_combine_row_offset(
+                                                src_metadata.topk_idx,
+                                                src_metadata.token_idx);
+                                        req_loffset =
+                                            get_cpu_proxy_staging_row_offset(
+                                                staging_row_idx);
+#else
                                         const auto staging_row =
                                             combine_full_row_staging_buffer
                                                 .get_data_buffer(
@@ -2571,10 +4134,46 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                         req_lptr =
                                             reinterpret_cast<uint64_t>(
                                                 staging_row.get_base_ptr());
+#endif
                                     }
                                 }
                             }
-                            if (chain_is_inter)
+                            const uint32_t active_rows = __ballot_sync(
+                                0xffffffff, row_active);
+                            block_active_rows |= active_rows;
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                            if (lane_idx == 0) {
+                                publisher_metadata_loads += cute::min(
+                                    valid_m - row_base,
+                                    kPublishRowsPerBatch);
+                                if (chain_is_inter)
+                                    ++ publisher_rdma_batches;
+                            }
+#endif
+                            if (chain_is_inter) {
+#ifdef DG_MEGA_MOE_FP4_CPU_PROXY
+                                if (row_active) {
+                                    const uint32_t remote_local_rank =
+                                        dst_rank_idx %
+                                        kCPUProxyPeersPerNode;
+                                    const auto& pair_dev_comm =
+                                        cpu_proxy_dev_comms[
+                                            remote_local_rank];
+                                    ncclGin net(
+                                        pair_dev_comm, 0,
+                                        NCCL_GIN_RESOURCE_SHARING_GPU);
+                                    net.put(
+                                        ncclTeamWorld(pair_dev_comm),
+                                        cpu_proxy_peer,
+                                        cpu_proxy_windows[remote_local_rank],
+                                        req_roffset,
+                                        cpu_proxy_windows[remote_local_rank],
+                                        req_loffset,
+                                        kCPUProxyRowBytes,
+                                        ncclGin_None{}, ncclGin_None{},
+                                        ncclCoopThread());
+                                }
+#else
                                 comm::ibgda::put_nbi_warp_batch_rows(
                                     req_rptr, req_lptr,
                                     kHidden * sizeof(nv_bfloat16),
@@ -2582,8 +4181,27 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                     static_cast<int>(dst_rank_idx),
                                     scatter_qp_id,
                                     static_cast<int>(lane_idx));
+#endif
+                            }
+#endif
                         }
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                        if (lane_idx == 0 and block_active_rows == 0)
+                            ++ publisher_empty_dst_blocks;
+#endif
                         ++ chain_cursor[idx];
+#ifdef DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_PROGRESS_BLOCK_BUDGET
+                        // Yield at block granularity so a single productive
+                        // scan cannot monopolize issue slots needed by the
+                        // FP4 decode and WGMMA warps.
+                        ++ publisher_progress_blocks;
+                        if (publisher_progress_blocks >=
+                            DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_PROGRESS_BLOCK_BUDGET) {
+                            __nanosleep(
+                                DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_PROGRESS_YIELD_NS);
+                            publisher_progress_blocks = 0;
+                        }
+#endif
                     }
                     if (chain_cursor[idx] != chain_blocks[idx])
                         continue;
@@ -2613,6 +4231,47 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t global_expert_idx =
                         sym_buffer.rank_idx * kNumExpertsPerRank +
                         local_expert_idx;
+#ifdef DG_MEGA_MOE_FP4_CPU_PROXY
+                    if (chain_is_inter) {
+                        if (lane_idx == 0) {
+                            const auto signal_epoch_ptr =
+                                get_cpu_proxy_signal_epoch_ptr(
+                                    local_expert_idx, dst_rank_idx);
+                            const uint64_t previous_signal_epoch =
+                                ptx::ld_acq_sys(signal_epoch_ptr);
+                            DG_DEVICE_ASSERT(
+                                launch_epoch > previous_signal_epoch);
+                            const uint64_t signal_delta =
+                                launch_epoch - previous_signal_epoch;
+                            const uint32_t remote_local_rank =
+                                dst_rank_idx % kCPUProxyPeersPerNode;
+                            const auto& pair_dev_comm =
+                                cpu_proxy_dev_comms[remote_local_rank];
+                            ncclGin net(
+                                pair_dev_comm, 0,
+                                NCCL_GIN_RESOURCE_SHARING_GPU);
+                            net.put(
+                                ncclTeamWorld(pair_dev_comm),
+                                cpu_proxy_peer,
+                                cpu_proxy_windows[remote_local_rank], 0,
+                                cpu_proxy_windows[remote_local_rank], 0, 0,
+                                ncclGin_StrongSignalAdd{
+                                    static_cast<ncclGinSignal_t>(
+                                        local_expert_idx),
+                                    signal_delta},
+                                ncclGin_None{}, ncclCoopThread());
+                            // The legacy path drains every expert/destination
+                            // chain here.  The async-credit path snapshots the
+                            // shared proxy queue once after all publishers are
+                            // done and waits only when its physical slot wraps.
+#ifndef DG_MEGA_MOE_FP4_CPU_PROXY_ASYNC_CREDIT
+                            net.flush(ncclCoopThread());
+#endif
+                            ptx::st_release_sys(
+                                signal_epoch_ptr, launch_epoch);
+                        }
+                    } else
+#endif
                     if (lane_idx == 0) {
                         const auto ready_ptr =
                             workspace.get_combine_ready_epoch_ptr(
@@ -2663,17 +4322,113 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
                 chain_pending &= ~(1u << idx);
-#ifdef DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_IDLE_NANOSLEEP
+#if defined(DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS) || \
+    defined(DG_MEGA_MOE_PHASE_PROFILE)
                 chain_made_progress = true;
 #endif
             }
-#ifdef DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_IDLE_NANOSLEEP
-            // Productive scans and completed expert pairs never sleep.
-            if (not chain_made_progress and chain_pending != 0)
-                __nanosleep(
-                    DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_IDLE_NANOSLEEP);
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+            if (lane_idx == 0 and not chain_made_progress and
+                chain_pending != 0)
+                ++ publisher_empty_passes;
+#endif
+#ifdef DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS
+            // Reset immediately after useful work. Consecutive idle scans use
+            // bounded exponential backoff to reduce scheduler pressure while
+            // retaining low wake-up latency when the producer is nearly ready.
+            if (chain_made_progress) {
+                publisher_backoff_ns =
+                    DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS;
+                publisher_idle_passes = 0;
+            } else if (chain_pending != 0) {
+                publisher_idle_passes +=
+                    publisher_idle_passes != 0xffffffffu;
+                uint32_t publisher_current_max_backoff_ns =
+                    DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_MAX_NS;
+                if constexpr (
+                    DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_FEW_PENDING_CHAINS > 0) {
+                    if (__popc(chain_pending) <=
+                        DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_FEW_PENDING_CHAINS)
+                        publisher_current_max_backoff_ns =
+                            DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_FEW_PENDING_MAX_NS;
+                    else if constexpr (
+                        DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_THRESHOLD > 0) {
+                        if (publisher_idle_passes >=
+                            DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_THRESHOLD)
+                            publisher_current_max_backoff_ns =
+                                DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_MAX_NS;
+                    }
+                } else if constexpr (
+                    DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_THRESHOLD > 0) {
+                    if (publisher_idle_passes >=
+                        DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_THRESHOLD)
+                        publisher_current_max_backoff_ns =
+                            DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_MAX_NS;
+                }
+                // Clip before sleeping as well as after doubling.  This makes
+                // the few-pending cap effective immediately when the chain
+                // count drops near the tail.
+                publisher_backoff_ns = cute::min(
+                    publisher_backoff_ns,
+                    publisher_current_max_backoff_ns);
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                if (lane_idx == 0) {
+                    ++ publisher_sleep_calls;
+                    publisher_requested_sleep_ns += publisher_backoff_ns;
+                    publisher_max_requested_sleep_ns = cute::max(
+                        publisher_max_requested_sleep_ns,
+                        static_cast<uint64_t>(publisher_backoff_ns));
+                }
+#endif
+                __nanosleep(publisher_backoff_ns);
+                publisher_backoff_ns = cute::min(
+                    publisher_backoff_ns * 2u,
+                    publisher_current_max_backoff_ns);
+            }
 #endif
         }
+
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+        if (lane_idx == 0) {
+            phase_profile[kProfilePublishTotalBlocks] =
+                publisher_total_blocks;
+            phase_profile[kProfilePublishEmptyDstBlocks] =
+                publisher_empty_dst_blocks;
+            phase_profile[kProfilePublishMetadataLoads] =
+                publisher_metadata_loads;
+            phase_profile[kProfilePublishRDMABatches] =
+                publisher_rdma_batches;
+            phase_profile[kProfilePublishOuterLoops] =
+                publisher_outer_loops;
+            phase_profile[kProfilePublishReadyChecks] =
+                publisher_ready_checks;
+            phase_profile[kProfilePublishEmptyPasses] =
+                publisher_empty_passes;
+            const uint64_t sleep_calls =
+                publisher_sleep_calls > 0xffffffffull ?
+                    0xffffffffull : publisher_sleep_calls;
+            const uint64_t requested_sleep_ns =
+                publisher_requested_sleep_ns > 0xffffffffull ?
+                    0xffffffffull : publisher_requested_sleep_ns;
+            phase_profile[kProfilePublishSleepStats] =
+                (sleep_calls << 32) | requested_sleep_ns;
+            constexpr uint64_t kReadyObserveNsMask =
+                (1ull << 48) - 1ull;
+            const uint64_t ready_observe_ns =
+                publisher_ready_observe_ns > kReadyObserveNsMask ?
+                    kReadyObserveNsMask :
+                    publisher_ready_observe_ns;
+            const uint64_t ready_observe_samples =
+                publisher_ready_observe_samples > 0xffffull ?
+                    0xffffull : publisher_ready_observe_samples;
+            phase_profile[kProfilePublishReadyObserveStats] =
+                (ready_observe_samples << 48) |
+                ready_observe_ns;
+            phase_profile[kProfilePublishMaxRequestedSleepNs] =
+                publisher_max_requested_sleep_ns;
+        }
+#endif
+#endif  // DG_MEGA_MOE_FP4_SIDECAR_PUBLISHER
 
         ptx::sync_unaligned(
             kNumDispatchEpilogueSyncThreads,
@@ -4443,11 +6198,18 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                                 m_block_idx * BLOCK_M +
                                                 m_idx_in_block :
                                             m_idx + m_idx_in_block;
-                                    const auto staging_row =
+#ifdef DG_MEGA_MOE_FP4_CPU_PROXY
+                                    const auto staging_base_ptr =
+                                        get_cpu_proxy_staging_row_ptr(
+                                            staging_row_idx);
+#else
+                                    const auto staging_base_ptr =
                                         combine_full_row_staging_buffer
-                                            .get_data_buffer(staging_row_idx);
+                                            .get_data_buffer(staging_row_idx)
+                                            .get_base_ptr();
+#endif
                                     auto staging_ptr = math::advance_ptr<uint4>(
-                                        staging_row.get_base_ptr(),
+                                        staging_base_ptr,
                                         (n_idx + wg_n_offset) * sizeof(nv_bfloat16) +
                                             lane_in_row * sizeof(uint4));
                                     *staging_ptr = packed;
@@ -4480,11 +6242,18 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                                 m_block_idx * BLOCK_M +
                                                 m_idx_in_block :
                                             m_idx + m_idx_in_block;
-                                    const auto staging_row =
+#ifdef DG_MEGA_MOE_FP4_CPU_PROXY
+                                    const auto staging_base_ptr =
+                                        get_cpu_proxy_staging_row_ptr(
+                                            staging_row_idx);
+#else
+                                    const auto staging_base_ptr =
                                         combine_full_row_staging_buffer
-                                            .get_data_buffer(staging_row_idx);
+                                            .get_data_buffer(staging_row_idx)
+                                            .get_base_ptr();
+#endif
                                     auto staging_ptr = math::advance_ptr<uint2>(
-                                        staging_row.get_base_ptr(),
+                                        staging_base_ptr,
                                         (n_idx + wg_n_offset) * sizeof(nv_bfloat16) +
                                             lane_in_row * sizeof(uint2));
                                     *staging_ptr = packed;
@@ -4539,11 +6308,18 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         const uint32_t num_l2_fragments =
                             kNumL2BlockNs * num_active_m_wgs *
                             (BLOCK_N / WG_BLOCK_N);
-                        if (old + 1 == num_l2_fragments)
+                        if (old + 1 == num_l2_fragments) {
+#ifdef DG_MEGA_MOE_PHASE_PROFILE
+                            *combine_full_row_ready_timestamp_buffer
+                                 .get_data_buffer(m_idx / BLOCK_M)
+                                 .get_base_ptr<uint64_t>() =
+                                     ptx::get_globaltimer();
+#endif
                             ptx::st_release_sys(
                                 arrival_ptr,
                                 kCombineFullRowPublishReadyBit |
                                     num_l2_fragments);
+                        }
                     }
                 }
 
@@ -4669,8 +6445,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 if (stored_topk_slot_idx >= 0) {
                     DG_TRAP_ONLY_DEVICE_ASSERT(
                         stored_topk_slot_idx < static_cast<int>(kNumExperts));
-                    const auto ready_ptr = workspace.get_combine_ready_epoch_ptr(
-                        static_cast<uint32_t>(stored_topk_slot_idx));
                     const uint64_t launch_epoch = kernel_launch_epoch;
                     constexpr uint64_t kReadyTimeoutCycles =
                         60ull * 2000000000ull;
@@ -4678,9 +6452,41 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     const uint64_t profile_ready_wait_start = clock64();
 #endif
                     const auto ready_wait_start = clock64();
-                    while (ptx::ld_acq_sys(ready_ptr) != launch_epoch)
-                        DG_TRAP_ONLY_DEVICE_ASSERT(
-                            clock64() - ready_wait_start < kReadyTimeoutCycles);
+#ifdef DG_MEGA_MOE_FP4_CPU_PROXY
+                    const uint32_t global_expert_idx =
+                        static_cast<uint32_t>(stored_topk_slot_idx);
+                    const uint32_t expert_src_rank =
+                        global_expert_idx / kNumExpertsPerRank;
+                    const bool expert_is_inter =
+                        expert_src_rank / DG_MEGA_MOE_NVL_PEERS !=
+                        sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS;
+                    if (expert_is_inter) {
+                        const uint32_t source_local_rank =
+                            expert_src_rank % kCPUProxyPeersPerNode;
+                        const auto& pair_dev_comm =
+                            cpu_proxy_dev_comms[source_local_rank];
+                        ncclGin net(
+                            pair_dev_comm, 0,
+                            NCCL_GIN_RESOURCE_SHARING_GPU);
+                        while (net.readSignal(
+                                   static_cast<ncclGinSignal_t>(
+                                       global_expert_idx %
+                                       kNumExpertsPerRank)) < launch_epoch)
+                            DG_TRAP_ONLY_DEVICE_ASSERT(
+                                clock64() - ready_wait_start <
+                                kReadyTimeoutCycles);
+                    } else {
+#endif
+                        const auto ready_ptr =
+                            workspace.get_combine_ready_epoch_ptr(
+                                static_cast<uint32_t>(stored_topk_slot_idx));
+                        while (ptx::ld_acq_sys(ready_ptr) != launch_epoch)
+                            DG_TRAP_ONLY_DEVICE_ASSERT(
+                                clock64() - ready_wait_start <
+                                kReadyTimeoutCycles);
+#ifdef DG_MEGA_MOE_FP4_CPU_PROXY
+                    }
+#endif
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
                     profile_combine_ready_wait_cycles +=
                         clock64() - profile_ready_wait_start;
@@ -4698,10 +6504,35 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     if (mask) {
                         const uint32_t slot_idx = __ffs(mask) - 1;
                         mask ^= 1 << slot_idx;
+                        const int selected_global_expert_idx =
+                            __shfl_sync(
+                                0xffffffff, stored_topk_slot_idx, slot_idx);
                         if (cute::elect_one_sync()) {
+#ifdef DG_MEGA_MOE_FP4_CPU_PROXY
+                            const uint32_t selected_src_rank =
+                                static_cast<uint32_t>(
+                                    selected_global_expert_idx) /
+                                kNumExpertsPerRank;
+                            const bool selected_is_inter =
+                                selected_src_rank / DG_MEGA_MOE_NVL_PEERS !=
+                                sym_buffer.rank_idx /
+                                    DG_MEGA_MOE_NVL_PEERS;
+                            const auto src_base_ptr = selected_is_inter ?
+                                get_cpu_proxy_combine_row_ptr(
+                                    slot_idx, token_idx) :
+                                combine_token_buffer
+                                    .get_rank_buffer(slot_idx)
+                                    .get_data_buffer(token_idx)
+                                    .get_base_ptr();
+#else
+                            const auto src_base_ptr =
+                                combine_token_buffer
+                                    .get_rank_buffer(slot_idx)
+                                    .get_data_buffer(token_idx)
+                                    .get_base_ptr();
+#endif
                             const auto src_ptr = math::advance_ptr<uint8_t>(
-                                combine_token_buffer.get_rank_buffer(slot_idx)
-                                                    .get_data_buffer(token_idx).get_base_ptr(),
+                                src_base_ptr,
                                 chunk_byte_offset);
                             ptx::tma_load_1d(combine_load_buffer[i], src_ptr, combine_load_barriers[i], kNumChunkBytes);
                             ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumChunkBytes);
@@ -4790,6 +6621,18 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             unsigned long long sum_decode_wait_cycles = 0;
             unsigned long long sum_a_wait_cycles = 0;
             unsigned long long sum_scatter_cycles = 0;
+            unsigned long long publish_total_blocks = 0;
+            unsigned long long publish_empty_dst_blocks = 0;
+            unsigned long long publish_metadata_loads = 0;
+            unsigned long long publish_rdma_batches = 0;
+            unsigned long long publish_outer_loops = 0;
+            unsigned long long publish_ready_checks = 0;
+            unsigned long long publish_empty_passes = 0;
+            unsigned long long publish_sleep_calls = 0;
+            unsigned long long publish_requested_sleep_ns = 0;
+            unsigned long long publish_max_requested_sleep_ns = 0;
+            unsigned long long publish_ready_observe_ns = 0;
+            unsigned long long publish_ready_observe_samples = 0;
             for (uint32_t sm = 0; sm < kNumSMs; ++ sm) {
                 const auto row = phase_profile_buffer.get_data_buffer(sm)
                     .get_base_ptr<unsigned long long>();
@@ -4805,6 +6648,34 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 sum_decode_wait_cycles += row[kProfileDecodeWait];
                 sum_a_wait_cycles += row[kProfileAWait];
                 sum_scatter_cycles += row[kProfileScatter];
+                publish_total_blocks +=
+                    row[kProfilePublishTotalBlocks];
+                publish_empty_dst_blocks +=
+                    row[kProfilePublishEmptyDstBlocks];
+                publish_metadata_loads +=
+                    row[kProfilePublishMetadataLoads];
+                publish_rdma_batches +=
+                    row[kProfilePublishRDMABatches];
+                publish_outer_loops +=
+                    row[kProfilePublishOuterLoops];
+                publish_ready_checks +=
+                    row[kProfilePublishReadyChecks];
+                publish_empty_passes +=
+                    row[kProfilePublishEmptyPasses];
+                const uint64_t sleep_stats =
+                    row[kProfilePublishSleepStats];
+                publish_sleep_calls += sleep_stats >> 32;
+                publish_requested_sleep_ns +=
+                    sleep_stats & 0xffffffffull;
+                publish_max_requested_sleep_ns = cute::max(
+                    publish_max_requested_sleep_ns,
+                    row[kProfilePublishMaxRequestedSleepNs]);
+                const uint64_t ready_observe_stats =
+                    row[kProfilePublishReadyObserveStats];
+                publish_ready_observe_samples +=
+                    ready_observe_stats >> 48;
+                publish_ready_observe_ns +=
+                    ready_observe_stats & ((1ull << 48) - 1ull);
             }
             printf(
                 "FP4_MEGA_MOE_PHASE_PROFILE rank=%u tokens=%u block_m=%u "
@@ -4833,6 +6704,32 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 max_cycles[kProfileCombineReduce],
                 max_cycles[kProfileTotal], remote_read_count,
                 l1_block_count, l2_block_count);
+            // CUDA device printf accepts at most 32 arguments including the
+            // format string. Keep publisher diagnostics in a separate record
+            // so the final values are not read from unrelated vararg state.
+            printf(
+                "FP4_MEGA_MOE_PUBLISH_PROFILE rank=%u tokens=%u "
+                "publish_total_blocks=%llu "
+                "publish_empty_dst_blocks=%llu "
+                "publish_metadata_loads=%llu "
+                "publish_rdma_batches=%llu "
+                "publish_outer_loops=%llu "
+                "publish_ready_checks=%llu "
+                "publish_empty_passes=%llu "
+                "publish_sleep_calls=%llu "
+                "publish_requested_sleep_ns=%llu "
+                "publish_max_requested_sleep_ns=%llu "
+                "publish_ready_observe_ns=%llu "
+                "publish_ready_observe_samples=%llu\n",
+                sym_buffer.rank_idx, num_tokens,
+                publish_total_blocks, publish_empty_dst_blocks,
+                publish_metadata_loads, publish_rdma_batches,
+                publish_outer_loops, publish_ready_checks,
+                publish_empty_passes, publish_sleep_calls,
+                publish_requested_sleep_ns,
+                publish_max_requested_sleep_ns,
+                publish_ready_observe_ns,
+                publish_ready_observe_samples);
             printf(
                 "FP4_MEGA_MOE_SYNC_PROFILE rank=%u tokens=%u entry_ns=%llu "
                 "counts_sent_ns=%llu counts_ready_ns=%llu\n",

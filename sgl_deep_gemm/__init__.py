@@ -5,6 +5,7 @@ import shutil
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
+import torch.distributed as torch_dist
 import tvm_ffi
 
 from .cuda_helpers import find_cuda_home, get_cuda_arch
@@ -319,6 +320,53 @@ class SM90SymmBuffer:
         self.group.barrier()
         torch.cuda.synchronize()
 
+        self.cpu_proxy_enabled = (
+            group.size() > 8
+            and int(os.environ.get('DG_MEGA_MOE_FP4_CPU_PROXY', '0')) != 0
+        )
+        if self.cpu_proxy_enabled:
+            proxy_ranks = torch_dist.get_process_group_ranks(group)
+            self.cpu_proxy_control_group = torch_dist.new_group(
+                ranks=proxy_ranks, backend='gloo'
+            )
+            uid = torch.zeros((64, 128), dtype=torch.uint8)
+            if torch_dist.get_rank() == proxy_ranks[0]:
+                uid.copy_(torch.from_dlpack(
+                    _C.sm90_mega_moe_cpu_proxy_get_unique_id()
+                ))
+            torch_dist.broadcast(
+                uid, src=proxy_ranks[0],
+                group=self.cpu_proxy_control_group,
+            )
+            # TVM-FFI's TensorView converter currently accepts CUDA tensors
+            # for this extension entry point.  The C++ initializer copies the
+            # UID bytes back to host before creating the pair communicators.
+            uid_cuda = uid.cuda()
+            previous_hca = os.environ.get('NCCL_IB_HCA')
+            if int(os.environ.get('DG_NCCL_PIN_LOCAL_HCA', '1')) != 0:
+                # COMM5/COMM6 expose GPU i next to mlx5_(i+1).  Scope this
+                # setting to the proxy communicators so PyTorch/NVSHMEM keep
+                # their normal multi-rail configuration.
+                os.environ['NCCL_IB_HCA'] = (
+                    f'mlx5_{torch.cuda.current_device() + 1}'
+                )
+            try:
+                _C.sm90_mega_moe_cpu_proxy_init(
+                    uid_cuda,
+                    torch_dist.get_rank(group),
+                    group.size(),
+                    num_experts,
+                    num_topk,
+                    num_max_tokens_per_rank,
+                    hidden,
+                )
+            finally:
+                if previous_hca is None:
+                    os.environ.pop('NCCL_IB_HCA', None)
+                else:
+                    os.environ['NCCL_IB_HCA'] = previous_hca
+            assert _C.sm90_mega_moe_cpu_proxy_is_initialized()
+
         (x, x_sf, topk_idx, topk_weights,
          l1_acts, l1_acts_sf, l2_acts, l2_acts_sf) = slice_input_buffers(self.buffer)
         self.x = _from_dlpack_if_needed(x, torch.float8_e4m3fn)
@@ -331,6 +379,15 @@ class SM90SymmBuffer:
         self.l2_acts_sf = _from_dlpack_if_needed(l2_acts_sf)
 
     def destroy(self):
+        if getattr(self, 'cpu_proxy_enabled', False):
+            self.group.barrier()
+            torch.cuda.synchronize()
+            _C.sm90_mega_moe_cpu_proxy_destroy()
+            self.group.barrier()
+            torch.cuda.synchronize()
+            self.cpu_proxy_enabled = False
+            torch_dist.destroy_process_group(self.cpu_proxy_control_group)
+            self.cpu_proxy_control_group = None
         self.handle = None
         self.buffer = None
         self.group = None
