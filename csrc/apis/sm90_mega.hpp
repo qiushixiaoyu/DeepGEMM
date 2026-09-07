@@ -9,7 +9,6 @@
 #include <vector>
 
 #include "mega.hpp"
-#include "sm90_mega_cpu_proxy.hpp"
 #include "../jit/device_runtime.hpp"
 #include "../jit_kernels/impls/sm90_fp8_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mega_moe.hpp"
@@ -593,11 +592,6 @@ static void fp8_fp4_mega_moe_sm90(
     auto fp4_defaults = get_fp4_sm90_api_defaults(
         num_experts_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden);
-    if (get_env<int>("DG_MEGA_MOE_FP4_SIDECAR_SPLIT_B_LOADER", 0) != 0) {
-        DG_HOST_ASSERT(fp4_internode);
-        DG_HOST_ASSERT(get_env<int>("DG_MEGA_MOE_FP4_SIDECAR_PUBLISHER", 0) != 0);
-        fp4_defaults.early_b_decode = true;
-    }
     // The protocol is shape-fixed: inter-node launches use expert-ready
     // dispatch, full-row async combine and one extra gateway QP; single-node
     // launches retain the NVLink count-sum data path.

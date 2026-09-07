@@ -445,9 +445,8 @@ struct SM90Workspace {
         // and ring lifetime.  SM 0 advances it once and publishes the latched
         // value to the whole local grid before any protocol state is touched.
         num_bytes += sizeof(uint64_t);
-        // Sidecar launch control: armed epoch plus a reusable CTA-arrival
-        // counter.  Keeping both in the common layout makes sidecar and fused
-        // specializations agree on every following workspace offset.
+        // Reserved launch-control padding. Keep downstream offsets stable
+        // for existing SM90 FP8/FP4 workspace layouts.
         num_bytes += 2 * sizeof(uint64_t);
         // Per-expert combine completion protocol.  Ready epochs are indexed
         // by global expert, while publication counters and destination masks
@@ -557,21 +556,6 @@ struct SM90Workspace {
     CUTLASS_DEVICE
     uint64_t* get_launch_epoch_ptr() const {
         return math::advance_ptr<uint64_t>(base, kNumBarrierSignalBytes);
-    }
-
-    // The second 64-bit launch-control word is reserved for the optional
-    // SM90 FP4 sidecar publisher.  The sidecar publishes the epoch it is
-    // armed for before the fused kernel advances get_launch_epoch_ptr().
-    // This closes the cross-stream race where the fused kernel could produce
-    // and clean a short launch before the sidecar had become resident.
-    CUTLASS_DEVICE
-    uint64_t* get_sidecar_publisher_armed_epoch_ptr() const {
-        return get_launch_epoch_ptr() + 1;
-    }
-
-    CUTLASS_DEVICE
-    uint32_t* get_sidecar_publisher_arrival_count_ptr() const {
-        return reinterpret_cast<uint32_t*>(get_launch_epoch_ptr() + 2);
     }
 
     CUTLASS_DEVICE

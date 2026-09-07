@@ -349,27 +349,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         f"deep_ep_phase_profile={int(args.deep_ep_phase_profile)} "
         f"normal_impl={'legacy_scatter_gather' if args.mode == 'normal' else 'n/a'} "
         f"row_combine={int(args.row_combine)} "
-        f"cpu_proxy={os.environ.get('DG_MEGA_MOE_FP4_CPU_PROXY', '0')} "
-        f"cpu_proxy_async_credit="
-        f"{os.environ.get('DG_MEGA_MOE_FP4_CPU_PROXY_ASYNC_CREDIT', '0')} "
-        f"cpu_proxy_slots="
-        f"{os.environ.get('DG_MEGA_MOE_FP4_CPU_PROXY_SLOTS', '1')} "
-        f"sidecar_publisher="
-        f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_PUBLISHER', '0')} "
-        f"sidecar_blocks="
-        f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_BLOCKS', '4')} "
-        f"sidecar_dispatch_rdma="
-        f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_DISPATCH_RDMA', '0')} "
-        f"sidecar_split_b_loader="
-        f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_SPLIT_B_LOADER', '0')} "
-        f"sidecar_aggregate_local="
-        f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_AGGREGATE_LOCAL', '0')} "
-        f"sidecar_shared_metadata="
-        f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_SHARED_METADATA', 'auto')} "
-        f"sidecar_expert_centric="
-        f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_EXPERT_CENTRIC', '0')} "
-        f"sidecar_expert_peer_groups="
-        f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_EXPERT_PEER_GROUPS', '2')} "
+        f"force_packed_dispatch={os.environ.get('DG_MEGA_MOE_FP4_FORCE_PACKED_DISPATCH', '0')} "
         f"warmup={args.num_warmup} repeat={args.num_repeat} "
         f"fused_tests={args.num_bench_tests} l2_flush_gb={args.l2_flush_gb}",
     )
@@ -1055,7 +1035,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         deep_ep_breakdown = None
         if need_fused:
             # Main metric: only the target MegaMoE CUDA kernel.  Auxiliary
-            # sidecar/input/wrapper work is deliberately excluded.  The
+            # Input preparation and wrapper work are deliberately excluded. The
             # event-based full invocation remains a separate diagnostic.
             if args.mega_timing == "kineto":
                 prepare_fused_input()

@@ -651,30 +651,6 @@ Tuple<int64_t, int64_t> dg_get_ring_limit_for_mega_moe(int64_t num_max_tokens_pe
     return Tuple<int64_t, int64_t>(static_cast<int64_t>(min_ring), static_cast<int64_t>(max_ring));
 }
 
-Tensor dg_sm90_mega_moe_cpu_proxy_get_unique_id() {
-    auto result = mega::sm90_mega_moe_cpu_proxy_get_unique_id();
-    return Tensor::FromDLPack(at::toDLPack(result));
-}
-
-void dg_sm90_mega_moe_cpu_proxy_init(
-        TensorView unique_id, int64_t rank, int64_t num_ranks,
-        int64_t num_experts, int64_t num_topk,
-        int64_t num_max_tokens_per_rank, int64_t hidden) {
-    mega::sm90_mega_moe_cpu_proxy_init(
-        convert_to_torch_tensor(unique_id), static_cast<int>(rank),
-        static_cast<int>(num_ranks), static_cast<int>(num_experts),
-        static_cast<int>(num_topk),
-        static_cast<int>(num_max_tokens_per_rank), static_cast<int>(hidden));
-}
-
-bool dg_sm90_mega_moe_cpu_proxy_is_initialized() {
-    return mega::sm90_mega_moe_cpu_proxy_is_initialized();
-}
-
-void dg_sm90_mega_moe_cpu_proxy_destroy() {
-    mega::sm90_mega_moe_cpu_proxy_destroy();
-}
-
 int64_t dg_get_token_alignment_for_sm90_mega_moe() {
     return (int64_t)mega::get_token_alignment_for_sm90_mega_moe();
 }
@@ -894,10 +870,6 @@ void dg_mega_moe_pre_dispatch_sm90(
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_token_alignment_for_mega_moe, dg_get_token_alignment_for_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_ring_limit_for_mega_moe, dg_get_ring_limit_for_mega_moe);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_mega_moe_cpu_proxy_get_unique_id, dg_sm90_mega_moe_cpu_proxy_get_unique_id);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_mega_moe_cpu_proxy_init, dg_sm90_mega_moe_cpu_proxy_init);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_mega_moe_cpu_proxy_is_initialized, dg_sm90_mega_moe_cpu_proxy_is_initialized);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_mega_moe_cpu_proxy_destroy, dg_sm90_mega_moe_cpu_proxy_destroy);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_token_alignment_for_sm90_mega_moe, dg_get_token_alignment_for_sm90_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_symm_buffer_size_for_mega_moe, dg_get_symm_buffer_size_for_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_symm_buffer_size_for_sm90_mega_moe, dg_get_symm_buffer_size_for_sm90_mega_moe);

@@ -104,9 +104,6 @@ extra_cflags = [
     '-Wno-psabi', '-Wno-deprecated-declarations',
     f'-D_GLIBCXX_USE_CXX11_ABI={cxx_abi}',
 ]
-nccl_home = os.environ.get('DG_NCCL_HOME', '')
-if nccl_home:
-    extra_cflags.append('-DDG_HAS_NCCL_GIN=1')
 if int(os.environ.get('DG_JIT_USE_RUNTIME_API', '0')):
     extra_cflags.append('-DDG_JIT_USE_RUNTIME_API')
 
@@ -123,8 +120,6 @@ extra_include_paths = [
 cccl = f'{cuda_home}/include/cccl'
 if os.path.exists(cccl):
     extra_include_paths.append(cccl)
-if nccl_home:
-    extra_include_paths.append(os.path.join(nccl_home, 'include'))
 
 nvshmem_home = os.path.join(sysconfig.get_path('purelib'), 'nvidia', 'nvshmem')
 extra_ldflags = [
@@ -135,8 +130,6 @@ extra_ldflags = [
     '-lcudart', '-lnvrtc', '-lcublasLt', '-lcublas',
     '-ltorch', '-ltorch_cpu', '-lc10', '-lc10_cuda', '-ltorch_cuda',
 ]
-if nccl_home:
-    extra_ldflags.extend([f'-L{os.path.join(nccl_home, "lib")}', '-lnccl'])
 
 build_subdir = os.path.join(pkg_dir, '_C_build')
 os.makedirs(build_subdir, exist_ok=True)
