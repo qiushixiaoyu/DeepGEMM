@@ -86,6 +86,7 @@ public:
         // swapAB path: use decoded weight as WGMMA-M and tokens as WGMMA-N.
         bool use_swap_ab;
         bool use_swap_ab_fast_amax;
+        bool sfb_n_contiguous;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -127,6 +128,18 @@ public:
         std::string internode_prefix =
             "// sm90 fp4 mega-moe protocol revision 3\n"
             "// sm90 fp4 mega-moe support uses nvshmem device helpers\n";
+        if (args.sfb_n_contiguous)
+            internode_prefix += "#define DG_MEGA_MOE_FP4_SFB_N_CONTIGUOUS 1\n";
+        if (get_env<int>("DG_MEGA_MOE_FP4_SFB_TMA", 0) != 0) {
+            DG_HOST_ASSERT(args.sfb_n_contiguous);
+            internode_prefix += "#define DG_MEGA_MOE_FP4_SFB_TMA 1\n";
+        }
+        if (get_env<int>("DG_MEGA_MOE_FP4_PAIRED_PRMT", 0) != 0)
+            internode_prefix += "#define DG_MEGA_MOE_FP4_PAIRED_PRMT 1\n";
+        if (get_env<int>("DG_MEGA_MOE_FP4_PACKED_GMMA_DESC", 0) != 0)
+            internode_prefix += "#define DG_MEGA_MOE_FP4_PACKED_GMMA_DESC 1\n";
+        if (get_env<int>("DG_MEGA_MOE_FP4_REUSE_GMMA_DESC", 0) != 0)
+            internode_prefix += "#define DG_MEGA_MOE_FP4_REUSE_GMMA_DESC 1\n";
         if (args.num_ranks > kNvlPeers) {
             internode_prefix += fmt::format(
                 "// inter-node mega-moe: uses nvshmem device functions\n"
@@ -160,6 +173,9 @@ public:
                     combine_stage_tokens == args.config.num_max_pool_tokens);
                 internode_prefix +=
                     "#define DG_MEGA_MOE_FP4_SIDECAR_PUBLISHER 1\n";
+                if (get_env<int>("DG_MEGA_MOE_FP4_SIDECAR_SPLIT_B_LOADER", 0) != 0)
+                    internode_prefix +=
+                        "#define DG_MEGA_MOE_FP4_SIDECAR_SPLIT_B_LOADER 1\n";
                 const bool sidecar_dispatch_rdma = get_env<int>(
                     "DG_MEGA_MOE_FP4_SIDECAR_DISPATCH_RDMA", 0) != 0;
                 if (sidecar_dispatch_rdma)
@@ -359,9 +375,18 @@ public:
             // switches execution topology and showed no benefit.  Use the
             // same weight-footprint boundary as the other FP4 heuristics.
             const float min_sfb_broadcast_rows = weight_light ? 24.0f : 16.0f;
-            const bool use_sfb_subgroup_broadcast =
+            const bool auto_sfb_subgroup_broadcast =
                 expected_rows_per_local_expert >= min_sfb_broadcast_rows and
                 expected_rows_per_local_expert <= 32.0f;
+            // Diagnostic overrides preserve the density policy at -1.
+            // Explicit 0 emits no macro: the decode implementation uses ifdef.
+            const int sfb_broadcast_override = get_env<int>(
+                "DG_MEGA_MOE_FP4_SFB_BROADCAST_OVERRIDE", -1);
+            DG_HOST_ASSERT(sfb_broadcast_override >= -1 and
+                           sfb_broadcast_override <= 1);
+            const bool use_sfb_subgroup_broadcast =
+                sfb_broadcast_override < 0 ? auto_sfb_subgroup_broadcast :
+                sfb_broadcast_override != 0;
             if (use_sfb_subgroup_broadcast)
                 internode_prefix +=
                     "#define DG_MEGA_MOE_FP4_SFB_SUBGROUP_BROADCAST 1\n";
@@ -395,6 +420,13 @@ public:
                     weight_light ? 2 :
                     expected_rows_per_local_expert < 28.0f ? 1 : 2;
             }
+            const int fine_bucket_cap = get_env<int>(
+                "DG_MEGA_MOE_FP4_FINE_BUCKET_CAP", -1);
+            DG_HOST_ASSERT(fine_bucket_cap >= -1 and
+                           fine_bucket_cap <= 3);
+            if (fine_bucket_cap >= 0)
+                fp4_swap_ab_fine_bucket_level =
+                    std::min(fp4_swap_ab_fine_bucket_level, fine_bucket_cap);
             if (fp4_swap_ab_fine_bucket_level > 0)
                 internode_prefix += fmt::format(
                     "#define DG_MEGA_MOE_FP4_SWAP_AB_FINE_BUCKETS {}\n",
@@ -407,9 +439,16 @@ public:
             const bool use_swap_scale_float2 =
                 expected_rows_per_local_expert >= 24.0f and
                 expected_rows_per_local_expert <= 48.0f;
-            if (use_swap_scale_float2)
-                internode_prefix +=
-                    "#define DG_MEGA_MOE_FP4_SWAP_SCALE_FLOAT2_LEVEL 3\n";
+            const int scale_float2_override = get_env<int>(
+                "DG_MEGA_MOE_FP4_SCALE_FLOAT2_OVERRIDE", -1);
+            DG_HOST_ASSERT(scale_float2_override >= -1 and
+                           scale_float2_override <= 3);
+            const int scale_float2_level = scale_float2_override < 0 ?
+                (use_swap_scale_float2 ? 3 : 0) : scale_float2_override;
+            if (scale_float2_level > 0)
+                internode_prefix += fmt::format(
+                    "#define DG_MEGA_MOE_FP4_SWAP_SCALE_FLOAT2_LEVEL {}\n",
+                    scale_float2_level);
         }
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE", 0) != 0)
             internode_prefix += "#define DG_MEGA_MOE_PHASE_PROFILE 1\n";
@@ -810,6 +849,7 @@ static void sm90_fp8_fp4_mega_moe(
         .use_ss_nsplit = use_ss_nsplit,
         .use_swap_ab = use_swap_ab,
         .use_swap_ab_fast_amax = use_swap_ab_fast_amax,
+        .sfb_n_contiguous = not l1_weights_sf.is_contiguous() or not l2_weights_sf.is_contiguous(),
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

@@ -102,6 +102,29 @@ CUTLASS_DEVICE uint32_t fp4x4_to_scaled_e4m3x4_lut(
     return (sign_bytes & 0x80808080u) | mantissa_bytes;
 }
 
+// Decode both halves of one packed word together. PRMT consumes only the
+// low 16 selector bits, so magnitude masking and the sign shift can be
+// shared without changing the packed-weight or decoded-tile layouts.
+CUTLASS_DEVICE void fp4x8_to_scaled_e4m3x8_lut(
+        uint32_t packed, uint32_t lut_lo, uint32_t lut_hi,
+        uint32_t& out_lo, uint32_t& out_hi) {
+    const uint32_t indices = packed & 0x77777777u;
+    const uint32_t sign_shifted = packed << 4;
+    asm volatile(
+        "{\n"
+        "  .reg .b32 ml, mh, sl, sh;\n"
+        "  prmt.b32 ml, %4, %5, %2;\n"
+        "  prmt.b32 mh, %4, %5, %3;\n"
+        "  prmt.b32 sl, %6, %7, 0xd9c8;\n"
+        "  prmt.b32 sh, %6, %7, 0xfbea;\n"
+        "  lop3.b32 %0, sl, 0x80808080, ml, 0xea;\n"
+        "  lop3.b32 %1, sh, 0x80808080, mh, 0xea;\n"
+        "}\n"
+        : "=r"(out_lo), "=r"(out_hi)
+        : "r"(indices), "r"(indices >> 16), "r"(lut_lo), "r"(lut_hi),
+          "r"(sign_shifted), "r"(packed));
+}
+
 }  // namespace fp4_decode_detail
 
 }  // namespace deep_gemm

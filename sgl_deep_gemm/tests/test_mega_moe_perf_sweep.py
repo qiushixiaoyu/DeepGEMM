@@ -18,6 +18,14 @@ import test_mega_moe_hopper as base
 import test_mega_moe_fp4_hopper as fp4_base
 
 
+def _deep_ep_expected_rows(batch: int, capacity: int, world_size: int,
+                           topk: int, num_experts: int, policy: str) -> int:
+    if policy not in ("batch", "capacity"):
+        raise ValueError(f"unknown DeepEP expected-M policy: {policy}")
+    hint_tokens = batch if policy == "batch" else capacity
+    return max(1, (hint_tokens * world_size * topk + num_experts - 1) // num_experts)
+
+
 def _global_stats(seconds: float) -> tuple[float, float, float]:
     value = torch.tensor([seconds], dtype=torch.float64, device="cuda")
     max_value = value.clone()
@@ -283,6 +291,13 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
             )
 
     rank, world_size, group = base.init_dist(local_rank, num_local_ranks)
+    if args.mega_num_sms:
+        if args.path != "fused":
+            raise ValueError("--mega-num-sms requires --path fused; DeepEP must retain its own configuration")
+        physical_sms = torch.cuda.get_device_properties(local_rank).multi_processor_count
+        if not (world_size <= args.mega_num_sms <= physical_sms and args.mega_num_sms % 2 == 0):
+            raise ValueError("--mega-num-sms must be even and between world size and physical SM count")
+        base.deep_gemm.set_num_sms(args.mega_num_sms)
     torch.manual_seed(20260721 + rank)
     random.seed(20260721 + rank)
 
@@ -321,6 +336,15 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         f"hidden={hidden} intermediate={intermediate} experts={num_experts} "
         f"topk={topk} local_experts={local_experts} batches={','.join(map(str, batches))} "
         f"mega_dtype={'fp4_runtime' if args.fp4_runtime else 'fp8'} "
+        f"sfb_n_contiguous={os.environ.get('DG_MEGA_MOE_FP4_SFB_N_CONTIGUOUS', '0')} "
+        f"sfb_tma={os.environ.get('DG_MEGA_MOE_FP4_SFB_TMA', '0')} "
+        f"paired_prmt={os.environ.get('DG_MEGA_MOE_FP4_PAIRED_PRMT', '0')} "
+        f"packed_gmma_desc={os.environ.get('DG_MEGA_MOE_FP4_PACKED_GMMA_DESC', '0')} "
+        f"reuse_gmma_desc={os.environ.get('DG_MEGA_MOE_FP4_REUSE_GMMA_DESC', '0')} "
+        f"mega_num_sms={base.deep_gemm.get_num_sms()} "
+        f"experts_per_wave_override={os.environ.get('DG_MEGA_MOE_FP4_EXPERTS_PER_WAVE', '0')} "
+        f"mega_timing={args.mega_timing} deep_ep_timing={args.deep_ep_timing} "
+        f"deep_ep_expected_m={args.deep_ep_expected_m} "
         f"fuse_shared={int(args.fuse_shared)} "
         f"deep_ep_phase_profile={int(args.deep_ep_phase_profile)} "
         f"normal_impl={'legacy_scatter_gather' if args.mode == 'normal' else 'n/a'} "
@@ -336,6 +360,8 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_BLOCKS', '4')} "
         f"sidecar_dispatch_rdma="
         f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_DISPATCH_RDMA', '0')} "
+        f"sidecar_split_b_loader="
+        f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_SPLIT_B_LOADER', '0')} "
         f"sidecar_aggregate_local="
         f"{os.environ.get('DG_MEGA_MOE_FP4_SIDECAR_AGGREGATE_LOCAL', '0')} "
         f"sidecar_shared_metadata="
@@ -460,7 +486,6 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
     # Low-latency masked GEMM storage depends only on the largest sweep point.
     if args.mode == "low_latency" and need_deep_ep:
         ll_m_max = max_tokens * world_size
-        ll_expected_m = max(1, (max_tokens * world_size * topk + num_experts - 1) // num_experts)
         ll_l1_y = torch.empty(
             (local_experts, ll_m_max, intermediate * 2),
             dtype=torch.bfloat16,
@@ -482,6 +507,17 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
 
     kineto_primed = False
     for batch in batches:
+        if args.mode == "low_latency" and need_deep_ep:
+            # Storage capacity is independent of the GEMM scheduling hint.
+            # Use the current batch's expected expert rows; retain the old
+            # capacity-based hint only for explicit reproducibility A/Bs.
+            ll_expected_m = _deep_ep_expected_rows(
+                batch, max_tokens, world_size, topk, num_experts, args.deep_ep_expected_m
+            )
+            _print_rank0(
+                rank, f"[DEEPEP_GEMM_HINT] batch={batch} capacity={max_tokens} "
+                f"policy={args.deep_ep_expected_m} expected_m={ll_expected_m}",
+            )
         # Each point gets deterministic but independent routing and inputs.
         torch.manual_seed(20260721 + rank * 100000 + batch)
         x_bf16 = torch.randn((batch, hidden), dtype=torch.bfloat16, device="cuda")
@@ -996,8 +1032,8 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
             dist.barrier()
             continue
 
-        if args.kineto_kernel_only and not kineto_primed:
-            if need_fused:
+        if not kineto_primed:
+            if need_fused and args.mega_timing == "kineto":
                 prepare_fused_input()
                 base.bench_kineto(
                     run_fused_kernel_only,
@@ -1007,7 +1043,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
                     suppress_kineto_output=True,
                     flush_l2=False,
                 )
-            if need_deep_ep:
+            if need_deep_ep and args.deep_ep_timing == "kineto-sum":
                 _bench_kineto_all_cuda_kernels(
                     run_deep_ep, args.num_warmup, 2
                 )
@@ -1018,10 +1054,10 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         deep_ep_stats = None
         deep_ep_breakdown = None
         if need_fused:
-            # DG_FUSED_EVENT_TIMING=1 times the fused kernel with the same
-            # free-running CUDA-event method as the DeepEP baseline, so the
-            # two are not compared across different timing methodologies.
-            if args.kineto_kernel_only:
+            # Main metric: only the target MegaMoE CUDA kernel.  Auxiliary
+            # sidecar/input/wrapper work is deliberately excluded.  The
+            # event-based full invocation remains a separate diagnostic.
+            if args.mega_timing == "kineto":
                 prepare_fused_input()
                 torch.cuda.synchronize()
                 dist.barrier()
@@ -1031,32 +1067,32 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
                     barrier=lambda: dist.barrier(),
                     num_tests=args.num_bench_tests,
                     suppress_kineto_output=True,
-                    flush_l2=False,
+                    flush_l2=args.l2_flush_gb > 0,
+                    trace_path=(
+                        os.path.join(args.kineto_trace_dir, f"mega_b{batch}_r{rank}.json")
+                        if args.kineto_trace_dir else None
+                    ),
                 )
-            elif os.environ.get("DG_FUSED_EVENT_TIMING", "0") == "1":
+                timing_ok = torch.tensor(
+                    [int(math.isfinite(fused_seconds) and fused_seconds > 0)],
+                    dtype=torch.int32, device="cuda",
+                )
+                dist.all_reduce(timing_ok, op=dist.ReduceOp.MIN)
+                if not timing_ok.item():
+                    raise RuntimeError("Kineto did not capture the target MegaMoE kernel on every rank")
+            else:
                 fused_seconds = base._bench_cuda_events(
                     run_fused,
                     num_warmup=args.num_warmup,
                     num_repeat=args.num_repeat,
                     l2_flush_gb=args.l2_flush_gb,
                 )
-            else:
-              fused_seconds = base.bench_kineto(
-                run_fused,
-                base.SM90_KERNEL_NAME,
-                barrier=lambda: dist.barrier(),
-                num_tests=args.num_bench_tests,
-                suppress_kineto_output=True,
-                # bench_kineto hardcodes an 8 GB flush; honour --l2-flush-gb 0
-                # so the fused path can be compared against DeepEP fairly.
-                flush_l2=args.l2_flush_gb > 0,
-            )
             fused_stats = _global_stats(fused_seconds)
 
             # Read the LAST launch's counters without device-side printf.
             _dump_fp8_phase_profile(sym_buffer, args.model_name, batch, rank)
         if need_deep_ep:
-            if args.kineto_kernel_only:
+            if args.deep_ep_timing == "kineto-sum":
                 deep_ep_seconds, deep_ep_breakdown, deep_ep_num_events = (
                     _bench_kineto_all_cuda_kernels(
                         run_deep_ep, args.num_warmup, args.num_bench_tests
@@ -1078,6 +1114,13 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
                 )
             deep_ep_stats = _global_stats(deep_ep_seconds)
 
+        mega_method = "kineto_kernel" if args.mega_timing == "kineto" else "cuda_events_end_to_end"
+        ep_method = "cuda_events_end_to_end" if args.deep_ep_timing == "cuda-events" else "kineto_kernel_sum"
+        timing_labels = (
+            f"mega_timing_method={mega_method if need_fused else 'disabled'} "
+            f"fp4_timing_method={mega_method if need_fused and args.fp4_runtime else 'disabled'} "
+            f"deep_ep_timing_method={ep_method if need_deep_ep else 'disabled'}"
+        )
         if args.path == "both":
             fused_max, fused_mean, fused_min = fused_stats
             deep_ep_max, deep_ep_mean, deep_ep_min = deep_ep_stats
@@ -1087,7 +1130,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
                 f"fused_us_max={fused_max*1e6:.3f} fused_us_mean={fused_mean*1e6:.3f} "
                 f"fused_us_min={fused_min*1e6:.3f} deep_ep_us_max={deep_ep_max*1e6:.3f} "
                 f"deep_ep_us_mean={deep_ep_mean*1e6:.3f} deep_ep_us_min={deep_ep_min*1e6:.3f} "
-                f"speedup={deep_ep_max/fused_max:.4f}",
+                f"speedup={deep_ep_max/fused_max:.4f} {timing_labels}",
             )
         else:
             time_max, time_mean, time_min = fused_stats or deep_ep_stats
@@ -1095,7 +1138,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
                 rank,
                 f"[RESULT] model={args.model_name} mode={args.mode} path={args.path} batch={batch} "
                 f"time_us_max={time_max*1e6:.3f} time_us_mean={time_mean*1e6:.3f} "
-                f"time_us_min={time_min*1e6:.3f}",
+                f"time_us_min={time_min*1e6:.3f} {timing_labels}",
             )
         dist.barrier()
 
@@ -1139,17 +1182,23 @@ if __name__ == "__main__":
     parser.add_argument("--num-topk", type=int, required=True)
     parser.add_argument("--batches", type=int, nargs="+", required=True)
     parser.add_argument("--num-processes", type=int, default=8)
+    parser.add_argument("--mega-num-sms", type=int, default=0,
+                        help="diagnostic MegaMoE SM/CTA budget; requires isolated --path fused; 0 keeps the device default")
     parser.add_argument("--num-bench-tests", type=int, default=30)
     parser.add_argument("--num-warmup", type=int, default=5)
     parser.add_argument("--num-repeat", type=int, default=20)
     parser.add_argument(
         "--kineto-kernel-only",
         action="store_true",
-        help=(
-            "compare the fused MegaMoE kernel with the sum of CUDA kernels "
-            "in one DeepEP low-latency invocation"
-        ),
+        help="compatibility alias for --mega-timing kineto; DeepEP timing is independent",
     )
+    parser.add_argument("--mega-timing", choices=("kineto", "cuda-events"), default="kineto",
+                        help="MegaMoE kernel-only main metric, or end-to-end diagnostic")
+    parser.add_argument("--deep-ep-timing", choices=("cuda-events", "kineto-sum"), default="cuda-events",
+                        help="DeepEP full pipeline main metric, or kernel-sum diagnostic")
+    parser.add_argument("--deep-ep-expected-m", choices=("batch", "capacity"), default="batch",
+                        help="masked-GEMM expert-row hint: current batch (default), or legacy capacity-based diagnostic")
+    parser.add_argument("--kineto-trace-dir", help="optional per-rank MegaMoE Chrome traces")
     parser.add_argument("--l2-flush-gb", type=float, default=1.0)
     parser.add_argument("--activation-clamp", type=float, default=10.0)
     parser.add_argument("--fast-math", type=int, default=1)
@@ -1183,5 +1232,9 @@ if __name__ == "__main__":
     parser.add_argument("--reference-max-local-tokens", type=int, default=16)
     parser.add_argument("--diff-tol", type=float, default=0.10)
     args = parser.parse_args()
+    if args.kineto_kernel_only:
+        args.mega_timing = "kineto"
+    if args.kineto_trace_dir:
+        os.makedirs(args.kineto_trace_dir, exist_ok=True)
     assert not args.check_fp4_reference or args.accuracy_only
     torch.multiprocessing.spawn(run, args=(args.num_processes, args), nprocs=args.num_processes)

@@ -229,6 +229,17 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_wide_load(
         const uint32_t scaled_lut_hi = static_cast<uint32_t>(scaled_lut >> 32);
 
         const uint4 packed = reinterpret_cast<const uint4*>(packed_row)[kg];
+#ifdef DG_MEGA_MOE_FP4_PAIRED_PRMT
+        uint32_t lo_0, hi_0, lo_1, hi_1, lo_2, hi_2, lo_3, hi_3;
+        fp4_decode_detail::fp4x8_to_scaled_e4m3x8_lut(
+            packed.x, scaled_lut_lo, scaled_lut_hi, lo_0, hi_0);
+        fp4_decode_detail::fp4x8_to_scaled_e4m3x8_lut(
+            packed.y, scaled_lut_lo, scaled_lut_hi, lo_1, hi_1);
+        fp4_decode_detail::fp4x8_to_scaled_e4m3x8_lut(
+            packed.z, scaled_lut_lo, scaled_lut_hi, lo_2, hi_2);
+        fp4_decode_detail::fp4x8_to_scaled_e4m3x8_lut(
+            packed.w, scaled_lut_lo, scaled_lut_hi, lo_3, hi_3);
+#else
         const uint32_t lo_0 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
             packed.x & 0xffffu, scaled_lut_lo, scaled_lut_hi);
         const uint32_t hi_0 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
@@ -245,6 +256,7 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_wide_load(
             packed.w & 0xffffu, scaled_lut_lo, scaled_lut_hi);
         const uint32_t hi_3 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
             packed.w >> 16, scaled_lut_lo, scaled_lut_hi);
+#endif
         ptx::st_shared(
             decoded_row_u64 + swz_seg_0 * 2u,
             lo_0, hi_0, lo_1, hi_1);
@@ -301,6 +313,13 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_vec_store(
             const uint32_t pw_global_0 = kg * kPackedWordsPerKG + pair * 2u;
             const uint32_t packed_0 = packed_row[pw_global_0];
             const uint32_t packed_1 = packed_row[pw_global_0 + 1u];
+#ifdef DG_MEGA_MOE_FP4_PAIRED_PRMT
+            uint32_t lo_0, hi_0, lo_1, hi_1;
+            fp4_decode_detail::fp4x8_to_scaled_e4m3x8_lut(
+                packed_0, scaled_lut_lo, scaled_lut_hi, lo_0, hi_0);
+            fp4_decode_detail::fp4x8_to_scaled_e4m3x8_lut(
+                packed_1, scaled_lut_lo, scaled_lut_hi, lo_1, hi_1);
+#else
             const uint32_t lo_0 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
                 packed_0 & 0xffffu, scaled_lut_lo, scaled_lut_hi);
             const uint32_t hi_0 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
@@ -309,6 +328,7 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_vec_store(
                 packed_1 & 0xffffu, scaled_lut_lo, scaled_lut_hi);
             const uint32_t hi_1 = fp4_decode_detail::fp4x4_to_scaled_e4m3x4_lut(
                 packed_1 >> 16, scaled_lut_lo, scaled_lut_hi);
+#endif
             const uint32_t seg_id = pw_global_0 >> 1;
             const uint32_t swz_seg = seg_id ^ row_swizzle;
             ptx::st_shared(
@@ -2051,6 +2071,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // dequant avoids reloading the same word once per K group.
     constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE =
         math::constexpr_align<uint32_t>(LOAD_BLOCK_N * sizeof(uint32_t), 128u);
+#ifdef DG_MEGA_MOE_FP4_SFB_TMA
+    constexpr uint32_t kSFBTMABytes = LOAD_BLOCK_N * sizeof(uint32_t);
+#else
+    constexpr uint32_t kSFBTMABytes = 0;
+#endif
 
     // CD output: max of L1 FP8 (BLOCK_M * (BLOCK_N/2) * 1 byte) and
     // L2 BF16 (BLOCK_M * BLOCK_N * 2 bytes). With split-M each math WG
@@ -3662,12 +3687,13 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx],
                         k_idx, m_idx, 1);
 
+#ifndef DG_MEGA_MOE_FP4_SIDECAR_SPLIT_B_LOADER
                     // Merged B loader: issue the packed-FP4 weight TMA from
                     // this warp too, freeing loader warp 1 for the publisher.
                     // Producer arrivals for the merged path are deferred until
-                    // after the SFB shared-memory writes below: SFB does not
-                    // ride the TMA tx count, so an early arrival would let a
-                    // consumer read stale scale factors.
+                    // after the scalar SFB shared-memory writes below. The
+                    // optional SFB TMA instead contributes its own tx bytes;
+                    // both paths prevent consumers from reading stale scales.
                     const uint32_t n_idx =
                         local_expert_idx * shape_n + n_block_idx * BLOCK_N;
                     auto b_full_barrier = kUseEarlyBDecode
@@ -3679,6 +3705,21 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         tensor_map_b_ptr, b_full_barrier,
                         smem_b_packed[stage_idx],
                         k_block_idx * (BLOCK_K / 2), n_idx, 1);
+#ifdef DG_MEGA_MOE_FP4_SFB_TMA
+                    // N-contiguous SFB is one aligned run. Account this bulk
+                    // transfer on the same input barrier as packed B, so no
+                    // decode consumer can observe an incomplete scale tile.
+                    const bool is_l1 = block_phase == sched::BlockPhase::Linear1;
+                    const auto* sfb_base = is_l1 ? l1_weights_sf : l2_weights_sf;
+                    const uint32_t sfb_per_expert = is_l1 ? kL1SFBPerExpert : kL2SFBPerExpert;
+                    ptx::tma_load_1d(
+                        smem_sfb[stage_idx],
+                        sfb_base + local_expert_idx * sfb_per_expert +
+                            k_block_idx * shape_n + n_block_idx * BLOCK_N,
+                        b_full_barrier, kSFBTMABytes,
+                        cute::TMA::CacheHintSm90::EVICT_NORMAL);
+#endif
+#endif
 
                     // TMA load SFA
                     if (block_phase == sched::BlockPhase::Linear1) {
@@ -3703,6 +3744,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
 
+#ifndef DG_MEGA_MOE_FP4_SIDECAR_SPLIT_B_LOADER
+#ifndef DG_MEGA_MOE_FP4_SFB_TMA
                 // Merged SFB load: the whole warp cooperates (one UE8M0 word
                 // per N row), exactly as loader warp 1 used to.
                 const bool is_l1 = block_phase == sched::BlockPhase::Linear1;
@@ -3714,14 +3757,19 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t n_global = n_block_idx * BLOCK_N + row;
                     smem_sfb[stage_idx][row] = __ldg(sfb_base
                         + local_expert_idx * sfb_per_expert
+#ifdef DG_MEGA_MOE_FP4_SFB_N_CONTIGUOUS
+                        + k_block_idx * shape_n + n_global);
+#else
                         + n_global * sfb_k_words
                         + k_block_idx);
+#endif
                 }
                 __syncwarp();
+#endif
+#endif
 
-                // Deferred producer arrivals (see the note at the B TMA):
-                // program order after the SFB stores plus the __syncwarp above
-                // orders the stores before the release-semantics arrivals.
+                // Scalar SFB stores are ordered before these release arrivals.
+                // Async SFB is covered by kSFBTMABytes on the B input barrier.
                 if (cute::elect_one_sync()) {
                     const uint32_t sfa_bytes =
                         block_phase == sched::BlockPhase::Linear1
@@ -3729,14 +3777,16 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             : kNumL2SFAPerBlockK * BLOCK_M *
                                   static_cast<uint32_t>(sizeof(float));
                     if constexpr (kUseEarlyBDecode) {
+#ifndef DG_MEGA_MOE_FP4_SIDECAR_SPLIT_B_LOADER
                         decode_full_barriers[stage_idx]->arrive_and_expect_tx(
-                            SMEM_B_PACKED_SIZE_PER_STAGE);
+                            SMEM_B_PACKED_SIZE_PER_STAGE + kSFBTMABytes);
+#endif
                         full_barriers[stage_idx]->arrive_and_expect_tx(
                             SMEM_A_SIZE_PER_STAGE + sfa_bytes);
                     } else {
                         full_barriers[stage_idx]->arrive_and_expect_tx(
                             SMEM_A_SIZE_PER_STAGE + sfa_bytes +
-                            SMEM_B_PACKED_SIZE_PER_STAGE);
+                            SMEM_B_PACKED_SIZE_PER_STAGE + kSFBTMABytes);
                     }
                 }
                 __syncwarp();
@@ -3768,6 +3818,63 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_unaligned(
             kNumDispatchEpilogueSyncThreads,
             kDispatchWithEpilogueBarrierIdx);
+
+#ifdef DG_MEGA_MOE_FP4_SIDECAR_SPLIT_B_LOADER
+        // The sidecar owns publication, so warp 1 can prefetch B/SFB without
+        // waiting for dispatch/L1 activation arrivals. Decode remains online
+        // in the bounded shared-memory stages; each stage still waits for
+        // math's empty credit before any packed or decoded bytes are reused.
+        DG_STATIC_ASSERT(kUseEarlyBDecode, "Split B loader requires independent B readiness");
+        sm90_fp8_fp4_mega_moe_for_each_cached_block<
+            kNumExpertsPerRank, kNumExpertsPerLane,
+            L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K>(
+            scheduler, [&]<sched::BlockPhase kBlockPhase, uint32_t kNumBlockKs>(
+                           const uint32_t& local_expert_idx,
+                           const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+            constexpr bool is_l1 = kBlockPhase == sched::BlockPhase::Linear1;
+            constexpr uint32_t shape_n = is_l1 ? L1_SHAPE_N : L2_SHAPE_N;
+            const auto tensor_map_b_ptr = is_l1 ? &tensor_map_l1_weights : &tensor_map_l2_weights;
+            const uint32_t* sfb_base = is_l1 ? l1_weights_sf : l2_weights_sf;
+            constexpr uint32_t sfb_per_expert = is_l1 ? kL1SFBPerExpert : kL2SFBPerExpert;
+            constexpr uint32_t sfb_k_words = is_l1 ? kL1SFBKWords : kL2SFBKWords;
+            for (uint32_t k_block_idx = 0; k_block_idx < kNumBlockKs; advance_pipeline(k_block_idx)) {
+                empty_barriers[stage_idx]->wait(phase ^ 1);
+                if (cute::elect_one_sync()) {
+                    tma::copy<BLOCK_K / 2, LOAD_BLOCK_N,
+                              kSwizzleBPackedMode, b_packed_dtype_t>(
+                        tensor_map_b_ptr, decode_full_barriers[stage_idx],
+                        smem_b_packed[stage_idx], k_block_idx * (BLOCK_K / 2),
+                        local_expert_idx * shape_n + n_block_idx * BLOCK_N, 1);
+#ifdef DG_MEGA_MOE_FP4_SFB_TMA
+                    ptx::tma_load_1d(
+                        smem_sfb[stage_idx],
+                        sfb_base + local_expert_idx * sfb_per_expert +
+                            k_block_idx * shape_n + n_block_idx * BLOCK_N,
+                        decode_full_barriers[stage_idx], kSFBTMABytes,
+                        cute::TMA::CacheHintSm90::EVICT_NORMAL);
+#endif
+                }
+#ifndef DG_MEGA_MOE_FP4_SFB_TMA
+                #pragma unroll
+                for (uint32_t row = lane_idx; row < LOAD_BLOCK_N; row += 32) {
+                    smem_sfb[stage_idx][row] = __ldg(sfb_base
+                        + local_expert_idx * sfb_per_expert
+#ifdef DG_MEGA_MOE_FP4_SFB_N_CONTIGUOUS
+                        + k_block_idx * shape_n + n_block_idx * BLOCK_N + row);
+#else
+                        + (n_block_idx * BLOCK_N + row) * sfb_k_words
+                        + k_block_idx);
+#endif
+                }
+#endif
+                __syncwarp();
+                if (cute::elect_one_sync())
+                    decode_full_barriers[stage_idx]->arrive_and_expect_tx(
+                        SMEM_B_PACKED_SIZE_PER_STAGE + kSFBTMABytes);
+                __syncwarp();
+            }
+        }, cached_recv_counts);
+#endif
 
 #ifndef DG_MEGA_MOE_FP4_SIDECAR_PUBLISHER
         sm90_fp8_fp4_mega_moe_fetch_cached_expert_recv_count<
@@ -4708,6 +4815,37 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     continue;
                 }
 
+                // All callers advance by K32 or whole N-row strides. Cache
+                // only the current stage: no descriptor survives stage reuse.
+                DG_STATIC_ASSERT(sizeof(*smem_a[stage_idx]) == 1 and
+                                 sizeof(*smem_b[stage_idx]) == 1 and
+                                 BLOCK_K % 16 == 0,
+                                 "FP4 descriptor offsets must use aligned bytes");
+#if defined(DG_MEGA_MOE_FP4_REUSE_GMMA_DESC) && DG_MEGA_MOE_FP4_REUSE_GMMA_DESC
+                const auto stage_a_desc = mma::sm90::make_smem_desc(
+                    smem_a[stage_idx], 1);
+                const auto stage_b_desc = mma::sm90::make_smem_desc(
+                    smem_b[stage_idx] + smem_b_wg_offset, 1);
+#endif
+                auto make_stage_a_desc = [&](uint32_t byte_offset) {
+#if defined(DG_MEGA_MOE_FP4_REUSE_GMMA_DESC) && DG_MEGA_MOE_FP4_REUSE_GMMA_DESC
+                    return cute::GmmaDescriptor(mma::sm90::advance_smem_desc_bits(
+                        stage_a_desc.desc_, byte_offset));
+#else
+                    return mma::sm90::make_smem_desc(
+                        smem_a[stage_idx] + byte_offset, 1);
+#endif
+                };
+                auto make_stage_b_desc = [&](uint32_t byte_offset) {
+#if defined(DG_MEGA_MOE_FP4_REUSE_GMMA_DESC) && DG_MEGA_MOE_FP4_REUSE_GMMA_DESC
+                    return cute::GmmaDescriptor(mma::sm90::advance_smem_desc_bits(
+                        stage_b_desc.desc_, byte_offset));
+#else
+                    return mma::sm90::make_smem_desc(
+                        smem_b[stage_idx] + smem_b_wg_offset + byte_offset, 1);
+#endif
+                };
+
                 if (block_phase == sched::BlockPhase::Linear1) {
                     if constexpr (kSwapABL1Active) {
                         // L1 swapAB: WGMMA-M is the 64-row weight slice owned by
@@ -4733,14 +4871,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 #pragma unroll
                                 for (uint32_t k = 0;
                                      k < BLOCK_K / SwapWGMMA::K; ++ k) {
-                                    auto desc_a = mma::sm90::make_smem_desc(
-                                        smem_b[stage_idx] + smem_b_wg_offset +
-                                            sub * 64 * BLOCK_K +
-                                            k * SwapWGMMA::K,
-                                        1);
-                                    auto desc_b = mma::sm90::make_smem_desc(
-                                        smem_a[stage_idx] + k * SwapWGMMA::K,
-                                        1);
+                                    auto desc_a = make_stage_b_desc(sub * 64 * BLOCK_K +
+                                            k * SwapWGMMA::K);
+                                    auto desc_b = make_stage_a_desc(k * SwapWGMMA::K);
                                     SwapWGMMA::wgmma(
                                         desc_a, desc_b, swap_accum, k);
                                 }
@@ -4814,14 +4947,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         #pragma unroll
                         for (uint32_t k = 0;
                              k < BLOCK_K / WGMMA::K; ++ k) {
-                            auto desc_a = mma::sm90::make_smem_desc(
-                                smem_a[stage_idx] + smem_a_wg_offset +
-                                    k * WGMMA::K,
-                                1);
-                            auto desc_b = mma::sm90::make_smem_desc(
-                                smem_b[stage_idx] + smem_b_wg_offset +
-                                    k * WGMMA::K,
-                                1);
+                            auto desc_a = make_stage_a_desc(smem_a_wg_offset +
+                                    k * WGMMA::K);
+                            auto desc_b = make_stage_b_desc(k * WGMMA::K);
                             WGMMA::wgmma(
                                 desc_a, desc_b, final_accum, true);
                         }
@@ -4846,12 +4974,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             ptx::warpgroup_arrive();
                             #pragma unroll
                             for (uint32_t k = 0; k < BLOCK_K / SSHalfWGMMA::K; ++ k) {
-                                auto desc_a = mma::sm90::make_smem_desc(
-                                    smem_a[stage_idx] + smem_a_wg_offset + k * SSHalfWGMMA::K, 1);
-                                auto desc_b = mma::sm90::make_smem_desc(
-                                    smem_b[stage_idx] + smem_b_wg_offset
-                                        + nh * (WG_BLOCK_N / 2) * BLOCK_K
-                                        + k * SSHalfWGMMA::K, 1);
+                                auto desc_a = make_stage_a_desc(smem_a_wg_offset + k * SSHalfWGMMA::K);
+                                auto desc_b = make_stage_b_desc(nh * (WG_BLOCK_N / 2) * BLOCK_K
+                                        + k * SSHalfWGMMA::K);
                                 SSHalfWGMMA::wgmma(desc_a, desc_b, accum, k);
                             }
                             ptx::warpgroup_commit_batch();
@@ -4877,10 +5002,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         ptx::warpgroup_arrive();
                         #pragma unroll
                         for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
-                            auto desc_a = mma::sm90::make_smem_desc(
-                                smem_a[stage_idx] + smem_a_wg_offset + k * WGMMA::K, 1);
-                            auto desc_b = mma::sm90::make_smem_desc(
-                                smem_b[stage_idx] + smem_b_wg_offset + k * WGMMA::K, 1);
+                            auto desc_a = make_stage_a_desc(smem_a_wg_offset + k * WGMMA::K);
+                            auto desc_b = make_stage_b_desc(k * WGMMA::K);
                             WGMMA::wgmma(desc_a, desc_b, accum, k);
                         }
                         ptx::warpgroup_commit_batch();
@@ -4986,14 +5109,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 #pragma unroll
                                 for (uint32_t k = 0;
                                      k < (BLOCK_K / 2) / SwapWGMMA::K; ++ k) {
-                                    auto desc_a = mma::sm90::make_smem_desc(
-                                        smem_b[stage_idx] + smem_b_wg_offset +
-                                            sub * 64 * BLOCK_K +
-                                            k * SwapWGMMA::K,
-                                        1);
-                                    auto desc_b = mma::sm90::make_smem_desc(
-                                        smem_a[stage_idx] + k * SwapWGMMA::K,
-                                        1);
+                                    auto desc_a = make_stage_b_desc(sub * 64 * BLOCK_K +
+                                            k * SwapWGMMA::K);
+                                    auto desc_b = make_stage_a_desc(k * SwapWGMMA::K);
                                     SwapWGMMA::wgmma(
                                         desc_a, desc_b, swap_accum, k);
                                 }
@@ -5013,12 +5131,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                      k < (BLOCK_K / 2) / SwapWGMMA::K; ++ k) {
                                     const uint32_t k_off =
                                         (BLOCK_K / 2) + k * SwapWGMMA::K;
-                                    auto desc_a = mma::sm90::make_smem_desc(
-                                        smem_b[stage_idx] + smem_b_wg_offset +
-                                            sub * 64 * BLOCK_K + k_off,
-                                        1);
-                                    auto desc_b = mma::sm90::make_smem_desc(
-                                        smem_a[stage_idx] + k_off, 1);
+                                    auto desc_a = make_stage_b_desc(sub * 64 * BLOCK_K + k_off);
+                                    auto desc_b = make_stage_a_desc(k_off);
                                     SwapWGMMA::wgmma(
                                         desc_a, desc_b, swap_accum, k);
                                 }
@@ -5051,14 +5165,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                         #pragma unroll
                         for (uint32_t k = 0;
                              k < (BLOCK_K / 2) / WGMMA::K; ++ k) {
-                            auto desc_a = mma::sm90::make_smem_desc(
-                                smem_a[stage_idx] + smem_a_wg_offset +
-                                    k * WGMMA::K,
-                                1);
-                            auto desc_b = mma::sm90::make_smem_desc(
-                                smem_b[stage_idx] + smem_b_wg_offset +
-                                    k * WGMMA::K,
-                                1);
+                            auto desc_a = make_stage_a_desc(smem_a_wg_offset +
+                                    k * WGMMA::K);
+                            auto desc_b = make_stage_b_desc(k * WGMMA::K);
                             WGMMA::wgmma(
                                 desc_a, desc_b, final_accum, true);
                         }
@@ -5080,12 +5189,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                              k < (BLOCK_K / 2) / WGMMA::K; ++ k) {
                             const uint32_t k_off =
                                 BLOCK_K / 2 + k * WGMMA::K;
-                            auto desc_a = mma::sm90::make_smem_desc(
-                                smem_a[stage_idx] + smem_a_wg_offset + k_off,
-                                1);
-                            auto desc_b = mma::sm90::make_smem_desc(
-                                smem_b[stage_idx] + smem_b_wg_offset + k_off,
-                                1);
+                            auto desc_a = make_stage_a_desc(smem_a_wg_offset + k_off);
+                            auto desc_b = make_stage_b_desc(k_off);
                             WGMMA::wgmma(
                                 desc_a, desc_b, final_accum, true);
                         }
@@ -5114,10 +5219,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             #pragma unroll
                             for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(accum[i]);
                             ptx::warpgroup_arrive();
-                            auto desc_a = mma::sm90::make_smem_desc(
-                                smem_a[stage_idx] + smem_a_wg_offset + k_off, 1);
-                            auto desc_b = mma::sm90::make_smem_desc(
-                                smem_b[stage_idx] + smem_b_wg_offset + k_off, 1);
+                            auto desc_a = make_stage_a_desc(smem_a_wg_offset + k_off);
+                            auto desc_b = make_stage_b_desc(k_off);
                             WGMMA::wgmma(desc_a, desc_b, accum, false);
                             ptx::warpgroup_commit_batch();
                             #pragma unroll
@@ -5152,10 +5255,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 ptx::warpgroup_arrive();
                                 #pragma unroll
                                 for (uint32_t k = 0; k < (BLOCK_K / 2) / SSHalfWGMMA::K; ++ k) {
-                                    auto desc_a = mma::sm90::make_smem_desc(
-                                        smem_a[stage_idx] + smem_a_wg_offset + k * SSHalfWGMMA::K, 1);
-                                    auto desc_b = mma::sm90::make_smem_desc(
-                                        smem_b[stage_idx] + smem_b_wg_offset + n_off + k * SSHalfWGMMA::K, 1);
+                                    auto desc_a = make_stage_a_desc(smem_a_wg_offset + k * SSHalfWGMMA::K);
+                                    auto desc_b = make_stage_b_desc(n_off + k * SSHalfWGMMA::K);
                                     SSHalfWGMMA::wgmma(desc_a, desc_b, accum, k);
                                 }
                                 ptx::warpgroup_commit_batch();
@@ -5179,10 +5280,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 #pragma unroll
                                 for (uint32_t k = 0; k < (BLOCK_K / 2) / SSHalfWGMMA::K; ++ k) {
                                     const uint32_t k_off = (BLOCK_K / 2) + k * SSHalfWGMMA::K;
-                                    auto desc_a = mma::sm90::make_smem_desc(
-                                        smem_a[stage_idx] + smem_a_wg_offset + k_off, 1);
-                                    auto desc_b = mma::sm90::make_smem_desc(
-                                        smem_b[stage_idx] + smem_b_wg_offset + n_off + k_off, 1);
+                                    auto desc_a = make_stage_a_desc(smem_a_wg_offset + k_off);
+                                    auto desc_b = make_stage_b_desc(n_off + k_off);
                                     SSHalfWGMMA::wgmma(desc_a, desc_b, accum, k);
                                 }
                                 ptx::warpgroup_commit_batch();
@@ -5211,10 +5310,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             ptx::warpgroup_arrive();
                             #pragma unroll
                             for (uint32_t k = 0; k < (BLOCK_K / 2) / WGMMA::K; ++ k) {
-                                auto desc_a = mma::sm90::make_smem_desc(
-                                    smem_a[stage_idx] + smem_a_wg_offset + k * WGMMA::K, 1);
-                                auto desc_b = mma::sm90::make_smem_desc(
-                                    smem_b[stage_idx] + smem_b_wg_offset + k * WGMMA::K, 1);
+                                auto desc_a = make_stage_a_desc(smem_a_wg_offset + k * WGMMA::K);
+                                auto desc_b = make_stage_b_desc(k * WGMMA::K);
                                 WGMMA::wgmma(desc_a, desc_b, accum, k);
                             }
                             ptx::warpgroup_commit_batch();
@@ -5238,10 +5335,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             #pragma unroll
                             for (uint32_t k = 0; k < (BLOCK_K / 2) / WGMMA::K; ++ k) {
                                 const uint32_t k_off = (BLOCK_K / 2) + k * WGMMA::K;
-                                auto desc_a = mma::sm90::make_smem_desc(
-                                    smem_a[stage_idx] + smem_a_wg_offset + k_off, 1);
-                                auto desc_b = mma::sm90::make_smem_desc(
-                                    smem_b[stage_idx] + smem_b_wg_offset + k_off, 1);
+                                auto desc_a = make_stage_a_desc(smem_a_wg_offset + k_off);
+                                auto desc_b = make_stage_b_desc(k_off);
                                 WGMMA::wgmma(desc_a, desc_b, accum, k);
                             }
                             ptx::warpgroup_commit_batch();

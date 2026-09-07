@@ -434,6 +434,17 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         num_compute_ring_tokens < 0 ? num_max_pool_tokens :
             std::min(num_max_pool_tokens, num_compute_ring_tokens),
         num_max_tokens_per_rank, num_ranks);
+    const int experts_per_wave_override =
+        get_env<int>("DG_MEGA_MOE_FP4_EXPERTS_PER_WAVE", 0);
+    DG_HOST_ASSERT(experts_per_wave_override >= 0);
+    if (experts_per_wave_override > 0) {
+        // Isolate wave scheduling from CTA budget during small-batch A/B.
+        // Full-pool storage avoids bypassing the compute-ring lifetime bound.
+        DG_HOST_ASSERT(num_compute_ring_tokens < 0 or
+                       num_compute_ring_tokens >= num_max_pool_tokens);
+        DG_HOST_ASSERT(experts_per_wave_override <= num_experts_per_rank);
+        num_experts_per_wave = experts_per_wave_override;
+    }
     const bool fp4_small_block_n_kernel =
         block_m == 64 and block_n == 128;
     const bool fp4_split_n_decode_thread_kernel_band =
