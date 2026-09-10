@@ -403,22 +403,11 @@ struct SM90Workspace {
 
     CUTLASS_HOST_DEVICE
     uint64_t get_gateway_packed_manifest_offset_bytes() const {
+        // Readiness must never overlap token bytes from ANY use of this
+        // parity slot, not merely the current (possibly smaller) payload.
         return math::align<uint64_t>(
             get_gateway_packed_payload_offset_bytes() +
                 get_gateway_max_packed_entries() * sizeof(uint32_t),
-            16);
-    }
-
-    // Dense wire-format manifest follows the LIVE payload rather than the
-    // maximum-capacity payload.  It therefore remains the publish marker
-    // while fitting in one contiguous RDMA WRITE.  Sparse shapes retain the
-    // fixed-address accessor above to avoid a receiver-side header dependency.
-    CUTLASS_HOST_DEVICE
-    uint64_t get_gateway_packed_compact_manifest_offset_bytes(
-        const uint64_t& total_entries) const {
-        return math::align<uint64_t>(
-            get_gateway_packed_payload_offset_bytes() +
-                total_entries * sizeof(uint32_t),
             16);
     }
 
@@ -476,6 +465,9 @@ struct SM90Workspace {
         // staging.  Payload rows live outside the workspace; this compact
         // control plane is always present so host sizing and FP8/FP4 kernel
         // slicing remain identical across protocol A/B variants.
+        // Token metadata only guarantees 8-byte alignment. Ring initialization
+        // may vectorize stores to these alignas(16) control/segment objects.
+        num_bytes = math::align<uint64_t>(num_bytes, alignof(SM90CombineRingControl));
         num_bytes += sizeof(SM90CombineRingControl);
         num_bytes += num_experts_per_rank * sizeof(SM90CombineRingSegment);
         num_bytes += math::align<uint64_t>(
@@ -656,8 +648,9 @@ struct SM90Workspace {
 
     CUTLASS_DEVICE
     SM90CombineRingControl* get_combine_ring_control_ptr() const {
-        return reinterpret_cast<SM90CombineRingControl*>(
-            get_token_src_metadata_ptr(num_max_pool_tokens));
+        return reinterpret_cast<SM90CombineRingControl*>(math::align<uint64_t>(
+            reinterpret_cast<uint64_t>(get_token_src_metadata_ptr(num_max_pool_tokens)),
+            alignof(SM90CombineRingControl)));
     }
 
     CUTLASS_DEVICE
@@ -847,19 +840,6 @@ struct SM90Workspace {
             : get_gateway_packed_send_slot_ptr(rel_node, epoch_slot);
         return reinterpret_cast<uint64_t*>(
             slot + get_gateway_packed_manifest_offset_bytes()) + cell_idx;
-    }
-
-    CUTLASS_DEVICE
-    uint64_t* get_gateway_packed_compact_manifest_ptr(
-        const bool& landing, const uint32_t& rel_node,
-        const uint32_t& epoch_slot, const uint64_t& total_entries,
-        const uint32_t& cell_idx = 0) const {
-        auto slot = landing
-            ? get_gateway_packed_landing_slot_ptr(rel_node, epoch_slot)
-            : get_gateway_packed_send_slot_ptr(rel_node, epoch_slot);
-        return reinterpret_cast<uint64_t*>(
-            slot + get_gateway_packed_compact_manifest_offset_bytes(
-                       total_entries)) + cell_idx;
     }
 
     CUTLASS_DEVICE

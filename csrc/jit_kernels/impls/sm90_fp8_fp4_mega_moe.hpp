@@ -14,15 +14,11 @@
 
 namespace deep_gemm {
 
-// Keep the original capacity policy by default. The opt-in override compares
-// packed metadata at the same buffer capacity and compute configuration.
+// Small requested capacities use dense metadata; larger capacities retain
+// the packed protocol. Storage alignment must not change this boundary.
 static int get_sm90_fp4_dispatch_gateway(const int& requested_capacity) {
-    const int force_packed = get_env<int>(
-        "DG_MEGA_MOE_FP4_FORCE_PACKED_DISPATCH", 0);
     DG_HOST_ASSERT(requested_capacity > 0);
-    DG_HOST_ASSERT(force_packed == 0 or force_packed == 1);
-    return force_packed != 0 or
-           requested_capacity > layout::kGatewayDenseMaxRequestedTokens ? 3 : 4;
+    return requested_capacity > layout::kGatewayDenseMaxRequestedTokens ? 3 : 4;
 }
 
 // ============================================================================
@@ -82,9 +78,6 @@ public:
         // Replace the FP4 decode rendezvous sync with a per-stage
         // mbarrier so assist warps can run ahead after publishing a decoded tile.
         bool use_decode_done_mbarrier;
-        // Mirror the FP8 split-MN arrival-counter path for FP4 L1->L2
-        // readiness, avoiding the bitmask update's CTA-wide epilogue sync.
-        bool use_l2_arrival_counter;
         // Split each SS N=128 WGMMA into two N=64 WGMMAs so the
         // per-K-block accumulator is 32 floats instead of 64. Large-token SS
         // shapes enable this to reduce accumulator pressure while keeping SS
@@ -94,6 +87,7 @@ public:
         bool use_swap_ab;
         bool use_swap_ab_fast_amax;
         bool sfb_n_contiguous;
+        bool use_activation_row_buckets;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -113,6 +107,10 @@ public:
         CUtensorMap tensor_map_l2_acts_sf;
         CUtensorMap tensor_map_l2_weights;
         const uint32_t* l2_weights_sf;
+        // Optional M64/swap-AB input boxes: 8, 16, and 32 token rows.
+        // Append these to the kernel ABI only for the enabled specialization.
+        CUtensorMap tensor_map_l1_act_rows[3];
+        CUtensorMap tensor_map_l2_act_rows[3];
 
         // Launch configs
         LaunchArgs launch_args;
@@ -143,8 +141,99 @@ public:
             internode_prefix += "#define DG_MEGA_MOE_FP4_PAIRED_PRMT 1\n";
         if (get_env<int>("DG_MEGA_MOE_FP4_PACKED_GMMA_DESC", 0) != 0)
             internode_prefix += "#define DG_MEGA_MOE_FP4_PACKED_GMMA_DESC 1\n";
-        if (get_env<int>("DG_MEGA_MOE_FP4_REUSE_GMMA_DESC", 0) != 0)
-            internode_prefix += "#define DG_MEGA_MOE_FP4_REUSE_GMMA_DESC 1\n";
+        if (get_env<int>("DG_MEGA_MOE_FP4_ROW_PARALLEL_QUANT", 0) != 0)
+            internode_prefix += "#define DG_MEGA_MOE_FP4_ROW_PARALLEL_QUANT 1\n";
+        if (use_sm90_fp4_n64_decode_ready(
+                args.config.block_m, args.config.block_n,
+                args.config.num_epilogue_threads / 128,
+                args.use_swap_ab, args.use_decode_done_mbarrier)) {
+            DG_HOST_ASSERT(args.num_math_wg_decode_warps == 0 and
+                           not args.math_wg_participates_in_fp4_decode);
+            const int helper_warps = args.config.num_non_epilogue_threads / 32 -
+                                     args.first_fp4_decode_assist_warp;
+            DG_HOST_ASSERT(helper_warps > 0 and helper_warps % 2 == 0);
+            internode_prefix += "#define DG_MEGA_MOE_FP4_N64_DECODE_READY 1\n";
+            const int skip_math_b_input_wait = get_env<int>(
+                "DG_MEGA_MOE_FP4_SKIP_MATH_B_INPUT_WAIT", 0);
+            DG_HOST_ASSERT(skip_math_b_input_wait == 0 or skip_math_b_input_wait == 1);
+            if (skip_math_b_input_wait != 0 and args.use_early_b_decode)
+                internode_prefix +=
+                    "#define DG_MEGA_MOE_FP4_SKIP_MATH_B_INPUT_WAIT 1\n";
+            const int full_unroll = get_env<int>(
+                "DG_MEGA_MOE_FP4_DECODE_FULL_UNROLL", 0);
+            DG_HOST_ASSERT(full_unroll == 0 or full_unroll == 1);
+            // Four helper warps split into two 64-thread groups. Each
+            // thread decodes four K32 groups in the N64 half. The 512-thread
+            // CTA was validated for this unroll; eight-helper CTAs already
+            // expand their two iterations and should keep the original codegen.
+            const int cta_threads = args.config.num_dispatch_threads +
+                                    args.config.num_non_epilogue_threads +
+                                    args.config.num_epilogue_threads;
+            const int balanced_registers = get_env<int>(
+                "DG_MEGA_MOE_FP4_BALANCED_WG_REGISTERS", 0);
+            DG_HOST_ASSERT(balanced_registers == 0 or balanced_registers == 1);
+            if (balanced_registers != 0 and args.num_ranks > kNvlPeers and
+                args.config.block_m == 64 and args.config.block_n == 128 and
+                args.config.block_k == 128 and args.config.num_dispatch_threads == 64 and
+                args.config.num_epilogue_threads == 256 and
+                args.first_fp4_decode_assist_warp == 2 and
+                ((helper_warps == 4 and cta_threads == 512) or
+                 (helper_warps == 8 and cta_threads == 640))) {
+                internode_prefix +=
+                    "#define DG_MEGA_MOE_FP4_BALANCED_WG_REGISTERS 1\n";
+                const int decode_register_boost = get_env<int>(
+                    "DG_MEGA_MOE_FP4_DECODE_REGISTER_BOOST", 0);
+                DG_HOST_ASSERT(decode_register_boost == 0 or decode_register_boost == 1);
+                const int decode_registers = decode_register_boost == 0 ? 40 :
+                    (cta_threads == 640 ? 48 : 64);
+                internode_prefix += fmt::format(
+                    "#define DG_MEGA_MOE_FP4_BALANCED_WG_DECODE_REGISTERS {}\n",
+                    decode_registers);
+                const int eight_math_registers = get_env<int>(
+                    "DG_MEGA_MOE_FP4_EIGHT_MATH_REGISTERS", 0);
+                DG_HOST_ASSERT(eight_math_registers >= 0 and eight_math_registers <= 2);
+                const float math_expected_rows_per_expert =
+                    static_cast<float>(args.num_tokens) * args.num_topk /
+                    (args.num_experts / args.num_ranks);
+                // Mode 1 is the original forced A/B. Mode 2 pairs with the
+                // density helper policy and changes only its higher-density
+                // M64 profile; low density keeps the original 128 math quota.
+                const bool use_eight_math_registers = eight_math_registers == 1 or
+                    (eight_math_registers == 2 and math_expected_rows_per_expert >= 32.0f);
+                if (use_eight_math_registers) {
+                    DG_HOST_ASSERT(cta_threads == 640 and helper_warps == 8 and
+                                   decode_register_boost == 1);
+                    internode_prefix +=
+                        "#define DG_MEGA_MOE_FP4_EIGHT_MATH_REGISTERS 1\n";
+                }
+            }
+            const bool unroll_four_groups = helper_warps == 4 and cta_threads == 512;
+            if (full_unroll != 0 and unroll_four_groups)
+                internode_prefix += "#define DG_MEGA_MOE_FP4_DECODE_FULL_UNROLL 1\n";
+            const int sfb_lookahead = get_env<int>(
+                "DG_MEGA_MOE_FP4_SFB_SHARED_LOOKAHEAD", 0);
+            DG_HOST_ASSERT(sfb_lookahead >= 0 and sfb_lookahead <= 2);
+            // Current ready-stage reads only: four K32 groups per helper.
+            // Keep every other topology on the original decode implementation.
+            if (sfb_lookahead != 0 and full_unroll != 0 and
+                unroll_four_groups and args.use_wide_load_decode and
+                args.config.block_k == 128) {
+                DG_HOST_ASSERT(get_env<int>(
+                    "DG_MEGA_MOE_FP4_SFB_BROADCAST_OVERRIDE", -1) == 0);
+                internode_prefix +=
+                    "#define DG_MEGA_MOE_FP4_SFB_SHARED_LOOKAHEAD 1\n";
+            } else if (sfb_lookahead == 2 and helper_warps == 8 and
+                       cta_threads == 640 and args.use_wide_load_decode and
+                       args.config.block_k == 128) {
+                // Mode 2 additionally covers two K32 groups per helper.
+                // Do not emit FULL_UNROLL for this topology: its original
+                // two-iteration loop is already expanded by the compiler.
+                DG_HOST_ASSERT(get_env<int>(
+                    "DG_MEGA_MOE_FP4_SFB_BROADCAST_OVERRIDE", -1) == 0);
+                internode_prefix +=
+                    "#define DG_MEGA_MOE_FP4_SFB_SHARED_LOOKAHEAD_8W 1\n";
+            }
+        }
         if (args.num_ranks > kNvlPeers) {
             internode_prefix += fmt::format(
                 "// inter-node mega-moe: uses nvshmem device functions\n"
@@ -212,77 +301,20 @@ public:
                 publisher_backoff_mode == 2 or
                 (publisher_backoff_mode == 0 and
                  auto_publisher_idle_backoff);
-            const int use_publish_row_mask = get_env<int>(
-                "DG_MEGA_MOE_FP4_PUBLISH_ROW_MASK", 0);
-            DG_HOST_ASSERT(
-                use_publish_row_mask == 0 or use_publish_row_mask == 1);
-            if (use_publish_row_mask != 0)
-                internode_prefix +=
-                    "#define DG_MEGA_MOE_FP4_PUBLISH_ROW_MASK 1\n";
             if (use_publisher_idle_backoff) {
                 const int publisher_backoff_initial_ns = get_env<int>(
                     "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS", 64);
                 const int publisher_backoff_max_ns = get_env<int>(
                     "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_MAX_NS", 512);
-                const int publisher_few_pending_chains = get_env<int>(
-                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_FEW_PENDING_CHAINS", 0);
-                const int publisher_few_pending_max_ns = get_env<int>(
-                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_FEW_PENDING_MAX_NS",
-                    publisher_backoff_max_ns);
-                const int publisher_long_idle_threshold = get_env<int>(
-                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_THRESHOLD", 0);
-                const int publisher_long_idle_max_ns = get_env<int>(
-                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_MAX_NS",
-                    publisher_backoff_max_ns);
-                const int publisher_progress_block_budget = get_env<int>(
-                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_PROGRESS_BLOCK_BUDGET", 0);
-                const int publisher_progress_yield_ns = get_env<int>(
-                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_PROGRESS_YIELD_NS", 64);
                 DG_HOST_ASSERT(publisher_backoff_initial_ns > 0 and
                                publisher_backoff_max_ns >=
                                    publisher_backoff_initial_ns and
-                               publisher_backoff_max_ns <= 1000000 and
-                               publisher_few_pending_chains >= 0 and
-                               publisher_few_pending_chains <= 32 and
-                               publisher_few_pending_max_ns >=
-                                   publisher_backoff_initial_ns and
-                               publisher_few_pending_max_ns <= 1000000 and
-                               publisher_long_idle_threshold >= 0 and
-                               publisher_long_idle_threshold <= 1000000 and
-                               publisher_long_idle_max_ns >=
-                                   publisher_backoff_max_ns and
-                               publisher_long_idle_max_ns <= 1000000 and
-                               publisher_progress_block_budget >= 0 and
-                               publisher_progress_block_budget <= 1024 and
-                               publisher_progress_yield_ns > 0 and
-                               publisher_progress_yield_ns <= 1000000);
+                               publisher_backoff_max_ns <= 1000000);
                 internode_prefix += fmt::format(
-                    "#define "
-                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS {}\n"
-                    "#define "
-                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_MAX_NS {}\n"
-                    "#define "
-                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_FEW_PENDING_CHAINS {}\n"
-                    "#define "
-                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_FEW_PENDING_MAX_NS {}\n"
-                    "#define "
-                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_THRESHOLD {}\n"
-                    "#define "
-                    "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_MAX_NS {}\n",
+                    "#define DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS {}\n"
+                    "#define DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_MAX_NS {}\n",
                     publisher_backoff_initial_ns,
-                    publisher_backoff_max_ns,
-                    publisher_few_pending_chains,
-                    publisher_few_pending_max_ns,
-                    publisher_long_idle_threshold,
-                    publisher_long_idle_max_ns);
-                if (publisher_progress_block_budget > 0)
-                    internode_prefix += fmt::format(
-                        "#define "
-                        "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_PROGRESS_BLOCK_BUDGET {}\n"
-                        "#define "
-                        "DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_PROGRESS_YIELD_NS {}\n",
-                        publisher_progress_block_budget,
-                        publisher_progress_yield_ns);
+                    publisher_backoff_max_ns);
             }
             // Four neighboring decode lanes consume the four K groups of
             // one N row and share its packed SFB word.  At middle density the
@@ -397,6 +429,9 @@ public:
             internode_prefix += "#define DG_MEGA_MOE_L1_RING_ACTIVE 1\n";
         if (l2_ring_active)
             internode_prefix += "#define DG_MEGA_MOE_L2_RING_ACTIVE 1\n";
+        if (args.use_activation_row_buckets)
+            internode_prefix +=
+                "#define DG_MEGA_MOE_FP4_ACTIVATION_ROW_TMA 1\n";
         return internode_prefix + fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_fp4_mega_moe.cuh>
 
@@ -416,7 +451,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {}, {}, {},
-        {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}
     >);
 }};
 )",
@@ -446,13 +481,36 @@ static void __instantiate_kernel() {{
     args.first_fp4_decode_assist_warp,
     args.use_early_b_decode ? "true" : "false",
     args.use_decode_done_mbarrier ? "true" : "false",
-    args.use_l2_arrival_counter ? "true" : "false",
     args.use_ss_nsplit ? "true" : "false",
     args.use_swap_ab ? "true" : "false",
     args.use_swap_ab_fast_amax ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        if (args.use_activation_row_buckets) {
+            DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+                args.y,
+                args.cumulative_local_expert_recv_stats,
+                args.num_tokens,
+                args.sym_buffer_ptrs,
+                args.tensor_map_l1_acts,
+                args.tensor_map_l1_acts_sf,
+                args.tensor_map_l1_weights,
+                args.l1_weights_sf,
+                args.tensor_map_l1_output,
+                args.tensor_map_l2_acts,
+                args.tensor_map_l2_acts_sf,
+                args.tensor_map_l2_weights,
+                args.l2_weights_sf,
+                args.tensor_map_l1_act_rows[0],
+                args.tensor_map_l1_act_rows[1],
+                args.tensor_map_l1_act_rows[2],
+                args.tensor_map_l2_act_rows[0],
+                args.tensor_map_l2_act_rows[1],
+                args.tensor_map_l2_act_rows[2]
+            ));
+            return;
+        }
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.y,
             args.cumulative_local_expert_recv_stats,
@@ -493,7 +551,6 @@ static void sm90_fp8_fp4_mega_moe(
     const bool& use_wide_load_decode = false,
     const bool& use_early_b_decode = false,
     const bool& use_decode_done_mbarrier = false,
-    const bool& use_l2_arrival_counter = false,
     const bool& use_ss_nsplit = false,
     const bool& use_swap_ab = false,
     const bool& use_swap_ab_fast_amax = false
@@ -613,6 +670,34 @@ static void sm90_fp8_fp4_mega_moe(
         config.swizzle_weights_mode, /*swizzle_base=*/0,
         /*allow_tf32=*/false);
 
+    // Only swap-AB gives the math instruction a runtime token-row extent.
+    // The conventional M128 path must retain its full activation tile.
+    const int activation_row_tma = get_env<int>(
+        "DG_MEGA_MOE_FP4_ACTIVATION_ROW_TMA", 0);
+    DG_HOST_ASSERT(activation_row_tma == 0 or activation_row_tma == 1);
+    const bool use_activation_row_buckets = activation_row_tma != 0 and
+        use_swap_ab and not use_ss_nsplit and config.block_m == 64 and
+        (config.block_n == 128 or config.block_n == 256) and
+        config.num_epilogue_threads == 256 and config.block_k == 128 and
+        config.swizzle_acts_mode == 128 and config.cluster_size == 1;
+    CUtensorMap tensor_map_l1_act_rows[3] = {};
+    CUtensorMap tensor_map_l2_act_rows[3] = {};
+    if (use_activation_row_buckets) {
+        for (int i = 0; i < 3; ++i) {
+            const int rows = 8 << i;
+            tensor_map_l1_act_rows[i] = make_tma_2d_desc(
+                l1_acts, hidden, num_l1_ring_tokens,
+                config.block_k, rows,
+                static_cast<int>(l1_acts.stride(-2)),
+                config.swizzle_acts_mode);
+            tensor_map_l2_act_rows[i] = make_tma_2d_desc(
+                l2_acts, intermediate_hidden, num_l2_storage_tokens,
+                config.block_k, rows,
+                static_cast<int>(l2_acts.stride(-2)),
+                config.swizzle_acts_mode);
+        }
+    }
+
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
     if (cumulative_local_expert_recv_stats.has_value())
@@ -638,11 +723,11 @@ static void sm90_fp8_fp4_mega_moe(
         .first_fp4_decode_assist_warp = first_fp4_decode_assist_warp,
         .use_early_b_decode = use_early_b_decode,
         .use_decode_done_mbarrier = use_decode_done_mbarrier,
-        .use_l2_arrival_counter = use_l2_arrival_counter,
         .use_ss_nsplit = use_ss_nsplit,
         .use_swap_ab = use_swap_ab,
         .use_swap_ab_fast_amax = use_swap_ab_fast_amax,
         .sfb_n_contiguous = not l1_weights_sf.is_contiguous() or not l2_weights_sf.is_contiguous(),
+        .use_activation_row_buckets = use_activation_row_buckets,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -657,6 +742,12 @@ static void sm90_fp8_fp4_mega_moe(
         .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
         .tensor_map_l2_weights = tensor_map_l2_weights,
         .l2_weights_sf = reinterpret_cast<const uint32_t*>(l2_weights_sf.data_ptr()),
+        .tensor_map_l1_act_rows = {tensor_map_l1_act_rows[0],
+                                   tensor_map_l1_act_rows[1],
+                                   tensor_map_l1_act_rows[2]},
+        .tensor_map_l2_act_rows = {tensor_map_l2_act_rows[0],
+                                   tensor_map_l2_act_rows[1],
+                                   tensor_map_l2_act_rows[2]},
         .launch_args = LaunchArgs(num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, config.cluster_size)
     };

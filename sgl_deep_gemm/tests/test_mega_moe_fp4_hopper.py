@@ -501,17 +501,12 @@ def legacy_api_features(
         or fp4_bigband_lookahead_band
         or fp4_2wg_decode_offload_band
     )
-    default_l2_arrival_counter = (
-        (intermediate_hidden <= 2048 and 0.375 <= e < 0.75)
-        or (intermediate_hidden >= 3072 and 0.25 <= e < 0.375)
-    )
     return {
         "math_wg_participates": not default_math_wg_decode,
         "first_decode_assist_warp": 2 if default_skip_loader_decode_assist else 0,
         "wide_load_decode": default_wide_load_decode,
         "early_b_decode": default_ss_early_b_decode,
         "decode_done_mbarrier": default_decode_done_mbarrier,
-        "l2_arrival_counter": default_l2_arrival_counter,
         "ss_nsplit": e >= 64.0,
         "swap_ab": (intermediate_hidden <= 2048 or intermediate_hidden >= 3072) and 0.0 < e <= 24.0,
         "swap_ab_fast_amax": intermediate_hidden >= 3072 and 12.0 <= e <= 24.0,
@@ -589,17 +584,12 @@ def table_api_features(
         or (fp4_middle_shape and fp4_bigband_lookahead_shape_band)
         or fp4_2wg_decode_offload_shape_band
     )
-    default_l2_arrival_counter = (
-        (fp4_flash_shape and 0.375 <= e < 0.75)
-        or (fp4_pro_shape and 0.25 <= e < 0.375)
-    )
     return {
         "math_wg_participates": not default_math_wg_decode,
         "first_decode_assist_warp": 2 if default_skip_loader_decode_assist else 0,
         "wide_load_decode": default_wide_load_decode,
         "early_b_decode": default_ss_early_b_decode,
         "decode_done_mbarrier": default_decode_done_mbarrier,
-        "l2_arrival_counter": default_l2_arrival_counter,
         "ss_nsplit": e >= 64.0,
         "swap_ab": (fp4_flash_shape or fp4_pro_shape) and 0.0 < e <= 24.0,
         "swap_ab_fast_amax": fp4_pro_shape and 12.0 <= e <= 24.0,

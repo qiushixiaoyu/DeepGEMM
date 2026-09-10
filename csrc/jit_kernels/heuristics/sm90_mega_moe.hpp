@@ -145,11 +145,21 @@ static bool should_use_swap_ab_for_mega_moe_sm90(
     const int64_t weight_elems =
         static_cast<int64_t>(hidden) * intermediate_hidden;
     const bool weight_light = weight_elems < kSwapAbMaxWeightElems;
+    const int hybrid_max_rows = get_env<int>("DG_MEGA_MOE_FP8_HYBRID_MAX_ROWS", 0);
+    DG_HOST_ASSERT(hybrid_max_rows == 0 or hybrid_max_rows == 32);
+    // Allocate the existing swap staging for both block-level alternatives.
+    // Confine this opt-in to the light-weight non-swap M64 density band.
+    if (hybrid_max_rows and weight_light and decode_split_n_path and
+        expected_tokens_per_expert > 16.0f and expected_tokens_per_expert <= 64.0f and
+        hidden % 256 == 0 and (2 * intermediate_hidden) % 256 == 0)
+        return true;
     constexpr float kSwapAbMaxTokensPerExpert = 16.0f;
     const bool light_weight_decode =
         weight_light and expected_tokens_per_expert > 0.0f and
         expected_tokens_per_expert <= kSwapAbMaxTokensPerExpert;
-    constexpr float kStreamingSwapAbMaxTokensPerExpert = 24.0f;
+    const int streaming_density32 = get_env<int>("DG_MEGA_MOE_FP8_STREAMING_DENSITY32", 0);
+    DG_HOST_ASSERT(streaming_density32 == 0 or streaming_density32 == 1);
+    const float kStreamingSwapAbMaxTokensPerExpert = streaming_density32 ? 32.0f : 24.0f;
     const bool weight_streaming_decode =
         not weight_light and
         expected_tokens_per_expert > 0.0f and
@@ -307,6 +317,18 @@ static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
     return std::min(best_wave, max_ring_safe_experts);
 }
 
+// Experimental per-WG weight readiness. Shared-memory accounting and JIT
+// emission must use this exact predicate; split-M consumes the whole N tile.
+static bool use_sm90_fp4_n64_decode_ready(
+    int block_m, int block_n, int num_epilogue_warpgroups,
+    bool use_swap_ab, bool use_decode_done_mbarrier) {
+    const int enabled = get_env<int>("DG_MEGA_MOE_FP4_N64_DECODE_READY", 0);
+    DG_HOST_ASSERT(enabled == 0 or enabled == 1);
+    return enabled != 0 and block_m == 64 and block_n == 128 and
+           num_epilogue_warpgroups == 2 and use_swap_ab and
+           use_decode_done_mbarrier;
+}
+
 static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
     const int& smem_capacity,
     const int& num_experts, const int& hidden,
@@ -368,8 +390,11 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
 
     const int smem_barriers_fixed = (num_dispatch_warps + 2 * num_epilogue_warps) * 8;
     const int smem_decode_full_per_stage = use_early_b_decode ? 8 : 0;
+    const int decode_ready_groups = use_sm90_fp4_n64_decode_ready(
+        block_m, block_n, num_epilogue_warpgroups,
+        use_swap_ab, use_decode_done_mbarrier) ? 2 : 1;
     const int smem_decode_done_per_stage =
-        use_decode_done_mbarrier ? 8 : 0;
+        use_decode_done_mbarrier ? 8 * decode_ready_groups : 0;
     const int smem_barriers_per_stage =
         2 * 8 + smem_decode_full_per_stage + smem_decode_done_per_stage;
     const int smem_fixed =
@@ -470,10 +495,39 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const bool fp4_middle_density_decode_assist_kernel_band =
         fp4_split_n_decode_thread_kernel_band and
         expected_tokens_per_expert >= 6.0f;
-    const int num_non_epilogue_threads =
+    int num_non_epilogue_threads =
         fp4_split_n_decode_thread_kernel_band ?
             (fp4_middle_density_decode_assist_kernel_band ? 192 : 320) :
         (fp4_decode_assist_thread_kernel_band ? 192 : 128);
+    // Experimental topology A/B under the WG-uniform full-LTO register
+    // profile. Reuse the existing eight-helper implementation, without
+    // changing tile/stage, protocol, or the M128 path.
+    const int eight_helpers = get_env<int>("DG_MEGA_MOE_FP4_EIGHT_HELPERS", 0);
+    DG_HOST_ASSERT(eight_helpers >= 0 and eight_helpers <= 2);
+    const int eight_math_registers = get_env<int>(
+        "DG_MEGA_MOE_FP4_EIGHT_MATH_REGISTERS", 0);
+    DG_HOST_ASSERT(eight_math_registers >= 0 and eight_math_registers <= 2);
+    // Helper mode 2 keeps four helpers at higher density unless the paired
+    // density-register policy is selected. That policy retains the original
+    // low-density quotas and gives higher-density eight-helper math WGs 144
+    // registers. It is opt-in pending broader EP/shape/skew validation.
+    // Neither the threshold nor selection depends on a model or exact batch.
+    if (eight_math_registers == 2)
+        DG_HOST_ASSERT(eight_helpers == 2);
+    const bool extend_eight_helpers = eight_helpers == 1 or
+        (eight_helpers == 2 and
+         (expected_tokens_per_expert < 32.0f or eight_math_registers == 2));
+    if (extend_eight_helpers and num_ranks > 8 and
+        block_m == 64 and block_n == 128 and block_k == 128 and
+        num_dispatch_threads == 64 and num_non_epilogue_threads == 192 and
+        fp4_num_epilogue_threads == 256) {
+        DG_HOST_ASSERT(use_sm90_fp4_n64_decode_ready(
+            block_m, block_n, fp4_num_epilogue_warpgroups,
+            use_swap_ab, use_decode_done_mbarrier));
+        DG_HOST_ASSERT(get_env<int>("DG_MEGA_MOE_FP4_BALANCED_WG_REGISTERS", 0) == 1);
+        DG_HOST_ASSERT(get_env<int>("DG_MEGA_MOE_FP4_DECODE_REGISTER_BOOST", 0) == 1);
+        num_non_epilogue_threads = 320;
+    }
     DG_HOST_ASSERT(num_non_epilogue_threads >= 128 and
                    num_non_epilogue_threads % 64 == 0);
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);

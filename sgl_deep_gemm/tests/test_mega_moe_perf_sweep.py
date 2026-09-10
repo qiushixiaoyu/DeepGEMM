@@ -6,16 +6,82 @@ weight construction/quantization and process-group startup at every point.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import random
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 
 import test_mega_moe_hopper as base
 import test_mega_moe_fp4_hopper as fp4_base
+
+
+def _tensor_digest(*tensors):
+    digest = hashlib.sha256()
+    for tensor in tensors:
+        digest.update(str((tuple(tensor.shape), str(tensor.dtype))).encode())
+        digest.update(tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _bench_fused_kineto(*args, **kwargs):
+    pending = []
+    if os.environ.get("FP8_TRANSFER_STREAM_ALIGNMENT", "0") == "1":
+        assert kwargs.get("barrier") is not None
+        def stream_barrier():
+            work = dist.barrier(async_op=True)
+            work.block_current_stream()
+            pending.append(work)
+        kwargs["barrier"] = stream_barrier
+    try:
+        seconds = base.bench_kineto(*args, **kwargs)
+    finally:
+        torch.cuda.synchronize()
+        for work in pending:
+            work.wait()
+    trace_path = kwargs.get("trace_path")
+    if trace_path:
+        # Preserve the existing launch/alignment protocol but avoid rounded
+        # profiler-table values. Retain every target-kernel sample and trace.
+        trace = json.loads(Path(trace_path).read_text())
+        samples = [float(e["dur"]) for e in trace["traceEvents"]
+                   if e.get("cat") == "kernel" and e.get("ph") == "X"
+                   and base.SM90_KERNEL_NAME in e.get("name", "")]
+        assert len(samples) == kwargs["num_tests"], (trace_path, len(samples))
+        assert all(math.isfinite(v) and v > 0 for v in samples)
+        Path(trace_path + ".samples.json").write_text(json.dumps(samples))
+        seconds = sum(samples) / len(samples) / 1e6
+    return seconds
+
+
+def _bench_deep_ep_events(fn, *, num_warmup, num_repeat, l2_flush_gb):
+    sample_dir = os.environ.get("FP8_TRANSFER_EVENT_DIR")
+    if not sample_dir:
+        return base._bench_cuda_events(fn, num_warmup, num_repeat, l2_flush_gb)
+    assert l2_flush_gb == 0, "This experiment records warm steady-state samples"
+    for _ in range(num_warmup):
+        fn()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(num_repeat):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn()
+        end.record()
+        end.synchronize()
+        times.append(start.elapsed_time(end) * 1e3)
+    directory = Path(sample_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    call = getattr(_bench_deep_ep_events, "call", 0)
+    _bench_deep_ep_events.call = call + 1
+    path = directory / f"call{call}_rank{dist.get_rank()}.json"
+    assert not path.exists()
+    path.write_text(json.dumps(times))
+    return sorted(times)[len(times) // 2] / 1e6
 
 
 def _deep_ep_expected_rows(batch: int, capacity: int, world_size: int,
@@ -340,7 +406,6 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         f"sfb_tma={os.environ.get('DG_MEGA_MOE_FP4_SFB_TMA', '0')} "
         f"paired_prmt={os.environ.get('DG_MEGA_MOE_FP4_PAIRED_PRMT', '0')} "
         f"packed_gmma_desc={os.environ.get('DG_MEGA_MOE_FP4_PACKED_GMMA_DESC', '0')} "
-        f"reuse_gmma_desc={os.environ.get('DG_MEGA_MOE_FP4_REUSE_GMMA_DESC', '0')} "
         f"mega_num_sms={base.deep_gemm.get_num_sms()} "
         f"experts_per_wave_override={os.environ.get('DG_MEGA_MOE_FP4_EXPERTS_PER_WAVE', '0')} "
         f"mega_timing={args.mega_timing} deep_ep_timing={args.deep_ep_timing} "
@@ -349,7 +414,12 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         f"deep_ep_phase_profile={int(args.deep_ep_phase_profile)} "
         f"normal_impl={'legacy_scatter_gather' if args.mode == 'normal' else 'n/a'} "
         f"row_combine={int(args.row_combine)} "
-        f"force_packed_dispatch={os.environ.get('DG_MEGA_MOE_FP4_FORCE_PACKED_DISPATCH', '0')} "
+        f"fp8_packed_gmma_desc={os.environ.get('DG_MEGA_MOE_FP8_PACKED_GMMA_DESC', '0')} "
+        f"fp8_activation_row_tma={os.environ.get('DG_MEGA_MOE_FP8_ACTIVATION_ROW_TMA', '0')} "
+        f"fp8_streaming_density32={os.environ.get('DG_MEGA_MOE_FP8_STREAMING_DENSITY32', '0')} "
+        f"fp8_row_parallel_quant={os.environ.get('DG_MEGA_MOE_FP8_ROW_PARALLEL_QUANT', '0')} "
+        f"fp8_hybrid_max_rows={os.environ.get('DG_MEGA_MOE_FP8_HYBRID_MAX_ROWS', '0')} "
+        f"fp8_skip_inactive_m_wg={os.environ.get('DG_MEGA_MOE_FP8_SKIP_INACTIVE_M_WG', '0')} "
         f"warmup={args.num_warmup} repeat={args.num_repeat} "
         f"fused_tests={args.num_bench_tests} l2_flush_gb={args.l2_flush_gb}",
     )
@@ -390,6 +460,11 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
     )
     del l2_bf16
     torch.cuda.empty_cache()
+
+    weight_digest = None
+    if args.check_fp8_reference:
+        assert not args.fp4_runtime and args.path == "fused" and not args.fuse_shared
+        weight_digest = _tensor_digest(*l1_weights, *l2_weights)
 
     shared_l1_weights = shared_l2_weights = None
     if args.fuse_shared:
@@ -503,6 +578,15 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         x_bf16 = torch.randn((batch, hidden), dtype=torch.bfloat16, device="cuda")
         scores = torch.randn((batch, num_experts), dtype=torch.float, device="cuda")
         topk_weights, topk_idx = torch.topk(scores, topk, dim=-1, largest=True, sorted=False)
+        if args.route_pattern == "ragged8":
+            assert topk == 8
+            ids = torch.arange(topk, device="cuda") * (num_experts // topk)
+            topk_idx = ids[None, :].expand(batch, -1).clone()
+            offsets = torch.tensor([0, 1, 7, 8, 9, 15, 16, 31], device="cuda")
+            keep = (rank * batch + torch.arange(batch, device="cuda")[:, None]
+                    < (world_size * batch - offsets)[None, :])
+            topk_idx.masked_fill_(~keep, -1)
+            topk_weights.masked_fill_(~keep, 0)
         if os.environ.get("DG_PERF_ROUTE_MATCH_LOCAL_NODE", "0") == "1":
             topk_idx = _make_rdma_compiled_local_route(
                 rank, world_size, batch, topk, local_experts
@@ -948,11 +1032,87 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         if args.accuracy_only:
             output = run_fused() if need_fused else run_deep_ep()
             torch.cuda.synchronize()
+            smoke_outputs = None
+            if args.align_accuracy:
+                assert need_fused and args.check_fp8_reference
+                # Match the established stream-aligned FP4 accuracy harness.
+                # Do not insert CPU reference/hash work between collective launches.
+                prepare_fused_input()
+                smoke_outputs, pending = [], []
+                for _ in range(args.accuracy_repeats):
+                    torch.cuda._sleep(int(2e7))
+                    work = dist.barrier(async_op=True)
+                    work.block_current_stream()
+                    pending.append(work)
+                    smoke_outputs.append(run_fused_kernel_only().clone())
+                torch.cuda.synchronize()
+                for work in pending:
+                    work.wait()
+                output = smoke_outputs[0]
             assert output.shape == (batch, hidden)
             assert output.dtype == torch.bfloat16
             assert torch.isfinite(output).all(), (
                 f"non-finite output: path={args.path} mode={args.mode} batch={batch} rank={rank}"
             )
+            if args.check_fp8_reference:
+                assert args.reference_cache_dir and args.accuracy_repeats >= 1
+                input_digest = _tensor_digest(*x_fp8, topk_idx, topk_weights)
+                cache_dir = Path(args.reference_cache_dir)
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                cache_path = cache_dir / f"{args.route_pattern}_b{batch}_r{rank}.pt"
+                first_output = output.detach().cpu().clone()
+                cross_diff = 0.0
+                cross_bitwise = True
+                if args.write_reference_cache:
+                    assert not cache_path.exists(), str(cache_path)
+                    reference = base._reference_fused(
+                        x_fp8[0], x_fp8[1], topk_idx, topk_weights,
+                        l1_weights[0], l1_weights[1], l2_weights[0], l2_weights[1],
+                        rank, world_size, group, num_experts, topk, hidden,
+                        intermediate, args.activation_clamp)
+                else:
+                    saved = torch.load(cache_path, map_location="cpu", weights_only=True)
+                    assert saved["input_digest"] == input_digest
+                    assert saved["weight_digest"] == weight_digest
+                    cross_bitwise = torch.equal(saved["output"], first_output)
+                    cross_diff = float(base.calc_diff(saved["output"].float(), first_output.float()))
+                    assert cross_bitwise or cross_diff <= args.equivalence_tol, ("cross-arm", cross_diff)
+                    reference = saved["reference"].cuda()
+                max_diff = 0.0
+                repeat_diff = 0.0
+                repeat_changed = 0
+                repeat_max_abs = 0.0
+                if args.dump_output_dir and smoke_outputs is not None:
+                    Path(args.dump_output_dir).mkdir(parents=True, exist_ok=True)
+                    torch.save(dict(outputs=[v.cpu() for v in smoke_outputs], reference=reference.cpu()),
+                               Path(args.dump_output_dir) / f"snapshots_b{batch}_r{rank}.pt")
+                for repeat in range(args.accuracy_repeats):
+                    if smoke_outputs is not None:
+                        output = smoke_outputs[repeat]
+                    elif repeat:
+                        output = run_fused()
+                        torch.cuda.synchronize()
+                    assert torch.isfinite(output).all()
+                    diff = float(base.calc_diff(output, reference))
+                    assert math.isfinite(diff) and diff < args.diff_tol, (rank, batch, diff)
+                    current = output.cpu()
+                    same = torch.equal(current, first_output)
+                    delta = float(base.calc_diff(current.float(), first_output.float()))
+                    assert same or delta <= args.equivalence_tol, ("buffer-reuse", delta)
+                    repeat_diff = max(repeat_diff, delta)
+                    repeat_changed = max(repeat_changed, int((current != first_output).sum()))
+                    repeat_max_abs = max(repeat_max_abs, float((current.float() - first_output.float()).abs().max()))
+                    max_diff = max(max_diff, diff)
+                if args.write_reference_cache:
+                    torch.save(dict(reference=reference.cpu(), output=first_output,
+                                    input_digest=input_digest, weight_digest=weight_digest), cache_path)
+                print(f"[FP8_REFERENCE] batch={batch} rank={rank} route={args.route_pattern} "
+                      f"rows={batch} repeats={args.accuracy_repeats} diff={max_diff:.10g} "
+                      f"input={input_digest} output={_tensor_digest(first_output)} "
+                      f"cross_arm={int(not args.write_reference_cache)} cross_bitwise={int(cross_bitwise)} "
+                      f"cross_diff={cross_diff:.10g} repeat_diff={repeat_diff:.10g} "
+                      f"repeat_changed={repeat_changed} repeat_max_abs={repeat_max_abs:.10g}", flush=True)
+                del reference
             if args.check_fp4_reference:
                 assert need_fused and use_fp4_execution
                 reference_rows = torch.linspace(
@@ -1015,7 +1175,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
         if not kineto_primed:
             if need_fused and args.mega_timing == "kineto":
                 prepare_fused_input()
-                base.bench_kineto(
+                _bench_fused_kineto(
                     run_fused_kernel_only,
                     base.SM90_KERNEL_NAME,
                     barrier=lambda: dist.barrier(),
@@ -1041,7 +1201,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
                 prepare_fused_input()
                 torch.cuda.synchronize()
                 dist.barrier()
-                fused_seconds = base.bench_kineto(
+                fused_seconds = _bench_fused_kineto(
                     run_fused_kernel_only,
                     base.SM90_KERNEL_NAME,
                     barrier=lambda: dist.barrier(),
@@ -1086,7 +1246,7 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
                     flush=True,
                 )
             else:
-                deep_ep_seconds = base._bench_cuda_events(
+                deep_ep_seconds = _bench_deep_ep_events(
                     run_deep_ep,
                     num_warmup=args.num_warmup,
                     num_repeat=args.num_repeat,
@@ -1131,6 +1291,21 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None
     if ll_buffer is not None:
         ll_buffer.destroy()
     dist.destroy_process_group()
+
+
+def _worker(local_rank, num_local_ranks, args):
+    try:
+        run(local_rank, num_local_ranks, args)
+    except BaseException:
+        # A rank-local exception must not hang in collective NVSHMEM allocator
+        # destruction while other ranks await an NCCL barrier. Preserve its
+        # traceback and let spawn promptly terminate the remaining workers.
+        import traceback
+        traceback.print_exc()
+        import sys
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
 
 
 if __name__ == "__main__":
@@ -1211,10 +1386,18 @@ if __name__ == "__main__":
     )
     parser.add_argument("--reference-max-local-tokens", type=int, default=16)
     parser.add_argument("--diff-tol", type=float, default=0.10)
+    parser.add_argument("--check-fp8-reference", action="store_true")
+    parser.add_argument("--reference-cache-dir")
+    parser.add_argument("--write-reference-cache", action="store_true")
+    parser.add_argument("--accuracy-repeats", type=int, default=12)
+    parser.add_argument("--route-pattern", choices=("uniform", "ragged8"), default="uniform")
+    parser.add_argument("--align-accuracy", action="store_true")
+    parser.add_argument("--equivalence-tol", type=float, default=0.0)
     args = parser.parse_args()
     if args.kineto_kernel_only:
         args.mega_timing = "kineto"
     if args.kineto_trace_dir:
         os.makedirs(args.kineto_trace_dir, exist_ok=True)
     assert not args.check_fp4_reference or args.accuracy_only
-    torch.multiprocessing.spawn(run, args=(args.num_processes, args), nprocs=args.num_processes)
+    assert not args.check_fp8_reference or args.accuracy_only
+    torch.multiprocessing.spawn(_worker, args=(args.num_processes, args), nprocs=args.num_processes)

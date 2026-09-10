@@ -41,40 +41,30 @@ class DispatchGatewayPolicyTest(unittest.TestCase):
             f"namespace layout {{ constexpr int kGatewayDenseMaxRequestedTokens = {cls.threshold}; }}\n"
             + match.group(0)
             + "\nint main(int argc, char** argv) {\n"
-            "  if (argc != 3) return 3;\n"
-            "  if (std::string(argv[2]) == \"unset\") unsetenv(\"DG_MEGA_MOE_FP4_FORCE_PACKED_DISPATCH\");\n"
-            "  else setenv(\"DG_MEGA_MOE_FP4_FORCE_PACKED_DISPATCH\", argv[2], 1);\n"
+            "  if (argc != 2) return 3;\n"
             "  try { std::cout << get_sm90_fp4_dispatch_gateway(std::stoi(argv[1])); }\n"
             "  catch (const std::exception&) { return 2; }\n"
             "}\n"
         )
         subprocess.run([compiler, "-std=c++17", str(source), "-o", str(cls.binary)], check=True)
 
-    def run_policy(self, capacity, force):
+    def run_policy(self, capacity):
         return subprocess.run(
-            [str(self.binary), str(capacity), str(force)],
+            [str(self.binary), str(capacity)],
             check=False, capture_output=True, text=True,
         )
 
     def test_default_preserves_capacity_boundary(self):
-        for force in ("unset", 0):
-            for capacity in (1, 16, 64, self.threshold, self.threshold + 1, 384, 1024, 8192):
-                with self.subTest(force=force, capacity=capacity):
-                    result = self.run_policy(capacity, force)
-                    self.assertEqual(result.returncode, 0)
-                    self.assertEqual(int(result.stdout), 4 if capacity <= self.threshold else 3)
-
-    def test_override_always_uses_packed(self):
         for capacity in (1, 16, 64, self.threshold, self.threshold + 1, 384, 1024, 8192):
             with self.subTest(capacity=capacity):
-                result = self.run_policy(capacity, 1)
+                result = self.run_policy(capacity)
                 self.assertEqual(result.returncode, 0)
-                self.assertEqual(result.stdout, "3")
+                self.assertEqual(int(result.stdout), 4 if capacity <= self.threshold else 3)
 
-    def test_invalid_overrides_and_capacities_are_rejected(self):
-        for capacity, force in ((16, -1), (16, 2), (0, 0), (0, 1), (-1, 0)):
-            with self.subTest(capacity=capacity, force=force):
-                self.assertEqual(self.run_policy(capacity, force).returncode, 2)
+    def test_invalid_capacities_are_rejected(self):
+        for capacity in (0, -1):
+            with self.subTest(capacity=capacity):
+                self.assertEqual(self.run_policy(capacity).returncode, 2)
 
     def test_fp8_jit_is_not_opted_in(self):
         fp8 = (ROOT / "csrc/jit_kernels/impls/sm90_fp8_mega_moe.hpp").read_text()

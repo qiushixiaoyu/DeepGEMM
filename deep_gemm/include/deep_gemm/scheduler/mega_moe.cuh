@@ -27,8 +27,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
           uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K,
           uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K,
-          typename WorkspaceT = layout::Workspace,
-          bool kCompactGatewayManifest = false>
+          typename WorkspaceT = layout::Workspace>
 struct MegaMoEScheduler {
     DG_STATIC_ASSERT(L1_SHAPE_N % BLOCK_N == 0, "Invalid shape");
     DG_STATIC_ASSERT(L2_SHAPE_N % BLOCK_N == 0, "Invalid shape");
@@ -84,8 +83,9 @@ struct MegaMoEScheduler {
 
     // Wait for one source/expert count.  Packed-gateway mode keeps remote
     // manifests in the same double-buffered landing slot as the offsets and
-    // payload. Sparse shapes poll a fixed manifest directly; dense shapes
-    // first locate the live-payload tail. Dense-V3 publishes its complete
+    // payload. All packed shapes poll a fixed manifest outside the maximum
+    // payload extent: a live-payload tail can alias an older epoch's token
+    // data after a batch-size decrease. Dense-V3 publishes its complete
     // manifest into the common double-buffered rank-major count table.
     CUTLASS_DEVICE uint32_t wait_source_expert_recv_count(
         const uint32_t& src_rank_idx, const uint32_t& expert_idx) const {
@@ -110,36 +110,8 @@ struct MegaMoEScheduler {
             const uint32_t cell_idx =
                 src_rank_idx % DG_MEGA_MOE_NVL_PEERS *
                     kNumExpertsPerRank + expert_idx;
-            if constexpr (kCompactGatewayManifest) {
-                const auto header = workspace.get_gateway_packed_header_ptr(
-                    true, rel_src_node, expected_marker & 1u);
-                uint64_t header_epoch = ptx::ld_acq_sys(&header->epoch);
-                while (static_cast<uint32_t>(header_epoch) != expected_marker) {
-#ifdef DG_MEGA_MOE_DEVICE_DIAGNOSTICS
-                    if (clock64() - start_clock >= kSlotTimeoutCycles)
-                        printf(
-                            "MEGA_MOE_COUNT_HEADER_TIMEOUT local_rank=%u "
-                            "src_rank=%u expert=%u expected=%u observed=%u\n",
-                            local_rank_idx, src_rank_idx, expert_idx,
-                            expected_marker,
-                            static_cast<uint32_t>(header_epoch));
-#endif
-                    DG_TRAP_ONLY_DEVICE_ASSERT(
-                        clock64() - start_clock < kSlotTimeoutCycles);
-                    header_epoch = ptx::ld_acq_sys(&header->epoch);
-                }
-                const uint32_t total_entries = ptx::ld_acq_sys(
-                    &header->total_entries);
-                DG_TRAP_ONLY_DEVICE_ASSERT(
-                    total_entries <=
-                    workspace.get_gateway_max_packed_entries());
-                slot_ptr = workspace.get_gateway_packed_compact_manifest_ptr(
-                    true, rel_src_node, expected_marker & 1u,
-                    total_entries, cell_idx);
-            } else {
-                slot_ptr = workspace.get_gateway_packed_manifest_ptr(
-                    true, rel_src_node, expected_marker & 1u, cell_idx);
-            }
+            slot_ptr = workspace.get_gateway_packed_manifest_ptr(
+                true, rel_src_node, expected_marker & 1u, cell_idx);
         } else
 #endif
         {
@@ -192,7 +164,11 @@ struct MegaMoEScheduler {
     }
 
     CUTLASS_DEVICE uint32_t get_num_tokens(const uint32_t& expert_idx) {
-        uint32_t valid_value;
+        // Every lane evaluates every iteration before the shuffle. Even the
+        // selected lane reads the fallback first when expert_idx >= 32, so
+        // leaving it indeterminate is undefined behavior, not a don't-care
+        // value that can safely be discarded by the subsequent shuffle.
+        uint32_t valid_value = 0;
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
             valid_value = (expert_idx == i * 32 + ptx::get_lane_idx()) ?

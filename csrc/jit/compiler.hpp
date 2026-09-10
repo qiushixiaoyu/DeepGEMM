@@ -225,6 +225,11 @@ public:
         const auto nvshmem_home = get_env<std::string>("DG_NVSHMEM_HOME");
         const bool needs_nvshmem = not nvshmem_home.empty()
                                    and code.find("nvshmem") != std::string::npos;
+        // Experimental FP4-only full device LTO. The source marker is also
+        // part of the JIT key; every unmarked kernel keeps its original path.
+        const bool fp4_balanced_lto = code.find(
+            "#define DG_MEGA_MOE_FP4_BALANCED_WG_REGISTERS 1") != std::string::npos;
+        DG_HOST_ASSERT(not fp4_balanced_lto or needs_nvshmem);
         std::string command;
         if (needs_nvshmem) {
             // Step 1: compile to a relocatable device object (with nvshmem headers).
@@ -236,7 +241,8 @@ public:
             const auto obj_path = dir_path / "kernel.o";
             const auto dc_flags = std::regex_replace(flags,
                 std::regex(R"(--gpu-architecture=sm_(\w+))"),
-                "-gencode arch=compute_$1,code=sm_$1");
+                fp4_balanced_lto ? "-gencode arch=compute_$1,code=lto_$1" :
+                                   "-gencode arch=compute_$1,code=sm_$1");
             // NOTE: `-rdc=true -dc` also emits a host stub (`*.cudafe1.stub.c`) in
             // which an infinity float NTTP (e.g. kActivationClamp = inf) is demangled
             // to the bare token `inf`, breaking host compilation ("'inf' was not
@@ -248,6 +254,8 @@ public:
             if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
                 printf("Running NVCC -dc command: %s\n", dc_command.c_str());
             const auto [dc_rc, dc_out] = call_external_command(dc_command);
+            if (fp4_balanced_lto)
+                put(dir_path / "lto_compile.log", dc_out);
             if (dc_rc != 0) {
                 printf("NVCC nvshmem -dc failed: %s\n", dc_out.c_str());
                 DG_HOST_ASSERT(false and "NVCC nvshmem -dc failed");
@@ -259,6 +267,15 @@ public:
                 arch_flag = arch_match[0].str();
             command = fmt::format("cd {} && {} {} -dlink {} -L{}/lib -lnvshmem_device -cubin -o {}",
                 compile_dir.c_str(), nvcc_path.c_str(), obj_path.c_str(), arch_flag, nvshmem_home, cubin_path.c_str());
+            if (fp4_balanced_lto) {
+                const auto linker = get_env<std::string>("DG_JIT_NVSHMEM_LTO_LINKER");
+                const auto archive = get_env<std::string>("DG_JIT_NVSHMEM_LTO_ARCHIVE");
+                DG_HOST_ASSERT(not linker.empty() and std::filesystem::exists(linker));
+                DG_HOST_ASSERT(not archive.empty() and std::filesystem::exists(archive));
+                DG_HOST_ASSERT(arch_flag == "--gpu-architecture=sm_90a");
+                command = fmt::format("cd {} && {} {} {} archive {}",
+                    compile_dir.c_str(), linker, obj_path.c_str(), archive, cubin_path.c_str());
+            }
         } else {
             command = fmt::format("cd {} && {} {} -cubin -o {} {}",
                 compile_dir.c_str(), nvcc_path.c_str(), code_path.c_str(), cubin_path.c_str(), flags);
@@ -266,6 +283,8 @@ public:
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
             printf("Running NVCC command: %s\n", command.c_str());
         const auto [return_code, output] = call_external_command(command);
+        if (fp4_balanced_lto)
+            put(dir_path / "lto_link.log", output);
         if (return_code != 0) {
             printf("NVCC compilation failed: %s\n", output.c_str());
             DG_HOST_ASSERT(false and "NVCC compilation failed");

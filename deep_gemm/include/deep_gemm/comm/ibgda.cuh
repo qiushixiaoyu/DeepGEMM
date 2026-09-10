@@ -24,6 +24,9 @@
 //     分摊到不同 qp_id 上，保证两次 quiet 之间单 QP 在途 WQE < NVSHMEM_QP_DEPTH
 //     (压力场景使用 NVSHMEM_QP_DEPTH=4096；full-row WRITE 在 reserve 时检查 credit)；
 //   - 阻塞式读 = get_thread + quiet(同一 pe/qp)。
+//   - WRITE-based readiness requires NVSHMEM_IB_ENABLE_RELAXED_ORDERING=0
+//     before NVSHMEM initialization/registration. Same-QP posting order alone
+//     is not a write-after-write visibility guarantee for relaxed-order MRs.
 
 #pragma once
 

@@ -48,6 +48,7 @@ public:
         bool l2_epilogue_requires_full_sync;
         bool split_phase_hot_path;
         bool use_swap_ab;
+        bool use_activation_row_buckets;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -69,6 +70,9 @@ public:
         CUtensorMap tensor_map_l2_weights;
         const float* l2_weights_sf;
 
+        CUtensorMap tensor_map_l1_act_rows[3];
+        CUtensorMap tensor_map_l2_act_rows[3];
+
         // Launch configs
         LaunchArgs launch_args;
     };
@@ -81,12 +85,46 @@ public:
         constexpr int kNvlPeers = 8;
         const bool internode = args.num_ranks > kNvlPeers;
         std::string internode_prefix;
+        // Validated opt-in optimizations; keep FP8's own density policy.
+        const int packed_desc = get_env<int>("DG_MEGA_MOE_FP8_PACKED_GMMA_DESC", 0);
+        DG_HOST_ASSERT(packed_desc == 0 or packed_desc == 1);
         if (internode)
             internode_prefix = fmt::format(
                 "// inter-node mega-moe: uses nvshmem device functions\n"
                 "#define DG_MEGA_MOE_INTERNODE\n"
                 "#define DG_MEGA_MOE_NVL_PEERS {}\n",
                 kNvlPeers);
+        if (packed_desc)
+            internode_prefix += "#define DG_MEGA_MOE_FP8_PACKED_GMMA_DESC 1\n";
+        if (args.use_activation_row_buckets)
+            internode_prefix += "#define DG_MEGA_MOE_FP8_ACTIVATION_ROW_TMA 1\n";
+        const int skip_inactive_m_wg = get_env<int>("DG_MEGA_MOE_FP8_SKIP_INACTIVE_M_WG", 0);
+        DG_HOST_ASSERT(skip_inactive_m_wg == 0 or skip_inactive_m_wg == 1);
+        // The validated split-M layout is disjoint from the M64 hybrid path.
+        // Do not silently enable this on experimental two-WG M128 shapes.
+        if (skip_inactive_m_wg and args.config.block_m == 128 and
+            args.config.block_n == 256 and args.config.num_epilogue_threads == 512 and
+            not args.use_swap_ab)
+            internode_prefix += "#define DG_MEGA_MOE_FP8_SKIP_INACTIVE_M_WG 1\n";
+        const int row_parallel_quant = get_env<int>("DG_MEGA_MOE_FP8_ROW_PARALLEL_QUANT", 0);
+        DG_HOST_ASSERT(row_parallel_quant >= 0 and row_parallel_quant <= 2);
+        const float expected_rows = static_cast<float>(args.num_tokens) * args.num_ranks *
+            args.num_topk / args.num_experts;
+        const int hybrid_max_rows = get_env<int>("DG_MEGA_MOE_FP8_HYBRID_MAX_ROWS", 0);
+        DG_HOST_ASSERT(hybrid_max_rows == 0 or hybrid_max_rows == 32);
+        const bool hybrid_blocks = hybrid_max_rows and args.use_swap_ab and
+            args.config.block_m == 64 and args.config.block_n == 256 and
+            args.config.num_epilogue_threads == 256 and
+            static_cast<int64_t>(args.hidden) * args.intermediate_hidden < 16ll * 1024 * 1024 and
+            expected_rows > 16.0f and expected_rows <= 64.0f;
+        if (hybrid_blocks)
+            internode_prefix += fmt::format("#define DG_MEGA_MOE_FP8_HYBRID_MAX_ROWS {}\n", hybrid_max_rows);
+        const bool expanded_streaming_band =
+            static_cast<int64_t>(args.hidden) * args.intermediate_hidden >= 16ll * 1024 * 1024 and
+            expected_rows > 24.0f and expected_rows <= 32.0f;
+        if (args.use_swap_ab and (hybrid_blocks or row_parallel_quant == 1 or
+                                 (row_parallel_quant == 2 and expanded_streaming_band)))
+            internode_prefix += "#define DG_MEGA_MOE_FP8_ROW_PARALLEL_QUANT 1\n";
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE", 0) != 0)
             internode_prefix += "#define DG_MEGA_MOE_PHASE_PROFILE 1\n";
         // Keep the counters, drop the device printf: the host reads the
@@ -112,10 +150,10 @@ public:
             internode_prefix +=
                 "#define DG_DEVICE_ASSERT_TRAP_ONLY 1\n";
         // Unified two-level dispatch handshake. Packed mode compacts live route
-        // cells into per-remote-node, per-epoch packed slots.  Sparse top-k
-        // shapes use live payload + fixed-address trailing manifest; denser
-        // top-k shapes use one contiguous header/offset/live-payload/manifest
-        // segment.  Mode 4 is an independent diagnostic restoration of the
+        // cells into per-remote-node, per-epoch packed slots. All packed
+        // shapes send live header/offset/payload bytes followed by a separate
+        // fixed-address manifest WRITE on the same QP. Mode 4 is an
+        // independent diagnostic restoration of the
         // old dense V3 wire format: one full collect box plus its manifest,
         // without compaction/decode.  All gateway modes use the current
         // double-buffered epoch lifetime. Inter-node builds always use one of
@@ -245,6 +283,21 @@ static void __instantiate_kernel() {{
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        // Preserve the original kernel ABI for every non-row-TMA specialization.
+        if (args.use_activation_row_buckets) {
+            DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+                args.y, args.cumulative_local_expert_recv_stats, args.num_tokens,
+                args.sym_buffer_ptrs, args.tensor_map_l1_acts,
+                args.tensor_map_l1_acts_sf, args.tensor_map_l1_weights,
+                args.l1_weights_sf, args.tensor_map_l1_output,
+                args.tensor_map_l2_acts, args.tensor_map_l2_acts_sf,
+                args.tensor_map_l2_weights, args.l2_weights_sf,
+                args.tensor_map_l1_act_rows[0], args.tensor_map_l1_act_rows[1],
+                args.tensor_map_l1_act_rows[2], args.tensor_map_l2_act_rows[0],
+                args.tensor_map_l2_act_rows[1], args.tensor_map_l2_act_rows[2]
+            ));
+            return;
+        }
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.y,
             args.cumulative_local_expert_recv_stats,
@@ -421,6 +474,28 @@ static void sm90_fp8_mega_moe(
                                                         config.block_k, weight_tma_block_n,
                                                         static_cast<int>(l2_weights.stride(-2)),
                                                         config.swizzle_weights_mode);
+    // Reduce only activation payload, not the shared allocation/stride or SFA.
+    // All padded rows consumed by a swap WGMMA remain inside the selected box.
+    const int activation_row_tma = get_env<int>("DG_MEGA_MOE_FP8_ACTIVATION_ROW_TMA", 0);
+    DG_HOST_ASSERT(activation_row_tma == 0 or activation_row_tma == 1);
+    const bool use_activation_row_buckets = activation_row_tma != 0 and
+        use_swap_ab and config.block_m == 64 and config.block_n == 256 and
+        config.block_k == 128 and config.num_epilogue_threads == 256 and
+        config.swizzle_acts_mode == 128 and config.cluster_size == 1;
+    CUtensorMap tensor_map_l1_act_rows[3] = {};
+    CUtensorMap tensor_map_l2_act_rows[3] = {};
+    if (use_activation_row_buckets) {
+        for (int i = 0; i < 3; ++i) {
+            const int rows = 8 << i;
+            tensor_map_l1_act_rows[i] = make_tma_2d_desc(
+                l1_acts, hidden, num_l1_ring_tokens, config.block_k, rows,
+                static_cast<int>(l1_acts.stride(-2)), config.swizzle_acts_mode);
+            tensor_map_l2_act_rows[i] = make_tma_2d_desc(
+                l2_acts, intermediate_hidden, num_l2_storage_tokens, config.block_k, rows,
+                static_cast<int>(l2_acts.stride(-2)), config.swizzle_acts_mode);
+        }
+    }
+
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
     if (cumulative_local_expert_recv_stats.has_value())
@@ -447,6 +522,7 @@ static void sm90_fp8_mega_moe(
         .l2_epilogue_requires_full_sync = l2_epilogue_requires_full_sync,
         .split_phase_hot_path = split_phase_hot_path,
         .use_swap_ab = use_swap_ab,
+        .use_activation_row_buckets = use_activation_row_buckets,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -461,6 +537,8 @@ static void sm90_fp8_mega_moe(
         .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
         .tensor_map_l2_weights = tensor_map_l2_weights,
         .l2_weights_sf = l2_weights_sf.data_ptr<float>(),
+        .tensor_map_l1_act_rows = {tensor_map_l1_act_rows[0], tensor_map_l1_act_rows[1], tensor_map_l1_act_rows[2]},
+        .tensor_map_l2_act_rows = {tensor_map_l2_act_rows[0], tensor_map_l2_act_rows[1], tensor_map_l2_act_rows[2]},
         .launch_args = LaunchArgs(num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, config.cluster_size)
     };

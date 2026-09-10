@@ -168,7 +168,7 @@ static KernelHandle load_kernel(const std::filesystem::path& cubin_path, const s
         if (lazy_cuLibraryGetGlobal(&state_ptr, &state_size, library, "nvshmemi_device_state_d") == CUDA_SUCCESS) {
             CUmodule nvshmem_module;
             if (lazy_cuLibraryGetModule(&nvshmem_module, library) == CUDA_SUCCESS)
-                nvshmemx_cumodule_init(nvshmem_module);
+                DG_HOST_ASSERT(nvshmemx_cumodule_init(nvshmem_module) == 0);
         }
     }
 #else

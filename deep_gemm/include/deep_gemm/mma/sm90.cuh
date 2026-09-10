@@ -219,7 +219,8 @@ make_smem_desc(PointerType smem_ptr, const int& layout_type,
     // NOTES: the default LBO and SBO are for K-major types
     cute::GmmaDescriptor desc;
     const auto uint_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-#if defined(DG_MEGA_MOE_FP4_PACKED_GMMA_DESC) && DG_MEGA_MOE_FP4_PACKED_GMMA_DESC
+#if (defined(DG_MEGA_MOE_FP4_PACKED_GMMA_DESC) && DG_MEGA_MOE_FP4_PACKED_GMMA_DESC) || \
+    (defined(DG_MEGA_MOE_FP8_PACKED_GMMA_DESC) && DG_MEGA_MOE_FP8_PACKED_GMMA_DESC)
     desc.desc_ = pack_smem_desc_bits(uint_ptr, layout_type,
                                    leading_byte_offset, stride_byte_offset);
 #else

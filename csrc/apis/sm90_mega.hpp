@@ -72,7 +72,6 @@ struct FP4SM90APIDefaults {
     bool wide_load_decode;
     bool early_b_decode;
     bool decode_done_mbarrier;
-    bool l2_arrival_counter;
     bool ss_nsplit;
     bool swap_ab;
     bool swap_ab_fast_amax;
@@ -128,14 +127,6 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     const bool default_decode_done_mbarrier =
         has_rows and not math_wg_participates_in_decode;
 
-    // Arrival-counter selection remains intentionally narrow until the
-    // expanded EP/skew matrix validates a wider sparse region.
-    const bool default_l2_arrival_counter =
-        ((fp4_flash_shape and
-          rows >= 0.375f and rows < 0.75f) or
-         (fp4_pro_shape and
-          rows >= 0.25f and rows < 0.375f));
-
     (void)hidden;
     // Warp-cooperative amax avoids the FP32 full-tile staging and serial
     // per-token row scan in the swapAB L1 epilogue.  The 16--32 row window
@@ -153,7 +144,6 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
         default_wide_load_decode,
         default_ss_early_b_decode,
         default_decode_done_mbarrier,
-        default_l2_arrival_counter,
         m128_or_larger,
         default_swap_ab,
         default_swap_ab_fast_amax
@@ -170,6 +160,14 @@ get_symm_buffer_size_for_sm90_mega_moe_impl(
     const bool& combine_uses_expert_ring,
     const bool& l1_uses_ring,
     const bool& l2_uses_ring) {
+    // This custom IBGDA protocol uses ordered WRITEs, not atomic signals.
+    // Require the setting at process startup, before any NVSHMEM allocator
+    // initializes/registers memory; changing it after initialization is unsafe.
+    if (num_ranks > 8 and
+        get_env<std::string>("NVSHMEM_IB_ENABLE_RELAXED_ORDERING", "") != "0")
+        DG_HOST_UNREACHABLE(
+            "SM90 MegaMoE RDMA requires NVSHMEM_IB_ENABLE_RELAXED_ORDERING=0 "
+            "at process startup, before NVSHMEM initialization; restart all ranks.");
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(use_fp8_dispatch);
     DG_HOST_ASSERT(activation == "swiglu");
@@ -284,18 +282,17 @@ get_symm_buffer_size_for_sm90_mega_moe_impl(
             layout::Data(sizeof(uint64_t), false), 1,
             workspace.num_max_pool_blocks,
             combine_full_row_arrival_buffer.get_end_ptr());
-        // One 32-bit mask word covers 32 output rows.  Reserve four words per
-        // destination so both BLOCK_M=64 and BLOCK_M=128 JIT specializations
-        // use the same physical stride and subsequent buffer offsets.
-        constexpr int kPublishRowMaskStorageWords = 4;
-        const auto combine_publish_row_mask_buffer = layout::Buffer(
+        // Preserve legacy publisher padding so existing symmetric-buffer
+        // offsets stay unchanged. The retired row mask is never accessed.
+        constexpr int kPublishReservedWordsPerRank = 4;
+        const auto combine_publish_reserved_buffer = layout::Buffer(
             layout::Data(
-                num_ranks * kPublishRowMaskStorageWords * sizeof(uint32_t),
+                num_ranks * kPublishReservedWordsPerRank * sizeof(uint32_t),
                 false),
             1, workspace.num_max_pool_blocks,
             combine_full_row_ready_timestamp_buffer.get_end_ptr());
         const auto combine_full_row_staging_base = reinterpret_cast<void*>(math::align(
-            reinterpret_cast<uint64_t>(combine_publish_row_mask_buffer.get_end_ptr()),
+            reinterpret_cast<uint64_t>(combine_publish_reserved_buffer.get_end_ptr()),
             static_cast<uint64_t>(128)));
         const auto combine_full_row_staging_buffer = layout::Buffer(
             bf16_token_layout, 1, num_combine_staging_tokens,
@@ -619,7 +616,6 @@ static void fp8_fp4_mega_moe_sm90(
                           fp4_defaults.wide_load_decode,
                           fp4_defaults.early_b_decode,
                           fp4_defaults.decode_done_mbarrier,
-                          fp4_defaults.l2_arrival_counter,
                           fp4_defaults.ss_nsplit,
                           fp4_defaults.swap_ab,
                           fp4_defaults.swap_ab_fast_amax);
