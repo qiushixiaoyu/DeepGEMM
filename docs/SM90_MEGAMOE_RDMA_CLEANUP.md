@@ -3,6 +3,9 @@
 2026-09-09。基于 experiment/mega-moe-combine-expert-ready / c12738ad8。
 本次是代码归并和清理，不是新性能优化，也不自动改变生产默认开关。
 
+本文保留 2026-09-09 的清理记录。当前发布使用说明、运行条件和双机命令统一见
+[SM90 MegaMoE RDMA](SM90_MEGAMOE_RDMA.md)，不要把下方历史证据目录当作随仓库发布的依赖。
+
 ## 保留的实现
 
 - FP4：V38 完整有效路径，包括在线 FP4 decode、paired PRMT、packed GMMA

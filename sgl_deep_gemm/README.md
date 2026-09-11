@@ -7,7 +7,9 @@ sgl-deep-gemm is a pypi package built from SGLang's customized branch of DeepGem
 3. Fast iteration: add custom kernels and bump versions at no time.
 
 ## Usage
-To build it locally, run `bash build_sgl_deep_gemm.sh`, then pip install the wheel generated under `dist`.
+To build it locally, run `bash build_sgl_deep_gemm.sh`, then install the generated wheel with `python3 -m pip install --force-reinstall --no-deps /absolute/path/to/dist/sgl_deep_gemm-<version>-<tags>.whl` (replace the placeholder with the actual wheel).
+
+SM90 MegaMoE RDMA additionally requires the NVSHMEM-enabled symmetric-memory runtime, IBGDA transport, and the matching device-link inputs. See [`docs/SM90_MEGAMOE_RDMA.md`](../docs/SM90_MEGAMOE_RDMA.md) in this source repository for the support matrix, recommended FP4/FP8 configurations and two-node accuracy/performance commands. A generic single-node MegaMoE example is not a complete RDMA setup.
 
 To release a new set of wheels, please contact SGLang team and run the [release workflow](https://github.com/sgl-project/sglang/actions/workflows/release-whl-deepgemm.yml) under SGLang repo
 

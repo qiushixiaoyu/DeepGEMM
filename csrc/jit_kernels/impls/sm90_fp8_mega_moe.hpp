@@ -127,9 +127,9 @@ public:
             internode_prefix += "#define DG_MEGA_MOE_FP8_ROW_PARALLEL_QUANT 1\n";
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE", 0) != 0)
             internode_prefix += "#define DG_MEGA_MOE_PHASE_PROFILE 1\n";
-        // Keep the counters, drop the device printf: the host reads the
-        // profile region (the tail of the symmetric buffer) after the run,
-        // so a real benchmark loop stays unperturbed.
+        // SILENT only removes profile printf. Clock reads, counters and
+        // profile stores still perturb execution when PHASE_PROFILE is on.
+        // Disable PHASE_PROFILE for uninstrumented performance measurements.
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE_SILENT", 0) != 0)
             internode_prefix +=
                 "#define DG_MEGA_MOE_PHASE_PROFILE_SILENT 1\n";
@@ -152,10 +152,9 @@ public:
         // Unified two-level dispatch handshake. Packed mode compacts live route
         // cells into per-remote-node, per-epoch packed slots. All packed
         // shapes send live header/offset/payload bytes followed by a separate
-        // fixed-address manifest WRITE on the same QP. Mode 4 is an
-        // independent diagnostic restoration of the
-        // old dense V3 wire format: one full collect box plus its manifest,
-        // without compaction/decode.  All gateway modes use the current
+        // fixed-address manifest WRITE on the same QP. Mode 4 is the normal
+        // small-capacity dense-V3 format: one full collect box plus its
+        // manifest, without compaction/decode. Both gateway modes use the current
         // double-buffered epoch lifetime. Inter-node builds always use one of
         // these two gateway formats; the per-entry direct path is not built.
         DG_HOST_ASSERT(not internode or

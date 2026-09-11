@@ -138,8 +138,9 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     return {
         math_wg_participates_in_decode,
         0,
-        // The merged loader owns non-epilogue warps 0/1 in every production
-        // topology, so dedicated FP4 decode assistants always start at warp 2.
+        // Non-epilogue warp 0 loads A/SFA and B/SFB; warp 1 is reserved for
+        // the inter-node publisher (idle on the single-node path). Dedicated
+        // FP4 decode assistants start at non-epilogue warp 2.
         2,
         default_wide_load_decode,
         default_ss_early_b_decode,
@@ -346,28 +347,19 @@ get_symm_buffer_size_for_sm90_mega_moe_impl(
     return {reinterpret_cast<int64_t>(symm_buffer_end), slice_input_buffers};
 }
 
-// Public sizing API stays unchanged.  It returns the union required by the
-// fixed FP8 inter-node protocol and the selected FP4 protocol family.
+// FP8 and FP4 use the same topology-based full-row combine/ring policy.
+// The shared layout reserves storage for both dense-V3 and packed metadata.
 static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
 get_symm_buffer_size_for_sm90_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const bool& use_fp8_dispatch, const std::string& activation) {
-    const bool force_fp4_internode_probe =
-        get_env<int>("DG_MEGA_MOE_FP4_FORCE_INTERNODE", 0) != 0;
-    const bool fp8_full_row = num_ranks > 8;
-    const bool fp8_ring = fp8_full_row;
-    const bool fp4_full_row = num_ranks > 8 or force_fp4_internode_probe;
-    const bool fp4_ring = fp4_full_row;
-    const bool full_row = fp8_full_row or fp4_full_row;
-    const bool every_full_row_path_uses_ring =
-        (not fp8_full_row or fp8_ring) and
-        (not fp4_full_row or fp4_ring);
+    const bool internode = num_ranks > 8;
     return get_symm_buffer_size_for_sm90_mega_moe_impl(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden, use_fp8_dispatch, activation,
-        full_row, full_row and every_full_row_path_uses_ring,
+        internode, internode,
         true, true);
 }
 
@@ -561,13 +553,9 @@ static void fp8_fp4_mega_moe_sm90(
 
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
-    // EXPERIMENT (single-node internode probe): force the INTERNODE
-    // compilation shape on an 8-rank single node (all ranks NVLink peers, so
-    // remote traffic is naturally zero).  Reproduces the compilation-shape
-    // cost in a single-node setting where Nsight Compute can profile without
-    // multi-node kernel-replay deadlocks.
-    const bool fp4_internode = num_ranks > 8 or
-        get_env<int>("DG_MEGA_MOE_FP4_FORCE_INTERNODE", 0) != 0;
+    // Match JIT topology selection; inter-node execution requires more than
+    // one complete eight-GPU NVLink domain, not a single-node probe override.
+    const bool fp4_internode = num_ranks > 8;
     const auto [num_required_bytes, slice] = get_symm_buffer_size_for_sm90_mega_moe_impl(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,

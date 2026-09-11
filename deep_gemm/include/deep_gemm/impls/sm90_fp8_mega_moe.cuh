@@ -2034,8 +2034,9 @@ sm90_fp8_mega_moe_impl(void* y,
 
     // =====================================================================
     // ROLE 2: merged GEMM TMA LOAD warp (load A + SFA + B)
-    //   Warp 0 inside `kNumNonEpilogueThreads` issues every operand TMA.
-    //   Warp 1 is available to the asynchronous inter-node publisher below.
+    //   Non-epilogue warp 0 (CTA warp kNumDispatchWarps) issues A/SFA/B TMA.
+    //   Non-epilogue warp 1 runs the inter-node publisher; it is idle on the
+    //   single-node path. Math warpgroups load weight scales (SFB).
     // =====================================================================
     }
     if (warp_idx == kNumDispatchWarps) {

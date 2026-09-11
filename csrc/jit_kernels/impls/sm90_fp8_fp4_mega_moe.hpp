@@ -413,6 +413,8 @@ public:
         else if (args.num_ranks > kNvlPeers)
             internode_prefix +=
                 "#define DG_DEVICE_ASSERT_TRAP_ONLY 1\n";
+        // SILENT suppresses profile printf, not clock/counter/store overhead.
+        // Disable PHASE_PROFILE for uninstrumented performance measurements.
         if (get_env<int>("DG_MEGA_MOE_PHASE_PROFILE_SILENT", 0) != 0)
             internode_prefix +=
                 "#define DG_MEGA_MOE_PHASE_PROFILE_SILENT 1\n";

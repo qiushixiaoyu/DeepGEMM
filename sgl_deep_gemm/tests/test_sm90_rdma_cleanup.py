@@ -1,6 +1,7 @@
 """CPU source-contract checks; not a substitute for CUDA/accuracy testing."""
 from pathlib import Path
 import re
+import subprocess
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -11,7 +12,7 @@ HOSTS = ROOT / "csrc/jit_kernels/impls"
 class RetainedOptimizationsTest(unittest.TestCase):
     def test_retired_switches_have_no_runtime_reader(self):
         retired = {
-            "FP4": ["PUBLISH_ROW_MASK", "REUSE_GMMA_DESC", "FORCE_PACKED_DISPATCH",
+            "FP4": ["FORCE_INTERNODE", "PUBLISH_ROW_MASK", "REUSE_GMMA_DESC", "FORCE_PACKED_DISPATCH",
                     "ASYNC_PUBLISHER_PROGRESS_BLOCK_BUDGET", "ASYNC_PUBLISHER_PROGRESS_YIELD_NS",
                     "ASYNC_PUBLISHER_FEW_PENDING_CHAINS", "ASYNC_PUBLISHER_FEW_PENDING_MAX_NS",
                     "ASYNC_PUBLISHER_LONG_IDLE_THRESHOLD", "ASYNC_PUBLISHER_LONG_IDLE_MAX_NS"],
@@ -22,11 +23,47 @@ class RetainedOptimizationsTest(unittest.TestCase):
         }
         sources = [p for directory in (ROOT / "csrc", ROOT / "deep_gemm/include")
                    for p in directory.rglob("*") if p.suffix in (".hpp", ".cuh", ".cpp")]
+        # Historical cleanup records may name retired experiments; current
+        # user-facing recipes must not advertise them as usable controls.
+        sources += [ROOT / "README.md", ROOT / "sgl_deep_gemm/README.md",
+                    ROOT / "docs/SM90_MEGAMOE_RDMA.md"]
+        contents = {source: source.read_text() for source in sources}
         for dtype, names in retired.items():
             for name in names:
                 key = f"DG_MEGA_MOE_{dtype}_{name}"
-                for source in sources:
-                    self.assertNotIn(key, source.read_text(), f"{key}: {source}")
+                for source, content in contents.items():
+                    self.assertNotIn(key, content, f"{key}: {source}")
+
+    def test_buffer_and_fp4_launch_use_real_topology(self):
+        source = (ROOT / "csrc/apis/sm90_mega.hpp").read_text()
+        start = source.index("get_symm_buffer_size_for_sm90_mega_moe(")
+        sizing = source[start:source.index("static void fp8_mega_moe_impl(", start)]
+        self.assertIn("const bool internode = num_ranks > 8;", sizing)
+        self.assertIn("internode, internode,", sizing)
+        self.assertNotIn("get_env", sizing)
+        self.assertIn("const bool fp4_internode = num_ranks > 8;", source)
+
+    def test_documented_mega_switches_exist_in_implementation(self):
+        implementation = "\n".join(
+            p.read_text() for directory in (ROOT / "csrc", ROOT / "deep_gemm", ROOT / "sgl_deep_gemm")
+            for p in directory.rglob("*")
+            if p.suffix in (".hpp", ".cuh", ".cpp", ".py") and "tests" not in p.parts
+        )
+        for path in (ROOT / "README.md", ROOT / "docs/SM90_MEGAMOE_RDMA.md"):
+            switches = set(re.findall(r"\bDG_MEGA_MOE_[A-Z0-9_]+\b", path.read_text()))
+            self.assertTrue(switches)
+            for switch in switches:
+                self.assertIn(switch, implementation, f"{switch}: {path}")
+
+    def test_reproduction_bash_syntax(self):
+        guide = (ROOT / "docs/SM90_MEGAMOE_RDMA.md").read_text()
+        blocks = re.findall(r"```bash\n(.*?)\n```", guide, flags=re.S)
+        self.assertGreaterEqual(len(blocks), 6)
+        for index, block in enumerate(blocks):
+            # Parse only: never build, launch a process group, or contact a node.
+            result = subprocess.run(["bash", "-n"], input=block, text=True,
+                                    capture_output=True)
+            self.assertEqual(result.returncode, 0, f"block {index}: {result.stderr}")
 
     def test_effective_switches_are_retained(self):
         kept = {

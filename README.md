@@ -113,7 +113,9 @@ For more details and the paged version `fp8_paged_mqa_logits`, please refer to `
 
 #### Mega MoE
 
-Mega MoE fuses and overlaps EP dispatch, linear 1 (FP8xFP4), SwiGLU, linear 2 (FP8xFP4), and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It requires multi-process launch with symmetric memory. Usage:
+Mega MoE fuses and overlaps EP dispatch, linear 1, SwiGLU, linear 2, and EP combine into a single mega-kernel. This branch includes SM90 FP8 and online FP4-weight implementations with NVLink communication within a node and NVSHMEM/IBGDA RDMA across nodes. Inter-node support has additional runtime and topology requirements; the general library requirements above are not sufficient.
+
+For the SM90 RDMA support matrix, recommended opt-in configurations, build/link dependencies, and two-node accuracy/performance commands, see [SM90 MegaMoE RDMA](docs/SM90_MEGAMOE_RDMA.md). The following example illustrates the generic API, not a complete RDMA launch:
 
 ```python
 # Allocate symmetric memory buffer
@@ -179,9 +181,10 @@ The library also provides some environment variables, which may be useful:
     - `DG_JIT_DUMP_SASS`: `0` or `1`, dump SASS output, `0` by default
     - `DG_COMM_KERNEL_DEBUG`: `0` or `1`, zero symmetric buffer before each Mega MoE call for debugging, `0` by default
     - `DG_USE_NVIDIA_TOOLS`: `0` or `1`, skip internal profiling when running under external NVIDIA tools, `0` by default
-- FP4 inter-node MegaMoE publisher
+- SM90 inter-node MegaMoE
+    - [Support matrix and two-node reproduction guide](docs/SM90_MEGAMOE_RDMA.md). Recommended opt-in settings are not the same as source defaults; FP4 LTO and FP8 ordinary RDC can coexist in one wheel.
     - Only the fused GPU publisher is supported on this branch. The removed auxiliary publisher experiments remain recoverable from Git commit `d97e8e113`.
-    - `DG_MEGA_MOE_FP4_FORCE_PACKED_DISPATCH`: `0` (default) retains dense-V3 metadata for requested capacity <= 256 and packed metadata above it; `1` forces packed metadata for every inter-node FP4 capacity without changing the allocated buffer or compute configuration. This is an experimental A/B override, not a new default or a demonstrated performance improvement; it does not change the FP8 path.
+    - Both FP4 and FP8 select dense-V3 metadata for caller-requested capacity <= 256 and packed metadata above it, independently of the current batch and internal 384-token alignment. Both protocols retain the fused GPU publisher and ring lifetime checks.
     - `sgl_deep_gemm/tests/test_mega_moe_perf_sweep.py` defaults to **MegaMoE kernel-only (Kineto) vs DeepEP end-to-end**. Use `--mega-timing kineto --deep-ep-timing cuda-events` explicitly for reproducible main results; every result includes timing-method labels. `--mega-timing cuda-events` and `--deep-ep-timing kineto-sum` are auxiliary diagnostics. `--kineto-trace-dir` saves per-rank traces to audit kernel selection; a missing MegaMoE kernel fails instead of falling back to another timing method.
     - DeepEP low-latency masked GEMMs use the current batch's expected expert-row count, independently of allocated buffer capacity. `--deep-ep-expected-m batch` is the default; `capacity` reproduces the legacy capacity-based hint for diagnostic A/Bs only. Each batch logs its policy and actual expected-M value. Both policies retain the same ceiling-division rounding and buffer sizes.
     - `DG_MEGA_MOE_FP4_SFB_N_CONTIGUOUS`: experimentally arrange packed UE8M0 scale factors with adjacent N rows in memory during weight transformation. Logical tensor dimensions and packed FP4 weights are unchanged; kernel selection follows actual scale-tensor strides. Disabled by default.
@@ -189,17 +192,10 @@ The library also provides some environment variables, which may be useful:
     - `DG_MEGA_MOE_FP4_EXPERTS_PER_WAVE`: diagnostic expert-wave override, restricted to full-pool storage so compute-ring lifetime limits cannot be bypassed; `0` keeps the normal heuristic. The sweep driver's isolated `--path fused --mega-num-sms N` can separately vary the MegaMoE CTA budget without changing DeepEP.
     - `DG_MEGA_MOE_FP4_PAIRED_PRMT`: experimentally share magnitude masking and sign extraction across the two halves of each packed FP4 word during online decode; leaves weight storage, warp roles and stage synchronization unchanged. Disabled by default.
     - `DG_MEGA_MOE_FP4_PACKED_GMMA_DESC`: experimentally encode WGMMA shared-memory descriptors with explicit bit packing instead of bitfield assignments. Applies to fused FP4 compute, with identical field truncation, addresses and synchronization. Disabled by default; not a weight predecode path.
-    - `DG_MEGA_MOE_FP4_REUSE_GMMA_DESC`: experimentally reuse per-stage WGMMA descriptor bases and advance their address fields for aligned K/N offsets, preserving the other fields and stage lifetimes. Independent of bit packing and disabled by default; applies to fused FP4 compute without predecoding weights.
     - `DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_MODE`: `0` uses the density-based automatic policy, `1` forces eager polling, and `2` forces adaptive idle backoff; defaults to `0`
     - `DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_INITIAL_NS`: initial idle-poll nanosleep duration, `64` ns by default
     - `DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_BACKOFF_MAX_NS`: maximum exponential idle-poll nanosleep duration, `512` ns by default; must be at least the initial duration
-    - `DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_FEW_PENDING_CHAINS`: treat this many remaining expert-pair chains owned by one publisher CTA as tail work and cap their sleep separately; this is not a destination-rank count, and `0` disables the tail cap by default
-    - `DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_FEW_PENDING_MAX_NS`: maximum sleep while at or below the few-pending chain count; defaults to the regular maximum
-    - `DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_THRESHOLD`: consecutive empty passes before the maximum sleep may grow beyond the regular cap; `0` disables long-idle escalation by default
-    - `DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_LONG_IDLE_MAX_NS`: maximum sleep after the long-idle threshold; defaults to the regular maximum
-    - `DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_PROGRESS_BLOCK_BUDGET`: yield after publishing this many ready output blocks; `0` disables productive-path yielding by default
-    - `DG_MEGA_MOE_FP4_ASYNC_PUBLISHER_PROGRESS_YIELD_NS`: productive-path nanosleep duration, `64` ns by default
-    - `DG_MEGA_MOE_FP4_PUBLISH_ROW_MASK`: build per-destination 32-row masks during dispatch so the async publisher skips empty blocks/halves and only loads active-row metadata; disabled by default after the initial batch-16/64 A/B, set to `1` to enable the experimental path
+    - `DG_MEGA_MOE_PHASE_PROFILE`: `1` enables device-side timing/counters; `0` by default. Disable it for main performance results. `DG_MEGA_MOE_PHASE_PROFILE_SILENT=1` only suppresses profile printing, not instrumentation overhead.
 - Build options
     - `DG_SKIP_CUDA_BUILD`: `0` or `1`, skip CUDA extension build during installation, `0` by default
     - `DG_FORCE_BUILD`: `0` or `1`, force local build instead of downloading pre-built wheels, `0` by default
