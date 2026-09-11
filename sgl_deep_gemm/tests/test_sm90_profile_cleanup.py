@@ -109,6 +109,97 @@ class ProfileCleanupTest(unittest.TestCase):
         self.assertIn("kNumEpilogueThreads == 512 ? 32 : 48", source)
         self.assertIn("kNumEpilogueThreads == 512 ? 24 : 40", source)
 
+    def test_fp4_counts_only_nonempty_rdma_batches(self):
+        source = FP4.read_text()
+        marker = source.index("publisher_metadata_loads +=")
+        start = source.rfind("#ifdef DG_MEGA_MOE_PHASE_PROFILE\n", 0, marker)
+        start += len("#ifdef DG_MEGA_MOE_PHASE_PROFILE\n")
+        body = source[start:source.index("#endif", marker)]
+        # Compile the real counter update, not a separately reimplemented
+        # predicate. CPU masks model empty, sparse, full and partial row groups.
+        code = r'''
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+namespace cute { using std::min; }
+struct Counts { uint64_t metadata = 0, batches = 0; };
+void record(Counts& counts, uint32_t valid_m, uint32_t row_base,
+            uint32_t active_rows, bool chain_is_inter, uint32_t lane_idx) {
+    constexpr uint32_t kPublishRowsPerBatch = 32;
+    auto& publisher_metadata_loads = counts.metadata;
+    auto& publisher_rdma_batches = counts.batches;
+''' + body + r'''
+}
+int main() {
+    for (uint32_t valid_m : {0u,1u,31u,32u,33u,63u,64u,65u,127u,128u})
+    for (bool inter : {false,true}) for (uint32_t lane = 0; lane < 32; ++lane)
+    for (uint32_t pattern : {0u,1u,0x80000000u,0xaaaaaaaau,0xffffffffu}) {
+        Counts counts;
+        uint64_t expected_batches = 0;
+        for (uint32_t row_base = 0; row_base < valid_m; row_base += 32) {
+            const uint32_t rows = std::min(32u, valid_m - row_base);
+            const uint32_t valid_mask = rows == 32 ? 0xffffffffu : ((1u << rows) - 1);
+            const uint32_t mask = pattern & valid_mask;
+            record(counts, valid_m, row_base, mask, inter, lane);
+            expected_batches += inter && lane == 0 && mask != 0;
+        }
+        assert(counts.batches == expected_batches);
+        assert(counts.metadata == (lane == 0 ? valid_m : 0));
+    }
+    Counts regression;
+    record(regression, 64, 0, 0, true, 0);
+    record(regression, 64, 32, 0xffffffffu, true, 0);
+    assert(regression.metadata == 64 && regression.batches == 1);
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="sm90-batch-counter-") as directory:
+            binary = str(Path(directory) / "counter")
+            subprocess.run([CXX, "-std=c++17", "-x", "c++", "-", "-o", binary],
+                           input=code, text=True, capture_output=True, check=True)
+            subprocess.run([binary], check=True)
+        # The metric counts non-empty submissions, not calls or fragment WQEs.
+        ibgda = (ROOT / "deep_gemm/include/deep_gemm/comm/ibgda.cuh").read_text()
+        self.assertIn("if (lane_id == 0 and total_wqes != 0)\n"
+                      "        ibgda_submit_requests(qp, base_wqe_idx, total_wqes);", ibgda)
+
+    def test_fp4_unused_profile_sums_removed(self):
+        source = FP4.read_text()
+        for name in ("sum_l1_cycles", "sum_l2_cycles", "sum_decode_wait_cycles",
+                     "sum_a_wait_cycles", "sum_scatter_cycles"):
+            self.assertNotIn(name, source)
+        for name in ("max_cycles[kProfileL1]", "max_cycles[kProfileL2]",
+                     "max_cycles[kProfileDecodeWait]", "max_cycles[kProfileAWait]",
+                     "max_cycles[kProfileScatter]", "FP4_MEGA_MOE_PUBLISH_PROFILE"):
+            self.assertIn(name, source)
+
+    def test_fp8_fixed_register_requests_compile_without_override(self):
+        host = (ROOT / "csrc/jit_kernels/impls/sm90_fp8_mega_moe.hpp").read_text()
+        device = FP8.read_text()
+        self.assertNotIn("kEpilogueRegisterBudget", host + device)
+        self.assertNotIn("epilogue_registers", host)
+        begin = device.index("    constexpr uint32_t kNumEpilogueRegisters =")
+        end = device.index("    constexpr uint32_t kDispatchGridSyncIndex", begin)
+        body = device[begin:end]
+        code = r'''
+#include <cstdint>
+#define DG_STATIC_ASSERT static_assert
+template<uint32_t kNumEpilogueThreads> struct Quotas {
+    static constexpr uint32_t kNumDispatchThreads = 64, kNumNonEpilogueThreads = 64;
+''' + body.replace("constexpr uint32_t", "static constexpr uint32_t") + r'''
+};
+static_assert(Quotas<256>::kNumEpilogueRegisters == 168);
+static_assert(Quotas<256>::kNumDispatchRegisters == 48);
+static_assert(Quotas<256>::kNumNonEpilogueRegisters == 40);
+static_assert(Quotas<512>::kNumEpilogueRegisters == 112);
+static_assert(Quotas<512>::kNumDispatchRegisters == 32);
+static_assert(Quotas<512>::kNumNonEpilogueRegisters == 24);
+'''
+        subprocess.run([CXX, "-std=c++17", "-x", "c++", "-fsyntax-only", "-"],
+                       input=code, text=True, capture_output=True, check=True)
+        self.assertIn("if (config.num_epilogue_threads == 512)", host)
+        self.assertIn("DG_HOST_ASSERT(32 * config.num_dispatch_threads +", host)
+        self.assertIn("112 * config.num_epilogue_threads <= 64512", host)
+
     def test_real_profile_reader_compiles_and_reports_live_fields(self):
         source = FP8.read_text()
         enum = re.search(r"enum ProfileSlot : uint32_t \{.*?\n    };", source, re.S)[0]

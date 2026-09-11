@@ -2690,7 +2690,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 publisher_metadata_loads += cute::min(
                                     valid_m - row_base,
                                     kPublishRowsPerBatch);
-                                if (chain_is_inter)
+                                // Empty row groups submit no WQEs. Count only
+                                // non-empty RDMA batches, not helper calls.
+                                if (chain_is_inter and active_rows != 0)
                                     ++ publisher_rdma_batches;
                             }
 #endif
@@ -4927,11 +4929,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
             unsigned long long remote_read_count = 0;
             unsigned long long l1_block_count = 0;
             unsigned long long l2_block_count = 0;
-            unsigned long long sum_l1_cycles = 0;
-            unsigned long long sum_l2_cycles = 0;
-            unsigned long long sum_decode_wait_cycles = 0;
-            unsigned long long sum_a_wait_cycles = 0;
-            unsigned long long sum_scatter_cycles = 0;
             unsigned long long publish_total_blocks = 0;
             unsigned long long publish_empty_dst_blocks = 0;
             unsigned long long publish_metadata_loads = 0;
@@ -4954,11 +4951,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 remote_read_count += row[kProfileRemoteReadCount];
                 l1_block_count += row[kProfileL1BlockCount];
                 l2_block_count += row[kProfileL2BlockCount];
-                sum_l1_cycles += row[kProfileL1];
-                sum_l2_cycles += row[kProfileL2];
-                sum_decode_wait_cycles += row[kProfileDecodeWait];
-                sum_a_wait_cycles += row[kProfileAWait];
-                sum_scatter_cycles += row[kProfileScatter];
                 publish_total_blocks +=
                     row[kProfilePublishTotalBlocks];
                 publish_empty_dst_blocks +=

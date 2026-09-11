@@ -221,7 +221,8 @@ public:
 
         // Kernels that use NVSHMEM (e.g. cross-node mega-moe) must device-link
         // `libnvshmem_device.a`; all other kernels keep the original single-step
-        // `-cubin`. Trigger: the generated source `#include`s an nvshmem header.
+        // `-cubin`. Trigger: DG_NVSHMEM_HOME is non-empty and the generated
+        // source contains the text "nvshmem"; a comment marker also qualifies.
         const auto nvshmem_home = get_env<std::string>("DG_NVSHMEM_HOME");
         const bool needs_nvshmem = not nvshmem_home.empty()
                                    and code.find("nvshmem") != std::string::npos;

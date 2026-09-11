@@ -60,6 +60,21 @@
 本轮不修改有效优化、环境默认值、形状阈值、workspace 布局或 RDMA 生命周期。
 本地源码契约/等价性检查不能替代 Linux wheel 重建和双机数值/性能验证。
 
+## 2026-09-11：提交后复查补漏
+
+- FP4 `publish_rdma_batches` 仅统计跨机且 active-row mask 非零的批次，
+  不再把未提交 WQE 的空组计入。只改 profiling 计数，不改变发送调用和同步。
+- 删除 FP4 只累加、没有消费者的五个 `sum_*_cycles` 变量；保留当前输出的
+  max-cycle 指标及 publisher 计数。profiling buffer 大小及 slot 编号不变。
+- FP8 删除内部寄存器预算覆盖参数及 JIT 传递链，math 的请求仍为
+  256-thread 路径 168、512-thread 路径 112；dispatch/loader 请求不变。
+  保留原 split-MN host 预算断言和两种拓扑的 device 静态预算断言。
+- 修正 NVSHMEM 链接触发条件注释：需要 `DG_NVSHMEM_HOME` 非空且生成源码
+  包含 `nvshmem` 字符串，注释 marker 也满足；未改变链接实现或 LTO 策略。
+
+本轮不修改公开 API、有效优化、默认值、数据布局或 ring 生命周期。
+内部模板参数减少后需要重建 wheel；本地 CPU 检查不替代双机验证。
+
 以下为 2026-09-09 的历史清理记录。
 
 ## 保留的实现

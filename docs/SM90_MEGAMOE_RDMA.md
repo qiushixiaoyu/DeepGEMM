@@ -77,6 +77,10 @@ GLM5.3 在本项目使用用户确认的同一组 MoE 维度。小 batch 常用�
   `scatter_staging_cycles` 保持原口径：取 scatter 总耗时最大的 SM 的 staging
   累计值，不是 publisher 耗时，也不是各 SM staging 的独立最大值。
   globaltimer 的跨 GPU 比较需要另行确认时钟对齐，不能仅凭绝对时间戳推断。
+- FP4 的 `publish_rdma_batches` 统计跨机 publisher 的非空 row 批次；对目的
+  rank 没有 active row 的组不计数。它不是 helper 调用次数、WQE 数量、网络
+  包数或 CQ 完成数。修正前的历史日志包含空组尝试，不能直接比较该字段。
+  `publish_metadata_loads` 仍统计逻辑 metadata 读取次数，不代表实际显存事务。
 
 旧 [FP8 分支记录](../SM90_FP8_MEGAMOE_RDMA_BRANCHES.md) 仅作为历史归档；
 其中单机路径、旧开关和按历史 shape 限制 split-phase 的描述不适用于当前版本。

@@ -201,7 +201,6 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
-    uint32_t kEpilogueRegisterBudget,
     bool kReuseAccumAsFinal,
     bool kL2ArrivalCounter,
     bool kL2EpilogueRequiresFullSync,
@@ -778,9 +777,7 @@ sm90_fp8_mega_moe_impl(void* y,
     // These are setmaxnreg requests, not evidence of emitted instructions or
     // actual per-role allocation; inspect the linked binary to establish that.
     constexpr uint32_t kNumEpilogueRegisters =
-        kEpilogueRegisterBudget == 0 ?
-            (kNumEpilogueThreads == 512 ? 112 : 168) :
-            kEpilogueRegisterBudget;
+        kNumEpilogueThreads == 512 ? 112 : 168;
     constexpr uint32_t kNumDispatchRegisters =
         kNumEpilogueThreads == 512 ? 32 : 48;
     constexpr uint32_t kNumNonEpilogueRegisters =

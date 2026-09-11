@@ -43,7 +43,6 @@ public:
         int num_l2_ring_tokens, num_l2_sf_storage_tokens;
         float activation_clamp;
         bool fast_math;
-        int epilogue_registers;
         bool reuse_accum_as_final;
         bool l2_arrival_counter;
         bool l2_epilogue_requires_full_sync;
@@ -241,7 +240,6 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {},
         {}
     >);
 }};
@@ -265,7 +263,6 @@ static void __instantiate_kernel() {{
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
-    args.epilogue_registers,
     args.reuse_accum_as_final ? "true" : "false",
     args.l2_arrival_counter ? "true" : "false",
     args.l2_epilogue_requires_full_sync ? "true" : "false",
@@ -358,17 +355,12 @@ static void sm90_fp8_mega_moe(
         num_max_tokens_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden, num_l1_sf_storage_tokens,
         num_compute_ring_tokens);
-    const int default_epilogue_registers =
-        config.num_epilogue_threads == 512 ? 112 : 0;
-    const int epilogue_registers = default_epilogue_registers;
-    if (epilogue_registers > 0) {
-        const int dispatch_registers =
-            config.num_epilogue_threads == 512 ? 32 : 48;
-        const int non_epilogue_registers =
-            config.num_epilogue_threads == 512 ? 24 : 40;
-        DG_HOST_ASSERT(dispatch_registers * config.num_dispatch_threads +
-                       non_epilogue_registers * config.num_non_epilogue_threads +
-                       epilogue_registers * config.num_epilogue_threads <= 64512);
+    // Preserve the split-MN host budget check. Both supported topologies
+    // also check their fixed register requests in the device specialization.
+    if (config.num_epilogue_threads == 512) {
+        DG_HOST_ASSERT(32 * config.num_dispatch_threads +
+                       24 * config.num_non_epilogue_threads +
+                       112 * config.num_epilogue_threads <= 64512);
     }
     const bool reuse_accum_as_final = config.block_m == 128;
     const bool default_split_mn_barrier_opt =
@@ -503,7 +495,6 @@ static void sm90_fp8_mega_moe(
         .num_l2_sf_storage_tokens = num_l2_sf_storage_tokens,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
-        .epilogue_registers = epilogue_registers,
         .reuse_accum_as_final = reuse_accum_as_final,
         .l2_arrival_counter = l2_arrival_counter,
         .l2_epilogue_requires_full_sync = l2_epilogue_requires_full_sync,

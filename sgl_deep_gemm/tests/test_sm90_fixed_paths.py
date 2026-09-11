@@ -87,8 +87,7 @@ class FixedPathsTest(unittest.TestCase):
                 wanted.update({param: f'args.{field} ? "true" : "false"'
                                for param, field in bools.items()})
                 if name == "sm90_fp8_mega_moe":
-                    wanted.update(kNumPaddedSFPoolTokens="args.config.num_padded_sf_pool_tokens",
-                                  kEpilogueRegisterBudget="args.epilogue_registers")
+                    wanted.update(kNumPaddedSFPoolTokens="args.config.num_padded_sf_pool_tokens")
                 compact = lambda values: {key: re.sub(r"\s+", "", value)
                                           for key, value in values.items()}
                 self.assertEqual(compact(bindings), compact(wanted))
