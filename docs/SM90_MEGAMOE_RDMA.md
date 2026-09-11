@@ -1,6 +1,9 @@
 # SM90 MegaMoE RDMA：支持范围与双机复现
 
 适用于本分支的 `sgl-deep-gemm` wheel（Python 导入名为 `deep_gemm`）。
+SM90 FP4/FP8 MegaMoE **仅支持跨机 RDMA**，已删除单机 fallback；单机及不完整
+八卡域拓扑会在对称内存分配前被拒绝。双机内部的 NVLink 通信仍然保留。
+其他 GEMM 和 SM100 算子的单机支持不受影响。
 本说明整理已有实现和测试方法，不代表重新完成了一轮 GPU 验证。
 历史优化取舍见 [清理记录](SM90_MEGAMOE_RDMA_CLEANUP.md)，packed manifest
 的顺序和生命周期约束见 [协议说明](SM90_PACKED_MANIFEST_PROTOCOL.md)。
@@ -18,11 +21,11 @@
 | 权重转换 | `transform_weights_for_mega_moe_sm90_fp4` | `transform_weights_for_mega_moe_sm90` |
 | GPU | SM90 Hopper；双机测试环境为每节点 8×H20 | 相同 |
 | 节点内 / 跨节点 | 节点内 NVLink；跨节点 NVSHMEM IBGDA，融合 GPU publisher | 相同 |
-| 跨节点拓扑 | 每个 NVLink 域固定 8 ranks；完整域、连续 rank 编号；跨节点 rank 数是 8 的倍数且不超过 64 | 相同 |
+| 跨节点拓扑 | 每个 NVLink 域固定 8 ranks；完整域、连续 rank 编号；总数 16～64 且为 8 的倍数；不支持单机 | 相同 |
 | 已验证主拓扑 | 两节点、16 ranks、每 GPU 一个进程 | 相同；不把源码 rank 上限当作 EP64 实测结论 |
 | 形状必要条件 | `hidden`、`intermediate` 为 128 的倍数，`intermediate <= 4096`；experts 可被 EP size 整除 | 相同；仍须满足实际 JIT tile/thread/layout 检查 |
 | 当前推荐设备链接 | 满足 balanced-register 形状条件且启用时使用 full device LTO；其余走普通 RDC | 普通 NVCC RDC；不默认引入 FP8 LTO 实验 |
-| 不包含的路径 | 预解码权重缓存、sidecar publisher、CPU proxy、强制单机模拟 RDMA | sidecar / CPU proxy |
+| 不包含的路径 | 单机 fallback、预解码权重缓存、sidecar publisher、CPU proxy、强制单机模拟 RDMA | 单机 fallback、sidecar / CPU proxy |
 
 输入应使用 buffer 暴露的视图：`x` 为 FP8 E4M3，`x_sf` 为 FP32，
 `topk_idx` 为 int64，`topk_weights` 为 FP32；路由必须是合法 expert ID。
@@ -50,7 +53,7 @@ GLM5.3 在本项目使用用户确认的同一组 MoE 维度。小 batch 常用�
   和固定地址 manifest；两者都保留 epoch、发送完成 credit 和 ring 复用保护。
 - warp 编号要区分 CTA 编号与 non-epilogue 相对编号。dispatch warps 位于 CTA
   开头；之后 non-epilogue warp 0 负责合并的 operand loader，warp 1 负责跨机
-  publisher（单机路径不运行该 publisher）。FP4 decode helpers 从该区域的
+  publisher。FP4 decode helpers 从该区域的
   warp 2 开始；math warpgroups 处理 WGMMA 和 epilogue。FP8 无 decode helpers，
   weight scale 由 math 路径加载。线程数和配额由形状决定，不能把示例拓扑当作常量。
 - 基础 FP4 publisher backoff 默认 `MODE=0`，由密度策略决定是否退避；启用时
@@ -311,6 +314,7 @@ reference 和 trace 目录。对三条路径分别重新完成精度门禁后测
 
 ```bash
 python3 sgl_deep_gemm/tests/test_sm90_rdma_cleanup.py
+python3 sgl_deep_gemm/tests/test_sm90_rdma_only.py
 python3 sgl_deep_gemm/tests/test_sm90_packed_manifest.py
 python3 sgl_deep_gemm/tests/test_sm90_combine_ring_alignment.py
 git diff --check

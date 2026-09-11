@@ -34,14 +34,12 @@ class RetainedOptimizationsTest(unittest.TestCase):
                 for source, content in contents.items():
                     self.assertNotIn(key, content, f"{key}: {source}")
 
-    def test_buffer_and_fp4_launch_use_real_topology(self):
+    def test_buffer_and_launches_require_rdma_topology(self):
         source = (ROOT / "csrc/apis/sm90_mega.hpp").read_text()
-        start = source.index("get_symm_buffer_size_for_sm90_mega_moe(")
-        sizing = source[start:source.index("static void fp8_mega_moe_impl(", start)]
-        self.assertIn("const bool internode = num_ranks > 8;", sizing)
-        self.assertIn("internode, internode,", sizing)
-        self.assertNotIn("get_env", sizing)
-        self.assertIn("const bool fp4_internode = num_ranks > 8;", source)
+        self.assertEqual(source.count("check_sm90_mega_moe_rdma_topology(num_ranks);"), 3)
+        self.assertNotIn("const bool internode", source)
+        self.assertNotIn("const bool fp4_internode", source)
+        self.assertNotIn("combine_uses_full_row", source)
 
     def test_documented_mega_switches_exist_in_implementation(self):
         implementation = "\n".join(

@@ -115,6 +115,8 @@ For more details and the paged version `fp8_paged_mqa_logits`, please refer to `
 
 Mega MoE fuses and overlaps EP dispatch, linear 1, SwiGLU, linear 2, and EP combine into a single mega-kernel. This branch includes SM90 FP8 and online FP4-weight implementations with NVLink communication within a node and NVSHMEM/IBGDA RDMA across nodes. Inter-node support has additional runtime and topology requirements; the general library requirements above are not sufficient.
 
+The SM90 FP4/FP8 MegaMoE operator is **RDMA-only**: 16–64 ranks in complete eight-GPU NVLink domains with node-contiguous rank numbering. Single-node execution is rejected before symmetric-buffer allocation; there is no single-node fallback. NVLink communication between peers within each RDMA node remains part of the algorithm. Other GEMMs and SM100 operators are unchanged.
+
 For the SM90 RDMA support matrix, recommended opt-in configurations, build/link dependencies, and two-node accuracy/performance commands, see [SM90 MegaMoE RDMA](docs/SM90_MEGAMOE_RDMA.md). The following example illustrates the generic API, not a complete RDMA launch:
 
 ```python

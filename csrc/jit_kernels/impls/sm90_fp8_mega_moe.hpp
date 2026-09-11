@@ -5,6 +5,7 @@
 #include "../../jit/kernel_runtime.hpp"
 #include "../../utils/exception.hpp"
 #include "../../utils/format.hpp"
+#include "../../utils/sm90_mega_moe_rdma.hpp"
 #include "runtime_utils.hpp"
 
 #include <deep_gemm/layout/mega_moe.cuh>
@@ -83,13 +84,12 @@ public:
         // dispatch/combine) take the NVSHMEM remote path. The `nvshmem` mention
         // in the comment also makes the JIT compiler device-link libnvshmem_device.
         constexpr int kNvlPeers = 8;
-        const bool internode = args.num_ranks > kNvlPeers;
-        std::string internode_prefix;
+        check_sm90_mega_moe_rdma_topology(args.num_ranks);
         // Validated opt-in optimizations; keep FP8's own density policy.
         const int packed_desc = get_env<int>("DG_MEGA_MOE_FP8_PACKED_GMMA_DESC", 0);
         DG_HOST_ASSERT(packed_desc == 0 or packed_desc == 1);
-        if (internode)
-            internode_prefix = fmt::format(
+        std::string internode_prefix = fmt::format(
+                "// sm90 mega-moe RDMA-only protocol revision 4\n"
                 "// inter-node mega-moe: uses nvshmem device functions\n"
                 "#define DG_MEGA_MOE_INTERNODE\n"
                 "#define DG_MEGA_MOE_NVL_PEERS {}\n",
@@ -146,7 +146,7 @@ public:
         if (device_diagnostics)
             internode_prefix +=
                 "#define DG_MEGA_MOE_DEVICE_DIAGNOSTICS 1\n";
-        else if (internode)
+        else
             internode_prefix +=
                 "#define DG_DEVICE_ASSERT_TRAP_ONLY 1\n";
         // Unified two-level dispatch handshake. Packed mode compacts live route
@@ -157,15 +157,11 @@ public:
         // manifest, without compaction/decode. Both gateway modes use the current
         // double-buffered epoch lifetime. Inter-node builds always use one of
         // these two gateway formats; the per-entry direct path is not built.
-        DG_HOST_ASSERT(not internode or
-                       args.num_ranks % static_cast<uint32_t>(kNvlPeers) == 0);
         // Storage is aligned to 384 tokens, but protocol selection follows
         // the exact capacity requested by the caller: small-capacity buffers
         // use the dense V3 wire format and larger buffers use packed metadata.
-        const int dispatch_gateway = internode
-            ? (args.requested_num_max_tokens_per_rank <=
-                   layout::kGatewayDenseMaxRequestedTokens ? 4 : 3)
-            : 0;
+        const int dispatch_gateway = args.requested_num_max_tokens_per_rank <=
+            layout::kGatewayDenseMaxRequestedTokens ? 4 : 3;
         if (dispatch_gateway == 3)
             internode_prefix +=
                 "#define DG_MEGA_MOE_DISPATCH_GATEWAY_PACKED 1\n";
@@ -262,11 +258,9 @@ static void __instantiate_kernel() {{
     args.num_l1_sf_storage_tokens,
     args.num_l2_ring_tokens,
     args.num_l2_sf_storage_tokens,
-    internode ?
-        layout::get_num_sm90_combine_ring_tokens(
+    layout::get_num_sm90_combine_ring_tokens(
             args.num_ranks, args.num_max_tokens_per_rank, args.num_topk,
-            args.num_experts / args.num_ranks) :
-        args.config.num_max_pool_tokens,
+            args.num_experts / args.num_ranks),
     args.config.num_padded_sf_pool_tokens,
     args.config.num_stages,
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
@@ -332,6 +326,7 @@ static void sm90_fp8_mega_moe(
     const bool& fast_math
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    check_sm90_mega_moe_rdma_topology(num_ranks);
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_l1_ring_tokens = static_cast<int>(l1_acts.size(0));
     const auto num_l1_sf_storage_tokens =

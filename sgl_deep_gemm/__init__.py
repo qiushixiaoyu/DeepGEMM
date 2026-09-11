@@ -284,6 +284,16 @@ def _from_dlpack_if_needed(tensor, dtype: Optional[torch.dtype] = None) -> torch
     return tensor
 
 
+def _check_sm90_mega_moe_rdma_group(group):
+    num_ranks = group.size()
+    if num_ranks <= 8 or num_ranks > 64 or num_ranks % 8 != 0:
+        raise ValueError(
+            "SM90 FP4/FP8 MegaMoE is RDMA-only: requires 16..64 ranks in "
+            "complete eight-GPU NVLink domains with node-contiguous ranks; "
+            "single-node execution is not supported."
+        )
+
+
 class SM90SymmBuffer:
     def __init__(self, group,
                  num_experts: int,
@@ -292,6 +302,9 @@ class SM90SymmBuffer:
                  use_fp8_dispatch: bool = True,
                  activation: str = 'swiglu',
                  requested_num_max_tokens_per_rank: Optional[int] = None):
+        # Reject unsupported topology before loading or allocating a collective
+        # symmetric-memory backend, so a single-node call cannot enter fallback.
+        _check_sm90_mega_moe_rdma_group(group)
         import torch.distributed._symmetric_memory as symm_mem
 
         self.group = group
@@ -345,6 +358,7 @@ def get_symm_buffer_for_sm90_mega_moe(group,
                                       hidden: int, intermediate_hidden: int,
                                       use_fp8_dispatch: bool = True,
                                       activation: str = 'swiglu') -> SM90SymmBuffer:
+    _check_sm90_mega_moe_rdma_group(group)
     from .utils.math import align
 
     requested_num_max_tokens_per_rank = num_max_tokens_per_rank
@@ -466,6 +480,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
             fast_math,
         )
 
+    _check_sm90_mega_moe_rdma_group(sym_buffer.group)
     (l1_weights_data, l1_weights_sf) = l1_weights
     (l2_weights_data, l2_weights_sf) = l2_weights
     _C.fp8_fp4_mega_moe_sm90(
@@ -493,6 +508,7 @@ def fp8_mega_moe(y: torch.Tensor,
                  activation: str = 'swiglu',
                  activation_clamp: Optional[float] = None,
                  fast_math: bool = True):
+    _check_sm90_mega_moe_rdma_group(sym_buffer.group)
     (l1_weights_data, l1_weights_sf) = l1_weights
     (l2_weights_data, l2_weights_sf) = l2_weights
     _C.fp8_mega_moe(

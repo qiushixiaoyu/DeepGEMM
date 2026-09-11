@@ -5,6 +5,7 @@
 #include "../../jit/kernel_runtime.hpp"
 #include "../../utils/exception.hpp"
 #include "../../utils/format.hpp"
+#include "../../utils/sm90_mega_moe_rdma.hpp"
 #include "runtime_utils.hpp"
 
 #include <deep_gemm/layout/mega_moe.cuh>
@@ -123,13 +124,11 @@ public:
         // `nvshmem` mention in the comment also makes the JIT compiler
         // device-link libnvshmem_device.
         constexpr int kNvlPeers = 8;
-        // The shared implementation header now always parses the combine-ring
-        // type, whose IBGDA helper includes NVSHMEM device headers even when a
-        // <=8-rank specialization compiles every remote branch away.  Keep the
-        // marker unconditional so the JIT compiler supplies those include and
-        // device-link flags for single-node FP4 as well.
+        check_sm90_mega_moe_rdma_topology(args.num_ranks);
+        // Keep the NVSHMEM marker in every generated RDMA specialization so
+        // JIT compilation supplies the device include/link dependencies.
         std::string internode_prefix =
-            "// sm90 fp4 mega-moe protocol revision 3\n"
+            "// sm90 mega-moe RDMA-only protocol revision 4\n"
             "// sm90 fp4 mega-moe support uses nvshmem device helpers\n";
         if (args.sfb_n_contiguous)
             internode_prefix += "#define DG_MEGA_MOE_FP4_SFB_N_CONTIGUOUS 1\n";
@@ -172,7 +171,7 @@ public:
             const int balanced_registers = get_env<int>(
                 "DG_MEGA_MOE_FP4_BALANCED_WG_REGISTERS", 0);
             DG_HOST_ASSERT(balanced_registers == 0 or balanced_registers == 1);
-            if (balanced_registers != 0 and args.num_ranks > kNvlPeers and
+            if (balanced_registers != 0 and
                 args.config.block_m == 64 and args.config.block_n == 128 and
                 args.config.block_k == 128 and args.config.num_dispatch_threads == 64 and
                 args.config.num_epilogue_threads == 256 and
@@ -234,7 +233,7 @@ public:
                     "#define DG_MEGA_MOE_FP4_SFB_SHARED_LOOKAHEAD_8W 1\n";
             }
         }
-        if (args.num_ranks > kNvlPeers) {
+        {
             internode_prefix += fmt::format(
                 "// inter-node mega-moe: uses nvshmem device functions\n"
                 "#define DG_MEGA_MOE_INTERNODE\n"
@@ -410,7 +409,7 @@ public:
         if (device_diagnostics)
             internode_prefix +=
                 "#define DG_MEGA_MOE_DEVICE_DIAGNOSTICS 1\n";
-        else if (args.num_ranks > kNvlPeers)
+        else
             internode_prefix +=
                 "#define DG_DEVICE_ASSERT_TRAP_ONLY 1\n";
         // SILENT suppresses profile printf, not clock/counter/store overhead.
@@ -467,11 +466,9 @@ static void __instantiate_kernel() {{
     args.num_l1_sf_storage_tokens,
     args.num_l2_ring_tokens,
     args.num_l2_sf_storage_tokens,
-    args.num_ranks > kNvlPeers ?
-        layout::get_num_sm90_combine_ring_tokens(
+    layout::get_num_sm90_combine_ring_tokens(
             args.num_ranks, args.num_max_tokens_per_rank, args.num_topk,
-            args.num_experts / args.num_ranks) :
-        args.config.num_max_pool_tokens,
+            args.num_experts / args.num_ranks),
     args.config.num_stages,
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
@@ -558,6 +555,7 @@ static void sm90_fp8_fp4_mega_moe(
     const bool& use_swap_ab_fast_amax = false
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    check_sm90_mega_moe_rdma_topology(num_ranks);
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_l1_ring_tokens = static_cast<int>(l1_acts.size(0));
     const auto num_l1_sf_storage_tokens =

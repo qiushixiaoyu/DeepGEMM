@@ -11,6 +11,8 @@ To build it locally, run `bash build_sgl_deep_gemm.sh`, then install the generat
 
 SM90 MegaMoE RDMA additionally requires the NVSHMEM-enabled symmetric-memory runtime, IBGDA transport, and the matching device-link inputs. See [`docs/SM90_MEGAMOE_RDMA.md`](../docs/SM90_MEGAMOE_RDMA.md) in this source repository for the support matrix, recommended FP4/FP8 configurations and two-node accuracy/performance commands. A generic single-node MegaMoE example is not a complete RDMA setup.
 
+The SM90 FP4/FP8 MegaMoE operator is RDMA-only (16–64 ranks, in complete eight-GPU domains); its single-node fallback has been removed. Other GEMM and SM100 APIs are unchanged.
+
 To release a new set of wheels, please contact SGLang team and run the [release workflow](https://github.com/sgl-project/sglang/actions/workflows/release-whl-deepgemm.yml) under SGLang repo
 
 For each major version release (0.X.Y -> 0.(X+1).0), a new branch should be created (release/v0.(X+1).0) for stability purpose.

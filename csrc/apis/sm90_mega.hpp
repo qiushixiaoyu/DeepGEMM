@@ -15,6 +15,7 @@
 #include "../jit_kernels/impls/sm90_mega_moe_pre_dispatch.hpp"
 #include "../utils/layout.hpp"
 #include "../utils/system.hpp"
+#include "../utils/sm90_mega_moe_rdma.hpp"
 
 namespace deep_gemm::mega {
 
@@ -138,9 +139,9 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     return {
         math_wg_participates_in_decode,
         0,
-        // Non-epilogue warp 0 loads A/SFA and B/SFB; warp 1 is reserved for
-        // the inter-node publisher (idle on the single-node path). Dedicated
-        // FP4 decode assistants start at non-epilogue warp 2.
+        // Non-epilogue warp 0 loads A/SFA and B/SFB; warp 1 runs the RDMA
+        // publisher. Dedicated FP4 decode assistants start at warp 2 of
+        // the same non-epilogue region.
         2,
         default_wide_load_decode,
         default_ss_early_b_decode,
@@ -156,16 +157,12 @@ get_symm_buffer_size_for_sm90_mega_moe_impl(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
-    const bool& use_fp8_dispatch, const std::string& activation,
-    const bool& combine_uses_full_row,
-    const bool& combine_uses_expert_ring,
-    const bool& l1_uses_ring,
-    const bool& l2_uses_ring) {
+    const bool& use_fp8_dispatch, const std::string& activation) {
+    check_sm90_mega_moe_rdma_topology(num_ranks);
     // This custom IBGDA protocol uses ordered WRITEs, not atomic signals.
     // Require the setting at process startup, before any NVSHMEM allocator
     // initializes/registers memory; changing it after initialization is unsafe.
-    if (num_ranks > 8 and
-        get_env<std::string>("NVSHMEM_IB_ENABLE_RELAXED_ORDERING", "") != "0")
+    if (get_env<std::string>("NVSHMEM_IB_ENABLE_RELAXED_ORDERING", "") != "0")
         DG_HOST_UNREACHABLE(
             "SM90 MegaMoE RDMA requires NVSHMEM_IB_ENABLE_RELAXED_ORDERING=0 "
             "at process startup, before NVSHMEM initialization; restart all ranks.");
@@ -212,19 +209,16 @@ get_symm_buffer_size_for_sm90_mega_moe_impl(
             num_experts / num_ranks));
     // Below the transition threshold the smooth-capacity policy intentionally
     // returns the full pool.  Treat that as "ring disabled".
-    const bool effective_l1_ring =
-        l1_uses_ring and num_compute_ring_tokens < num_max_pool_tokens;
-    const bool effective_l2_ring =
-        l2_uses_ring and num_compute_ring_tokens < num_max_pool_tokens;
+    const bool effective_l1_ring = num_compute_ring_tokens < num_max_pool_tokens;
+    const bool effective_l2_ring = effective_l1_ring;
     const auto num_l1_ring_tokens = effective_l1_ring ?
         num_compute_ring_tokens : num_max_pool_tokens;
     const auto num_l2_ring_tokens = effective_l2_ring ?
         num_compute_ring_tokens : num_max_pool_tokens;
-    const auto num_combine_staging_tokens = combine_uses_expert_ring ?
+    const auto num_combine_staging_tokens =
         static_cast<int>(layout::get_num_sm90_combine_ring_tokens(
             num_ranks, num_max_tokens_per_rank, num_topk,
-            num_experts / num_ranks)) :
-        num_max_pool_tokens;
+            num_experts / num_ranks));
     // Both SM90 FP8 and FP4 MegaMoE recipes use BLOCK_M={64,128}.  Sizing
     // against the common BLOCK_M=8 candidate inflated each SF pool to 16x
     // payload rows; two SF rows per payload row is the exact worst case.
@@ -272,7 +266,7 @@ get_symm_buffer_size_for_sm90_mega_moe_impl(
         combine_token_buffer.get_end_ptr());
 
     void* symm_buffer_end = dispatch_staging_buffer.get_end_ptr();
-    if (combine_uses_full_row) {
+    {
         const auto combine_full_row_arrival_buffer = layout::Buffer(
             layout::Data(sizeof(uint32_t), false), 1,
             workspace.num_max_pool_blocks, symm_buffer_end);
@@ -347,7 +341,7 @@ get_symm_buffer_size_for_sm90_mega_moe_impl(
     return {reinterpret_cast<int64_t>(symm_buffer_end), slice_input_buffers};
 }
 
-// FP8 and FP4 use the same topology-based full-row combine/ring policy.
+// RDMA FP8 and FP4 share the full-row combine/ring policy.
 // The shared layout reserves storage for both dense-V3 and packed metadata.
 static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
 get_symm_buffer_size_for_sm90_mega_moe(
@@ -355,12 +349,9 @@ get_symm_buffer_size_for_sm90_mega_moe(
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const bool& use_fp8_dispatch, const std::string& activation) {
-    const bool internode = num_ranks > 8;
     return get_symm_buffer_size_for_sm90_mega_moe_impl(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
-        hidden, intermediate_hidden, use_fp8_dispatch, activation,
-        internode, internode,
-        true, true);
+        hidden, intermediate_hidden, use_fp8_dispatch, activation);
 }
 
 static void fp8_mega_moe_impl(
@@ -378,6 +369,8 @@ static void fp8_mega_moe_impl(
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math
 ) {
+    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    check_sm90_mega_moe_rdma_topology(num_ranks);
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
@@ -422,23 +415,15 @@ static void fp8_mega_moe_impl(
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
     }
 
-    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
-    const bool internode = num_ranks > 8;
-    if (internode) {
-        DG_HOST_ASSERT(
-            num_ranks % static_cast<int>(layout::kGatewayNvlPeers) == 0);
-        const auto num_rc_per_pe = get_env<int>("NVSHMEM_IBGDA_NUM_RC_PER_PE", 0);
-        // Expert QPs occupy [0, E); automatic packed/dense gateway metadata
-        // always uses the spare QP E.
-        DG_HOST_ASSERT(num_rc_per_pe >= num_experts_per_rank + 1);
-    }
+    const auto num_rc_per_pe = get_env<int>("NVSHMEM_IBGDA_NUM_RC_PER_PE", 0);
+    // Expert QPs occupy [0, E); gateway metadata uses the spare QP E.
+    DG_HOST_ASSERT(num_rc_per_pe >= num_experts_per_rank + 1);
     const auto [num_required_bytes, slice] = get_symm_buffer_size_for_sm90_mega_moe_impl(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        true, activation,
-        internode, internode, true, true);
+        true, activation);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
@@ -508,6 +493,8 @@ static void fp8_fp4_mega_moe_sm90(
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math
 ) {
+    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    check_sm90_mega_moe_rdma_topology(num_ranks);
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
@@ -551,17 +538,12 @@ static void fp8_fp4_mega_moe_sm90(
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
     }
 
-    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
-    // Match JIT topology selection; inter-node execution requires more than
-    // one complete eight-GPU NVLink domain, not a single-node probe override.
-    const bool fp4_internode = num_ranks > 8;
     const auto [num_required_bytes, slice] = get_symm_buffer_size_for_sm90_mega_moe_impl(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        true, activation,
-        fp4_internode, fp4_internode, true, true);
+        true, activation);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
@@ -577,14 +559,9 @@ static void fp8_fp4_mega_moe_sm90(
     auto fp4_defaults = get_fp4_sm90_api_defaults(
         num_experts_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden);
-    // The protocol is shape-fixed: inter-node launches use expert-ready
-    // dispatch, full-row async combine and one extra gateway QP; single-node
-    // launches retain the NVLink count-sum data path.
-    if (fp4_internode) {
-        const auto num_rc_per_pe = get_env<int>("NVSHMEM_IBGDA_NUM_RC_PER_PE", 0);
-        // Expert QPs occupy [0, E); packed/dense gateway metadata uses E.
-        DG_HOST_ASSERT(num_rc_per_pe >= num_experts_per_rank + 1);
-    }
+    // Expert-ready dispatch and full-row async combine use one extra gateway QP.
+    const auto num_rc_per_pe = get_env<int>("NVSHMEM_IBGDA_NUM_RC_PER_PE", 0);
+    DG_HOST_ASSERT(num_rc_per_pe >= num_experts_per_rank + 1);
     sm90_fp8_fp4_mega_moe(y,
                           l1_acts, l1_acts_sf,
                           l2_acts, l2_acts_sf,
