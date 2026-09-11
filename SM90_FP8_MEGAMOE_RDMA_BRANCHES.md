@@ -1,10 +1,27 @@
-# SM90 FP8 MegaMOE RDMA 分支与优化记录
+# SM90 FP8 MegaMoE RDMA 分支与优化记录（历史归档）
 
-更新时间：2026-08-18
+历史记录截至：2026-08-18；归档说明更新：2026-09-11。
 
-## 2026-08-18 固定生产路径
+> 本文不是当前分支的运行说明。各节中的“当前”“保留”“已删除”和性能数据，
+> 均指该节记录时的代码快照；旧环境变量、命令和分支名仅供历史追溯，不能作为
+> 当前配置使用。当前支持范围、推荐配置和双机命令统一见
+> [SM90 MegaMoE RDMA](docs/SM90_MEGAMOE_RDMA.md)，后续优化取舍见
+> [清理记录](docs/SM90_MEGAMOE_RDMA_CLEANUP.md)。
 
-本节覆盖下文所有“当前状态”描述；旧内容仅作为历史实验记录。
+特别注意当前实现与下文历史快照的差别：
+
+- SM90 FP4/FP8 仅支持跨机 RDMA，单机 fallback 已删除；双机内部的 NVLink
+  通信仍保留。
+- dense V3 根据实际 token 数和 dispatch 分工推导 metadata producer CTA
+  前缀；packed 保留完整 producer grid。不能把旧的“全部 SM”结论套到两者。
+- FP8 的 split-phase 分派已用于全部生成形状，不再只限于宽 M128 shape；
+  FP4 固定由 non-epilogue warp 2 开始的 helpers 做在线 decode，math 不参与。
+- 当前仍有必要的 phase profiling 和诊断开关；历史“已移除”的描述不代表
+  当前不可用。主性能测量应关闭这些打点，并使用 Kineto 的目标 kernel 时间。
+
+## 2026-08-18 固定生产路径（历史快照）
+
+本节记录 2026-08-18 的状态，覆盖更早历史快照，但不覆盖上述当前发布说明。
 
 - scheduler 只保留 eager count，lazy producer/cache/prefix-wait 实现及
   `DG_MEGA_MOE_SCHEDULER_COUNT_IMPL` 已删除。专家按本地 expert ID 固定顺序
@@ -60,7 +77,7 @@
 这两项都是由已选出的 kernel shape 自动派生的内部编译特化，不读取环境变量，
 也不是保留给用户的 A/B 分支。
 
-## 2026-08-07 当前状态补充
+## 2026-08-07 状态补充（历史快照）
 
 本节覆盖下文 2026-08-05 的“当前”描述；下文继续保留，作为简化基线和历史优化分支的查阅记录。
 
@@ -105,7 +122,7 @@ COMM5/COMM6 上开启 profiler 的 full-remote t64 精度通过，最大归一�
 
 当前 `DG_MEGA_MOE_COMBINE_BATCH_DOORBELL` 默认仍为 0：本轮只按计划验证 Flash/GLM b256，待补低 batch、Pro 和路由矩阵后再决定是否默认启用。详细命令、样本、phase 表和原始日志见 `../test_logs/20260807_ready_batch_doorbell/RESULTS.md`。
 
-## 当前决策
+## 2026-08-05 决策（历史快照）
 
 当前 `mega_moe_rdma` 分支作为“最小正确性基线”：保留双节点 RDMA 所需的功能和已经验证过的精度修复，移除第一轮性能优化及其观测代码。该版本用于重新设计通信方案前的正确性基准，不代表最终性能版本。
 

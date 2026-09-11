@@ -98,7 +98,7 @@ int main() {
             self.assertIn("kNumRanks > 8", kernel)
             self.assertIn("kNumRanks <= 64 and kNumRanks % 8 == 0", kernel)
             for flag in ("kDispatchExpertReady", "kCombineFullRow", "kCombineExpertReady"):
-                self.assertNotIn(f"{flag} = false", kernel)
+                self.assertNotIn(f"bool {flag} =", kernel)
             self.assertNotIn("comm::nvlink_barrier<", kernel)
             # Same-node transport is part of the RDMA operator, not fallback.
             self.assertIn("sym_buffer.map(", kernel)

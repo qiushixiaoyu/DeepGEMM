@@ -9,11 +9,13 @@ namespace deep_gemm {
 // ----------------------------------------------------------------------------
 // SM90 differs from SM100 in:
 //   - No tensor memory (TMEM): WGMMA accumulators live in registers.
-//   - No FP4: weights are FP8 e4m3 with per-128 channel float scales.
-//   - No 2-CTA cluster MMA: TMA multicast cluster=2 may still be used.
+//   - No native FP4 MMA: FP4 weights are decoded online to FP8 E4M3;
+//     the FP8-weight path loads E4M3 directly. Their scale layouts differ.
+//   - No 2-CTA cluster MMA: both current configurations use cluster=1.
 //   - Activation SF is float, not UE8M0 int: L1 input uses per-128 K and the
 //     fused L1 epilogue writes L2 activation SF at per-64 K granularity.
-// The kernel implementation is in `deep_gemm/impls/sm90_fp8_mega_moe.cuh`.
+// Implementations: `deep_gemm/impls/sm90_fp8_mega_moe.cuh` and
+// `deep_gemm/impls/sm90_fp8_fp4_mega_moe.cuh`.
 // ============================================================================
 
 struct MegaMoESM90Config {
@@ -212,10 +214,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
 
 static std::tuple<int, int> get_block_config_for_mega_moe_sm90_fp4(
     const int& num_ranks, const int& num_experts,
-    const int& num_max_tokens_per_rank, const int& num_topk,
-    const int& num_tokens) {
-    (void)num_max_tokens_per_rank;
-
+    const int& num_topk, const int& num_tokens) {
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
     const bool auto_split_mn =
@@ -317,7 +316,8 @@ static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
     return std::min(best_wave, max_ring_safe_experts);
 }
 
-// Experimental per-WG weight readiness. Shared-memory accounting and JIT
+// Validated opt-in per-WG weight readiness for M64 split-N/swap-AB.
+// Shared-memory accounting and JIT
 // emission must use this exact predicate; split-M consumes the whole N tile.
 static bool use_sm90_fp4_n64_decode_ready(
     int block_m, int block_n, int num_epilogue_warpgroups,
@@ -421,7 +421,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const bool& use_swap_ab_fast_amax = false,
     const int& num_compute_ring_tokens = -1) {
     const auto [block_m, num_epilogue_threads] = get_block_config_for_mega_moe_sm90_fp4(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens);
+        num_ranks, num_experts, num_topk, num_tokens);
     const int block_k = 128;
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
@@ -499,8 +499,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
         fp4_split_n_decode_thread_kernel_band ?
             (fp4_middle_density_decode_assist_kernel_band ? 192 : 320) :
         (fp4_decode_assist_thread_kernel_band ? 192 : 128);
-    // Experimental topology A/B under the WG-uniform full-LTO register
-    // profile. Reuse the existing eight-helper implementation, without
+    // Validated opt-in eight-helper topology under the WG-uniform full-LTO
+    // register profile. Reuse the existing helper implementation, without
     // changing tile/stage, protocol, or the M128 path.
     const int eight_helpers = get_env<int>("DG_MEGA_MOE_FP4_EIGHT_HELPERS", 0);
     DG_HOST_ASSERT(eight_helpers >= 0 and eight_helpers <= 2);
@@ -601,16 +601,10 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms,
         num_compute_ring_tokens, num_max_tokens_per_rank, num_ranks);
-    const bool reduce_decode_threads = num_epilogue_threads == 128;
-    const bool decode_split_n =
-        block_m == 64 and num_epilogue_threads == 256;
-    const bool shrink_non_epilogue = reduce_decode_threads or decode_split_n;
-    const int num_dispatch_threads =
-        (num_epilogue_threads == 512 or shrink_non_epilogue) ? 64 : 128;
-    const bool split_sfa_loader_warp = false;
-    const int num_non_epilogue_threads =
-        split_sfa_loader_warp ? 128 :
-            ((num_epilogue_threads == 512 or shrink_non_epilogue) ? 64 : 128);
+    // Both supported FP8 shapes use two dispatch warps, one loader warp and
+    // one publisher warp. There are no extra idle non-epilogue warps.
+    const int num_dispatch_threads = 64;
+    const int num_non_epilogue_threads = 64;
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);
 
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(

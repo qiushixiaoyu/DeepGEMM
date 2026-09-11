@@ -28,9 +28,28 @@
 #include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>
-#define __CLION_IDE__
 
 namespace deep_gemm {
+
+#ifdef DG_MEGA_MOE_DEBUG_NVSHMEM_STATE
+// Diagnostic-only: the remote heap table has exactly st.npes entries.
+// Keep the topology-dependent walk here, outside the production kernel path.
+template <typename State>
+__device__ __forceinline__ void sm90_fp8_mega_moe_debug_nvshmem_state(
+    const State& st, const uint32_t rank_idx) {
+    printf("[NVST r%u] npes=%d node_npes=%d node_mype=%d rail=%d heap=%p sz=%llu\n",
+           rank_idx, st.npes, st.node_npes, st.node_mype,
+           static_cast<int>(st.enable_rail_opt), st.heap_base,
+           static_cast<unsigned long long>(st.heap_size));
+    if (st.peer_heap_base_remote == nullptr) {
+        printf("[NVST r%u] remote heap table unavailable\n", rank_idx);
+        return;
+    }
+    for (int peer = 0; peer < st.npes; ++peer)
+        printf("[NVST r%u] peer=%d remote_heap=%p\n",
+               rank_idx, peer, st.peer_heap_base_remote[peer]);
+}
+#endif
 
 template <float kActivationClamp>
 __forceinline__ __device__ float sm90_fp8_mega_moe_clamp_gate(float x) {
@@ -91,33 +110,8 @@ CUTLASS_DEVICE void sm90_fp8_mega_moe_fetch_cached_expert_recv_count(
     __syncwarp();
 }
 
-template <bool kUseSchedulerCountCache,
-          uint32_t kNumExpertsPerRank, uint32_t kNumExpertsPerLane,
-          uint32_t kNumL1BlockKs, uint32_t kNumL2BlockKs,
-          typename Scheduler, typename Func>
-CUTLASS_DEVICE void sm90_fp8_mega_moe_for_each_cached_block(
-    Scheduler& scheduler,
-    Func&& func,
-    const uint32_t* cached_recv_counts) {
-    sm90_fp8_mega_moe_fetch_cached_expert_recv_count<
-        kUseSchedulerCountCache,
-        kNumExpertsPerRank, kNumExpertsPerLane>(
-            scheduler, cached_recv_counts);
-    scheduler.set_expert_idx(0);
-
-    while (true) {
-        CUTE_TIE_DECL(scheduler.get_next_block(), block_phase,
-                      current_local_expert_idx, m_block_idx, n_block_idx);
-        if (block_phase == sched::BlockPhase::None)
-            break;
-
-        func(block_phase, current_local_expert_idx,
-             block_phase == sched::BlockPhase::Linear2 ?
-                 kNumL2BlockKs : kNumL1BlockKs,
-             m_block_idx, n_block_idx);
-    }
-}
-
+// All FP8 shapes specialize the phase and K extent at compile time while
+// retaining the scheduler's original expert/block order.
 template <bool kUseSchedulerCountCache,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t L1_SHAPE_N, uint32_t L1_SHAPE_K,
@@ -211,7 +205,6 @@ template <
     bool kReuseAccumAsFinal,
     bool kL2ArrivalCounter,
     bool kL2EpilogueRequiresFullSync,
-    bool kSplitPhaseHotPath,
     bool kFP8SwapAB = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -252,9 +245,6 @@ sm90_fp8_mega_moe_impl(void* y,
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     // RDMA-only protocol: per-expert dispatch readiness and full-row,
     // per-expert-ready combine. Same-node peers still communicate over NVLink.
-    constexpr bool kDispatchExpertReady = true;
-    constexpr bool kCombineFullRow = true;
-    constexpr bool kCombineExpertReady = true;
 #ifdef DG_MEGA_MOE_NUM_METADATA_SMS
     constexpr uint32_t kNumMetadataSMs =
         DG_MEGA_MOE_NUM_METADATA_SMS;
@@ -268,13 +258,14 @@ sm90_fp8_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(DG_MEGA_MOE_NVL_PEERS == 8 and kNumRanks > 8 and
                      kNumRanks <= 64 and kNumRanks % 8 == 0,
                      "SM90 MegaMoE is RDMA-only: 16..64 ranks in eight-GPU domains");
-    DG_STATIC_ASSERT(kNumDispatchThreads >= 64 and kNumDispatchThreads % 64 == 0,
-                     "Invalid number of dispatch threads");
-    DG_STATIC_ASSERT(kNumNonEpilogueThreads == 64 or kNumNonEpilogueThreads == 128,
-                     "Invalid number of GEMM TMA warps");
+    DG_STATIC_ASSERT(kNumDispatchThreads == 64,
+                     "FP8 RDMA uses two dispatch warps");
+    DG_STATIC_ASSERT(kNumNonEpilogueThreads == 64,
+                     "FP8 RDMA uses one loader warp and one publisher warp");
     DG_STATIC_ASSERT((kNumDispatchThreads + kNumNonEpilogueThreads) % 128 == 0,
                      "Math warpgroup start must be 128-thread aligned");
-    DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of math/epilogue threads");
+    DG_STATIC_ASSERT(kNumEpilogueThreads == 256 or kNumEpilogueThreads == 512,
+                     "FP8 RDMA uses two or four math warpgroups");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
     DG_STATIC_ASSERT(kNumMMANonEpilogueWarps >= 2,
                      "Async publisher reuses the second GEMM loader warp");
@@ -291,15 +282,13 @@ sm90_fp8_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(BLOCK_N == 128 or BLOCK_N == 256 or BLOCK_N == 512,
                      "SM90 MegaMoE supports CTA BLOCK_N=128/256/512");
     DG_STATIC_ASSERT(BLOCK_K == 128, "BLOCK_K is fixed to 128 (per-128 SF)");
-    DG_STATIC_ASSERT(not kCombineExpertReady or kNumRanks <= 64,
+    DG_STATIC_ASSERT(kNumRanks <= 64,
                      "Per-expert destination mask supports at most 64 ranks");
     DG_STATIC_ASSERT(kNumMetadataSMs >= 1 and kNumMetadataSMs <= kNumSMs,
                      "Invalid number of metadata producer CTAs");
     DG_STATIC_ASSERT(kNumCombineStageTokens <= kNumMaxPoolTokens,
                      "Combine staging cannot exceed the logical full pool");
-    DG_STATIC_ASSERT(not kCombineExpertReady or
-                         kNumCombineStageTokens >=
-                             kNumRanks * kNumMaxTokensPerRank,
+    DG_STATIC_ASSERT(kNumCombineStageTokens >= kNumRanks * kNumMaxTokensPerRank,
                      "Combine ring must fit one maximum-fan-in expert");
     DG_STATIC_ASSERT(kNumRanks % DG_MEGA_MOE_NVL_PEERS == 0,
                      "Inter-node runs require whole NVLink domains");
@@ -327,7 +316,6 @@ sm90_fp8_mega_moe_impl(void* y,
     // for L2 activations uses per-64 K granularity)
     // =====================================================================
     constexpr uint32_t SF_BLOCK_M = math::constexpr_align(BLOCK_M, 128u);
-    constexpr uint32_t kNumPoolBlocks = kNumMaxPoolTokens / BLOCK_M;
     constexpr uint32_t kNumL1RingBlocks = kNumL1RingTokens / BLOCK_M;
     constexpr uint32_t kNumL2RingBlocks = kNumL2RingTokens / BLOCK_M;
     constexpr bool kL1RingStorageCompact =
@@ -424,30 +412,28 @@ sm90_fp8_mega_moe_impl(void* y,
         dispatch_staging_layout, 1, kNumMaxPoolTokens,
         combine_token_buffer.get_end_ptr());
 
-    // Full-row combine keeps one registered BF16 row per pool token.  A
-    // separate per-pool-block arrival counter lets the last L2 N-block CTA
-    // publish the complete row with one large RDMA WRITE.
+    // Full-row combine keeps registered BF16 rows in full-pool or ring storage.
+    // A per-pool-block arrival counter lets the last L2 N-block producer
+    // hand the completed rows to the publisher warp for batched RDMA WRITEs.
     constexpr uint32_t kNumMaxPoolBlocks =
         kNumMaxPoolTokens / layout::kMinCandidateBlockM;
     constexpr uint32_t kCombineFullRowPublishReadyBit = 1u << 31;
     constexpr auto combine_full_row_arrival_layout = layout::Data(
-        kCombineFullRow ? sizeof(uint32_t) : 0u, false);
+        sizeof(uint32_t), false);
     const auto combine_full_row_arrival_buffer = layout::Buffer(
         combine_full_row_arrival_layout, 1, kNumMaxPoolBlocks,
         dispatch_staging_buffer.get_end_ptr());
     const auto combine_full_row_staging_base = reinterpret_cast<void*>(
-        kCombineFullRow ? math::align(
+        math::align(
             reinterpret_cast<uint64_t>(combine_full_row_arrival_buffer.get_end_ptr()),
-            static_cast<uint64_t>(128)) :
-            reinterpret_cast<uint64_t>(dispatch_staging_buffer.get_end_ptr()));
+            static_cast<uint64_t>(128)));
     constexpr auto combine_full_row_staging_layout = layout::Data(
-        kCombineFullRow ? kHidden * sizeof(nv_bfloat16) : 0u);
+        kHidden * sizeof(nv_bfloat16));
     const auto combine_full_row_staging_buffer = layout::Buffer(
         combine_full_row_staging_layout, 1, kNumCombineStageTokens,
         combine_full_row_staging_base);
 
     constexpr bool kCombineStageRing =
-        kCombineFullRow and kCombineExpertReady and
         kNumCombineStageTokens < kNumMaxPoolTokens;
     const auto combine_stage_ring = SM90CombineStageRing<
         kCombineStageRing, kNumCombineStageTokens,
@@ -465,6 +451,8 @@ sm90_fp8_mega_moe_impl(void* y,
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
     DG_STATIC_ASSERT(kNumSMs <= kPhaseProfileMaxSMs,
                      "Too many SMs for phase profiler");
+    // Preserve the buffer ABI: slots 8, 15 and 19--26 are reserved after
+    // retiring uninstrumented publisher metrics. Zero is not a measurement.
     enum ProfileSlot : uint32_t {
         kProfileMetadata = 0,
         kProfileDispatchBarrier = 1,
@@ -474,14 +462,12 @@ sm90_fp8_mega_moe_impl(void* y,
         kProfileL1 = 5,
         kProfileL2 = 6,
         kProfileScatter = 7,
-        kProfileScatterPublish = 8,
         kProfileCombineBarrier = 9,
         kProfileCombineReduce = 10,
         kProfileTotal = 11,
         kProfileRemoteReadCount = 12,
         kProfileL1BlockCount = 13,
         kProfileL2BlockCount = 14,
-        kProfileScatterWriteCount = 15,
         kProfileStartClock = 16,
         kProfileCombineReadyWait = 17,
         kProfileScatterStaging = 18,
@@ -491,43 +477,18 @@ sm90_fp8_mega_moe_impl(void* y,
         kProfileL2Mainloop = 37,
         kProfileL1AWait = 38,
         kProfileL2AWait = 39,
-        kProfileScatterArrival = 19,
-        kProfileScatterWQE = 20,
-        kProfileScatterReady = 21,
-        kProfileScatterReadyMask = 22,
-        kProfileScatterReadyAtomic = 23,
-        kProfileScatterReadyFence = 24,
-        kProfileScatterReadyNotify = 25,
-        kProfileScatterReadySync = 26,
         kProfileCombineWork = 27,
         kProfileCombineTokenMax = 28,
         kProfileCombineTokenCount = 29,
         // Packed as [wait cycles:32 | global expert:16 | token:16].
         kProfileLongestReadyDependency = 30,
         // Absolute globaltimer (ns) stamps written only by SM 0, so they are
-        // race-free and comparable across ranks on the same clock domain.
-        // Their spread separates launch skew from protocol serialization.
+        // race-free. Cross-rank comparisons require independently established
+        // clock alignment; local stamp differences need no such assumption.
         kProfileEntryGlobaltimer = 31,
         kProfileCountsSentGlobaltimer = 32,
         kProfileCountsReadyGlobaltimer = 33,
     };
-    enum ExpertReadyProfileSlot : uint32_t {
-        kExpertProfileEpoch = 0,
-        kExpertProfileNumTokens = 1,
-        kExpertProfileNumMBlocks = 2,
-        kExpertProfileDstRankMask = 3,
-        kExpertProfileFinalScatter = 4,
-        kExpertProfileFinalWQE = 5,
-        kExpertProfileReadyNotify = 6,
-        kExpertProfilePublishGlobaltimer = 7,
-        kExpertProfileSM = 8,
-        kExpertProfilePoolBlockOffset = 9,
-    };
-    constexpr uint32_t kExpertProfileRowBase =
-        kPhaseProfileMaxSMs - kNumExpertsPerRank;
-    DG_STATIC_ASSERT(
-        kNumSMs <= kExpertProfileRowBase,
-        "Expert-ready profiler rows overlap per-SM profiler rows");
     auto phase_profile = phase_profile_buffer.get_data_buffer(sm_idx)
         .get_base_ptr<unsigned long long>();
 #endif
@@ -593,8 +554,6 @@ sm90_fp8_mega_moe_impl(void* y,
                      "swapAB epilogue token chunks assume BLOCK_M is a multiple of 8");
     constexpr uint32_t kSwizzleAMode   = BLOCK_K * sizeof(a_dtype_t);   // 128
     constexpr uint32_t kSwizzleBMode   = BLOCK_K * sizeof(b_dtype_t);   // 128
-    constexpr uint32_t kSwizzleCDMode  = 128;
-    constexpr uint32_t kGranK          = 128;          // L1 acts SF, weights SF
     constexpr uint32_t kL2ActsSFGranK  = 64;           // L2 acts SF (per-64 K, SM90 only)
 
     // =====================================================================
@@ -614,7 +573,6 @@ sm90_fp8_mega_moe_impl(void* y,
         math::constexpr_align<uint32_t>(2 * BLOCK_M * sizeof(float), 128u);
     // Block (128, 128) weight SF is loaded directly from global by the math
     // warpgroup, so no SMEM is needed.
-    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = 0;
 
     // CD output: max of L1 FP8 (BLOCK_M * (BLOCK_N/2) * 1 byte), L2 BF16
     // (BLOCK_M * BLOCK_N * 2 bytes), and the swapAB L1 FP32+FP8 staging
@@ -694,17 +652,9 @@ sm90_fp8_mega_moe_impl(void* y,
                 workspace.get_launch_epoch_ptr(), 1ull);
 #ifdef DG_MEGA_MOE_DEBUG_NVSHMEM_STATE
             if (prev_epoch == 0 and
-                (sym_buffer.rank_idx == 0 or sym_buffer.rank_idx == 16)) {
-                const auto& st = nvshmemi_device_state_d;
-                printf("[NVST r%u] npes=%d node_npes=%d node_mype=%d rail=%d "
-                       "heap=%p sz=%llu p0=%p p1=%p p8=%p p16=%p p24=%p\n",
-                       sym_buffer.rank_idx, st.npes, st.node_npes, st.node_mype,
-                       static_cast<int>(st.enable_rail_opt), st.heap_base,
-                       static_cast<unsigned long long>(st.heap_size),
-                       st.peer_heap_base_remote[0], st.peer_heap_base_remote[1],
-                       st.peer_heap_base_remote[8], st.peer_heap_base_remote[16],
-                       st.peer_heap_base_remote[24]);
-            }
+                sym_buffer.rank_idx % DG_MEGA_MOE_NVL_PEERS == 0)
+                sm90_fp8_mega_moe_debug_nvshmem_state(
+                    nvshmemi_device_state_d, sym_buffer.rank_idx);
 #endif
         }
     }
@@ -777,7 +727,7 @@ sm90_fp8_mega_moe_impl(void* y,
         kNumL1BlockKs, kNumL2BlockKs,
         layout::SM90Workspace>(
             workspace,
-            kDispatchExpertReady ? kernel_launch_epoch : 0,
+            kernel_launch_epoch,
             sym_buffer.rank_idx);
 
     // Pipeline state shared by TMA loaders and math warpgroups
@@ -801,8 +751,8 @@ sm90_fp8_mega_moe_impl(void* y,
         kEpilogueWGBarrierStartIdx + kNumEpilogueWarpgroups <=
             kSchedulerCountCacheBarrierIdx,
         "Epilogue WG barriers overlap scheduler-count cache barrier");
-    // Aggregate eager count waits once per CTA for the compact 16/24-local-
-    // expert decode topologies.  Besides avoiding duplicate manifest polls in
+    // Aggregate eager count waits once per CTA for 16--32 local experts.
+    // Besides avoiding duplicate manifest polls in
     // every kernel role, this gives those paths a single producer set and lets
     // them omit the redundant post-publication all-thread system fence below.
     // Many-expert topologies do not amortize the CTA rendezvous.
@@ -822,27 +772,15 @@ sm90_fp8_mega_moe_impl(void* y,
         }
     };
 
-    // Cross-rank NVLink barrier tags
-
-    // Register reconfiguration counts (chosen to fit in 64512 reg budget).
-    // For the 256-epilogue-thread split-N decode path:
-    //   64*48 + 64*40 + 256*168 = 48640 <= 64512.
-    // For the 512-epilogue-thread split-MN path, trim dispatch and loader roles
-    // so launch bounds still leave enough WGMMA registers.
-    // Reduced-thread decode (kNumThreads<=256) raises the launch-bounds
-    // register ceiling to 65536/256=256; grant the epilogue warpgroup the full
-    // 256 so the accumulator double-buffer fits without spilling.
-    //   64*48 + 64*40 + 128*256 = 38400 <= 64512.
-    constexpr uint32_t kNumEpilogueRegisters    =
+    // Requested register quotas for the current role topologies:
+    //   split-N: 64*48 + 64*40 + 256*168 = 48640 <= 64512.
+    //   split-MN: 64*32 + 64*24 + 512*112 = 60928 <= 64512.
+    // These are setmaxnreg requests, not evidence of emitted instructions or
+    // actual per-role allocation; inspect the linked binary to establish that.
+    constexpr uint32_t kNumEpilogueRegisters =
         kEpilogueRegisterBudget == 0 ?
-            (kNumEpilogueThreads == 512 ? 112 :
-                (kNumEpilogueThreads == 256 ? 168 :
-                    (kNumThreads <= 256u ? 256 : 208))) :
+            (kNumEpilogueThreads == 512 ? 112 : 168) :
             kEpilogueRegisterBudget;
-    // The 512-epilogue-thread path has only 3584 registers of headroom at
-    // epilogue=112.  Raising epilogue to 120 is not viable without changing
-    // the role topology: dispatch=24 stalls the split-MN path, while
-    // non-epilogue=16 is below ptxas' setmaxnreg.dec legal minimum.
     constexpr uint32_t kNumDispatchRegisters =
         kNumEpilogueThreads == 512 ? 32 : 48;
     constexpr uint32_t kNumNonEpilogueRegisters =
@@ -853,7 +791,6 @@ sm90_fp8_mega_moe_impl(void* y,
                      "Too many registers");
 
     constexpr uint32_t kDispatchGridSyncIndex = 0;
-    constexpr uint32_t kEpilogueGridSyncIndex = 1;
     // =====================================================================
     // ROLE 1: DISPATCH WARPS
     //   Mirrors SM100 dispatch with two changes:
@@ -901,29 +838,12 @@ sm90_fp8_mega_moe_impl(void* y,
             #pragma unroll
             for (uint32_t i = thread_idx; i < kNumExperts;
                  i += kNumDispatchThreads) {
-#ifdef DG_MEGA_MOE_SPARSE_STAKEOUT
-                // The per-destination completion counter below already proves
-                // that every metadata CTA has finished stake-out.  Therefore
-                // the old high-32 producer count is redundant on the RDMA
-                // gateway path: reserve offsets only for non-empty local
-                // tranches and leave zero-count experts untouched.  The
-                // production no-RDMA protocol still uses the high half as its
-                // readiness marker and retains the original dense atomics.
-                const uint32_t local_count = smem_expert_count[i];
-                if (local_count != 0) {
-                    smem_expert_count[i] = static_cast<uint32_t>(
-                        ptx::atomic_add(
-                            workspace.get_expert_send_count_ptr(i),
-                            static_cast<uint64_t>(local_count)));
-                }
-#else
                 const uint64_t send_value =
                     (1ull << 32) |
                     static_cast<uint64_t>(smem_expert_count[i]);
                 smem_expert_count[i] = static_cast<uint32_t>(
                     ptx::atomic_add(
                         workspace.get_expert_send_count_ptr(i), send_value));
-#endif
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
@@ -1050,102 +970,9 @@ sm90_fp8_mega_moe_impl(void* y,
                 }
             }
         }
-#else
-        comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
-            workspace, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
-        );
 #endif
 
-#if (defined(DG_MEGA_MOE_DISPATCH_GATEWAY_PACKED) || \
-     defined(DG_MEGA_MOE_DISPATCH_GATEWAY_DENSE_V3)) && \
-    defined(DG_MEGA_MOE_INTERNODE)
-        if constexpr (false) {
-#else
-        if (sm_idx == 0) {
-#endif
-            #pragma unroll
-            for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-                const auto dst_rank_idx = i / kNumExpertsPerRank;
-                const auto dst_local_expert_idx = i % kNumExpertsPerRank;
-                const auto expert_status = *workspace.get_expert_send_count_ptr(i);
-                const auto recv_count_ptr =
-#if (defined(DG_MEGA_MOE_DISPATCH_GATEWAY_PACKED) || \
-     defined(DG_MEGA_MOE_DISPATCH_GATEWAY_DENSE_V3)) && \
-    defined(DG_MEGA_MOE_INTERNODE)
-                    workspace.get_dispatch_epoch_count_ptr(
-                        static_cast<uint32_t>(kernel_launch_epoch) & 1u,
-                        sym_buffer.rank_idx, dst_local_expert_idx);
-#else
-                    workspace.get_expert_recv_count_ptr(
-                        sym_buffer.rank_idx, dst_local_expert_idx);
-#endif
-                uint64_t ready_status = expert_status;
-                {
-                    const auto dispatch_epoch =
-                        static_cast<uint32_t>(kernel_launch_epoch);
-                    ready_status =
-                        (static_cast<uint64_t>(dispatch_epoch) << 32) |
-                        static_cast<uint32_t>(expert_status);
-                }
-                if (dst_rank_idx / DG_MEGA_MOE_NVL_PEERS != sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS) {
-                    // Stage this direction's manifest row on the local
-                    // gateway; its trailing WRITE lands the complete bank in
-                    // the receiver's matching double-buffered landing slot.
-                    const auto gateway_rank_idx =
-                        sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS *
-                            DG_MEGA_MOE_NVL_PEERS +
-                        dst_rank_idx % DG_MEGA_MOE_NVL_PEERS;
-                    *sym_buffer.map(
-                        workspace.get_gateway_manifest_ptr(
-                            sym_buffer.rank_idx % DG_MEGA_MOE_NVL_PEERS,
-                            dst_local_expert_idx,
-                            layout::gateway_rel_node(
-                                dst_rank_idx / DG_MEGA_MOE_NVL_PEERS,
-                                sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS),
-                            gateway_epoch_slot),
-                        gateway_rank_idx) = ready_status;
-                } else {
-                    ptx::st_relaxed_sys(
-                        sym_buffer.map(recv_count_ptr, dst_rank_idx), ready_status);
-                }
-            }
-#if (defined(DG_MEGA_MOE_DISPATCH_GATEWAY_PACKED) || \
-     defined(DG_MEGA_MOE_DISPATCH_GATEWAY_DENSE_V3)) && \
-    defined(DG_MEGA_MOE_INTERNODE)
-            // All of this rank's entries and manifest rows are staged on
-            // the gateways.  Raise our per-source flag on every local
-            // gateway so each direction's forwarder can depart.
-            {
-                ptx::sync_aligned(
-                    kNumDispatchThreads, kDispatchBarrierIdx);
-                __threadfence_system();
-                constexpr uint32_t kNumNodes =
-                    kNumRanks / DG_MEGA_MOE_NVL_PEERS;
-                constexpr uint32_t kNumRemoteNodes = kNumNodes - 1;
-                for (uint32_t task = thread_idx;
-                     task < kNumRemoteNodes * DG_MEGA_MOE_NVL_PEERS;
-                     task += kNumDispatchThreads) {
-                    const auto node_base = sym_buffer.rank_idx /
-                        DG_MEGA_MOE_NVL_PEERS * DG_MEGA_MOE_NVL_PEERS;
-                    const auto flag_epoch = kernel_launch_epoch;
-                    const uint32_t rel_dst =
-                        task / DG_MEGA_MOE_NVL_PEERS;
-                    const uint32_t gateway_nvl =
-                        task % DG_MEGA_MOE_NVL_PEERS;
-                    ptx::st_release_sys(
-                        sym_buffer.map(
-                            workspace.get_gateway_flag_ptr(
-                                sym_buffer.rank_idx %
-                                    DG_MEGA_MOE_NVL_PEERS,
-                                rel_dst,
-                                static_cast<uint32_t>(flag_epoch) & 1u),
-                            node_base + gateway_nvl),
-                        flag_epoch);
-                }
-            }
-#endif
-        }
+        // All dispatch threads rendezvous before gateway forwarding.
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
 #if defined(DG_MEGA_MOE_DISPATCH_GATEWAY_DENSE_V3) and \
@@ -1455,15 +1282,9 @@ sm90_fp8_mega_moe_impl(void* y,
         }
 #endif
 
-        // In packed-gateway mode, the fixed manifest WRITE follows the live
-        // payload WRITE on the same QP. Polling its epoch does not depend on
-        // a header or on stale token bytes. Direct expert-ready mode retains
-        // the equivalent per-expert
-        // QP ordering; the legacy path still uses the global barrier below.
-
-        // The legacy tag/barrier path still needs every metadata writer to
-        // flush before releasing the cross-rank barrier.  Expert-ready mode
-        // has already established the same ordering above: each route writer
+        // Both gateway formats publish a fixed manifest after their payload
+        // WRITE on the same QP. Polling its epoch does not depend on a header
+        // or on stale token bytes. Each route writer
         // fences before the acq_rel direction counter, and the gateway fences
         // again before posting its ordered data/manifest WRITE batch.  A
         // second system fence from every dispatch thread in every CTA is
@@ -1681,11 +1502,10 @@ sm90_fp8_mega_moe_impl(void* y,
                 // (RDMA READ) instead of NVLink P2P. Decided once per pulled token.
                 const bool tok_is_inter =
                     current_rank_in_expert_idx / DG_MEGA_MOE_NVL_PEERS != sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS;
-                // The optimized path shares QP(src_rank, local_expert) across
+                // Dispatch shares QP(src_rank, local_expert) across
                 // dispatch warps; completion waits target only the caller's
-                // reserved batch.  Legacy keeps its per-warp QP for A/B.
-                const int inter_qp_id = kDispatchExpertReady ?
-                    current_expert_idx : static_cast<int>(sm_idx * kNumDispatchWarps + warp_idx);
+                // reserved batch.
+                const int inter_qp_id = current_expert_idx;
                 const auto inter_staging = dispatch_staging_buffer
                     .get_data_buffer(pool_token_idx).get_base_ptr<float>();
 
@@ -2110,40 +1930,23 @@ sm90_fp8_mega_moe_impl(void* y,
             }
         };
 
-        if constexpr (kSplitPhaseHotPath) {
-            auto process_static_a_sfa_block = [&]<
-                sched::BlockPhase kBlockPhase,
-                uint32_t kNumBlockKs>(
-                    const uint32_t& local_expert_idx,
-                    const uint32_t& m_block_idx,
-                    const uint32_t& n_block_idx) {
-                process_a_sfa_block(
-                    std::integral_constant<
-                        sched::BlockPhase, kBlockPhase>{},
-                    local_expert_idx,
-                    std::integral_constant<uint32_t, kNumBlockKs>{},
-                    m_block_idx, n_block_idx);
-            };
-            sm90_fp8_mega_moe_for_each_static_block<
-                kUseSchedulerCountCache>(
-                scheduler, process_static_a_sfa_block,
-                cached_recv_counts);
-        } else {
-            sm90_fp8_mega_moe_for_each_cached_block<
-                kUseSchedulerCountCache,
-                kNumExpertsPerRank, kNumExpertsPerLane,
-                kNumL1BlockKs, kNumL2BlockKs>(
-                scheduler,
-                [&](const sched::BlockPhase& block_phase,
-                    const uint32_t& local_expert_idx,
-                    const uint32_t& num_k_blocks,
-                    const uint32_t& m_block_idx,
-                    const uint32_t& n_block_idx) {
-                    process_a_sfa_block(
-                        block_phase, local_expert_idx, num_k_blocks,
-                        m_block_idx, n_block_idx);
-                }, cached_recv_counts);
-        }
+        auto process_static_a_sfa_block = [&]<
+            sched::BlockPhase kBlockPhase,
+            uint32_t kNumBlockKs>(
+                const uint32_t& local_expert_idx,
+                const uint32_t& m_block_idx,
+                const uint32_t& n_block_idx) {
+            process_a_sfa_block(
+                std::integral_constant<
+                    sched::BlockPhase, kBlockPhase>{},
+                local_expert_idx,
+                std::integral_constant<uint32_t, kNumBlockKs>{},
+                m_block_idx, n_block_idx);
+        };
+        sm90_fp8_mega_moe_for_each_static_block<
+            kUseSchedulerCountCache>(
+            scheduler, process_static_a_sfa_block,
+            cached_recv_counts);
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
         if (lane_idx == 0)
             phase_profile[kProfileLoaderPoolWait] =
@@ -2188,7 +1991,7 @@ sm90_fp8_mega_moe_impl(void* y,
         // per chained pair and round-robins, publishing whichever pair has
         // its next M block already arrived instead of spinning on one
         // pair's long-tail block while ready data of later pairs sits
-        // idle (the batch-4096 authorization gap).  Per-pair semantics are
+        // idle. Per-pair semantics are
         // unchanged: blocks post in order within a pair, ready posts last
         // on the same QP, and each pair/QP is still owned by exactly one
         // warp from start to finish.
@@ -2251,7 +2054,6 @@ sm90_fp8_mega_moe_impl(void* y,
         const uint64_t chain_wait_start = clock64();
         constexpr int64_t kPublishTimeoutCycles = 60ll * 2000000000ll;
         while (chain_pending != 0) {
-            bool chain_made_progress = false;
             if (clock64() - chain_wait_start >= kPublishTimeoutCycles) {
 #ifdef DG_MEGA_MOE_DEVICE_DIAGNOSTICS
                 if (lane_idx == 0)
@@ -2326,7 +2128,6 @@ sm90_fp8_mega_moe_impl(void* y,
                         if ((ptx::ld_acq_sys(arrival_ptr) &
                              kCombineFullRowPublishReadyBit) == 0)
                             break;
-                        chain_made_progress = true;
                         if constexpr (kCombineStageRing) {
                             if (chain_is_inter and
                                 chain_stage_ready[idx] == 0) {
@@ -2536,27 +2337,12 @@ sm90_fp8_mega_moe_impl(void* y,
 #endif
                 __syncwarp();
                 chain_pending &= ~(1u << idx);
-                chain_made_progress = true;
             }
-#ifdef DG_MEGA_MOE_ASYNC_PUBLISHER_IDLE_NANOSLEEP
-            if (not chain_made_progress and chain_pending != 0)
-                __nanosleep(DG_MEGA_MOE_ASYNC_PUBLISHER_IDLE_NANOSLEEP);
-#endif
         }
 
         ptx::sync_unaligned(
             kNumDispatchEpilogueSyncThreads,
             kDispatchWithEpilogueBarrierIdx);
-
-        return;
-
-    }
-    if (warp_idx < kNumDispatchWarps + kNumMMANonEpilogueWarps) {
-        // Idle non-epilogue warps (kNumDispatchWarps+2, +3). They must still
-        // participate in the warpgroup-collective `setmaxnreg.dec.sync.aligned`
-        // so that the math warpgroup's `warpgroup_reg_alloc` can succeed.
-        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
-        cache_expert_recv_counts();
 
         return;
 
@@ -2584,16 +2370,7 @@ sm90_fp8_mega_moe_impl(void* y,
         uint64_t profile_l1_cycles = 0;
         uint64_t profile_l2_cycles = 0;
         uint64_t profile_scatter_cycles = 0;
-        uint64_t profile_scatter_publish_cycles = 0;
         uint64_t profile_scatter_staging_cycles = 0;
-        uint64_t profile_scatter_arrival_cycles = 0;
-        uint64_t profile_scatter_wqe_cycles = 0;
-        uint64_t profile_scatter_ready_cycles = 0;
-        uint64_t profile_scatter_ready_mask_cycles = 0;
-        uint64_t profile_scatter_ready_atomic_cycles = 0;
-        uint64_t profile_scatter_ready_fence_cycles = 0;
-        uint64_t profile_scatter_ready_notify_cycles = 0;
-        uint64_t profile_scatter_ready_sync_cycles = 0;
         uint32_t profile_l1_block_count = 0;
         uint32_t profile_l2_block_count = 0;
 #endif
@@ -2610,7 +2387,6 @@ sm90_fp8_mega_moe_impl(void* y,
         // so a single combined TMA store matches the host descriptor box.
         constexpr uint32_t WG_SMEM_CD_L1_STRIDE_N =
             kSplitNSharesSF ? L1_OUT_BLOCK_N : WG_L1_OUT_BLOCK_N;
-        constexpr uint32_t WG_SMEM_CD_L2_STRIDE_N = WG_BLOCK_N;
 
         // Sync with dispatch in the full communication path.
         ptx::sync_unaligned(
@@ -2636,20 +2412,7 @@ sm90_fp8_mega_moe_impl(void* y,
                 profile_a_wait_cycles;
             uint64_t profile_scatter_block_start = 0;
             uint64_t profile_scatter_block_cycles = 0;
-            uint64_t profile_scatter_publish_block_cycles = 0;
             uint64_t profile_scatter_staging_block_cycles = 0;
-            uint64_t profile_scatter_arrival_block_cycles = 0;
-            uint64_t profile_scatter_wqe_block_cycles = 0;
-            uint64_t profile_scatter_ready_block_cycles = 0;
-            uint64_t profile_scatter_ready_mask_block_cycles = 0;
-            uint64_t profile_scatter_ready_atomic_block_cycles = 0;
-            uint64_t profile_scatter_ready_fence_block_cycles = 0;
-            uint64_t profile_scatter_ready_notify_block_cycles = 0;
-            uint64_t profile_scatter_ready_sync_block_cycles = 0;
-            bool profile_expert_ready_published = false;
-            uint64_t profile_expert_ready_epoch = 0;
-            uint64_t profile_expert_dst_rank_mask = 0;
-            uint64_t profile_expert_publish_globaltimer = 0;
 #endif
             const uint32_t valid_m = scheduler.template get_valid_m<false>();
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
@@ -3516,16 +3279,11 @@ sm90_fp8_mega_moe_impl(void* y,
                 }
             }
 
-            // Skip epilogue when block is past valid M (still must release via empty)
-            if (row_base >= valid_m and
-                (block_phase == sched::BlockPhase::Linear1 or not kCombineFullRow)) {
-                if (block_phase == sched::BlockPhase::Linear1) {
-                    if constexpr (not kL2ArrivalCounter)
-                        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                } else {
-                    if constexpr (kL2EpilogueRequiresFullSync)
-                        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                }
+            // Skip inactive L1 rows after returning stage credits. Full-row
+            // L2 publication retains its own arrival/synchronization path.
+            if (row_base >= valid_m and block_phase == sched::BlockPhase::Linear1) {
+                if constexpr (not kL2ArrivalCounter)
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 return;
             }
 
@@ -4028,17 +3786,9 @@ sm90_fp8_mega_moe_impl(void* y,
                 const uint32_t lane_in_row = lane_idx % 16;
                 const uint32_t cols_per_lane = WG_BLOCK_N / 16;
 
-                {
-                    // Dispatch no longer uses these shared words after its
-                    // pre-pull rendezvous.  Reuse them as CTA-local flags so
-                    // legacy full-row mode can bypass the arrival/send path
-                    // for local-only pool blocks.
-                    if (epilogue_thread_idx == 0) {
-                        smem_expert_count[0] = 0;  // contains a remote row
-                        smem_expert_count[1] = 0;  // this CTA is last producer
-                    }
-                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                }
+                // Preserve the full math rendezvous before staging scatter
+                // fragments; expert-ready publication needs no shared flags.
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
 
                 if constexpr (kSwapABBlockActive) {
                     auto store_bf16 = [&](const uint32_t& token, const uint32_t& col, float value) {
@@ -4211,8 +3961,6 @@ sm90_fp8_mega_moe_impl(void* y,
                                 (n_idx + wg_n_offset) * sizeof(nv_bfloat16) +
                                     lane_in_row * sizeof(ScatterVec));
                             *staging_ptr = packed;
-                            if (row_is_inter and lane_in_row == 0)
-                                atomicExch(smem_expert_count, 1u);
                         } else {
                             *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
                         }
@@ -4220,13 +3968,11 @@ sm90_fp8_mega_moe_impl(void* y,
                     __syncwarp();
 
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
-                    uint64_t profile_arrival_start = 0;
                     if (profile_math_leader) {
                         // Includes the initial CTA rendezvous, shared-memory
                         // reads, metadata lookup, and HBM/NVLink row stores.
                         profile_scatter_staging_block_cycles =
                             clock64() - profile_scatter_block_start;
-                        profile_arrival_start = clock64();
                     }
 #endif
 
@@ -4234,14 +3980,12 @@ sm90_fp8_mega_moe_impl(void* y,
                     // completed its HBM fragments.  The system-scope acq_rel
                     // RMW makes the final CTA acquire all earlier producers.
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                    if (epilogue_thread_idx == 0 and
-                        (smem_expert_count[0] != 0 or kCombineExpertReady)) {
+                    if (epilogue_thread_idx == 0) {
                         const auto arrival_ptr = combine_full_row_arrival_buffer
                             .get_data_buffer(pool_block_idx)
                             .get_base_ptr<uint32_t>();
                         const auto old = ptx::atomic_add_acq_rel_sys(arrival_ptr, 1);
-                        smem_expert_count[1] = old + 1 == kNumL2BlockNs;
-                        if (smem_expert_count[1] != 0) {
+                        if (old + 1 == kNumL2BlockNs) {
                             // The last N-block publishes a release marker; the
                             // dedicated warp acquires it before reading the
                             // completed full-row staging data.  Reusing the
@@ -4260,55 +4004,8 @@ sm90_fp8_mega_moe_impl(void* y,
                     profile_scatter_block_cycles =
                         clock64() - profile_scatter_block_start;
                     profile_scatter_cycles += profile_scatter_block_cycles;
-                    profile_scatter_publish_cycles +=
-                        profile_scatter_publish_block_cycles;
                     profile_scatter_staging_cycles +=
                         profile_scatter_staging_block_cycles;
-                    profile_scatter_arrival_cycles +=
-                        profile_scatter_arrival_block_cycles;
-                    profile_scatter_wqe_cycles +=
-                        profile_scatter_wqe_block_cycles;
-                    profile_scatter_ready_cycles +=
-                        profile_scatter_ready_block_cycles;
-                    profile_scatter_ready_mask_cycles +=
-                        profile_scatter_ready_mask_block_cycles;
-                    profile_scatter_ready_atomic_cycles +=
-                        profile_scatter_ready_atomic_block_cycles;
-                    profile_scatter_ready_fence_cycles +=
-                        profile_scatter_ready_fence_block_cycles;
-                    profile_scatter_ready_notify_cycles +=
-                        profile_scatter_ready_notify_block_cycles;
-                    profile_scatter_ready_sync_cycles +=
-                        profile_scatter_ready_sync_block_cycles;
-                    if (profile_expert_ready_published) {
-                        // Reuse rows beyond the active SM range for one
-                        // launch-epoch-tagged record per local expert.  This
-                        // keeps the diagnostic path API/workspace neutral.
-                        const auto expert_profile = phase_profile_buffer
-                            .get_data_buffer(
-                                kExpertProfileRowBase + local_expert_idx)
-                            .get_base_ptr<uint64_t>();
-                        expert_profile[kExpertProfileNumTokens] =
-                            scheduler.current_num_tokens;
-                        expert_profile[kExpertProfileNumMBlocks] =
-                            scheduler.get_current_num_m_blocks();
-                        expert_profile[kExpertProfileDstRankMask] =
-                            profile_expert_dst_rank_mask;
-                        expert_profile[kExpertProfileFinalScatter] =
-                            profile_scatter_block_cycles;
-                        expert_profile[kExpertProfileFinalWQE] =
-                            profile_scatter_wqe_block_cycles;
-                        expert_profile[kExpertProfileReadyNotify] =
-                            profile_scatter_ready_notify_block_cycles;
-                        expert_profile[kExpertProfilePublishGlobaltimer] =
-                            profile_expert_publish_globaltimer;
-                        expert_profile[kExpertProfileSM] = sm_idx;
-                        expert_profile[kExpertProfilePoolBlockOffset] =
-                            scheduler.get_current_pool_block_offset();
-                        ptx::st_release_sys(
-                            expert_profile + kExpertProfileEpoch,
-                            profile_expert_ready_epoch);
-                    }
                 }
 #endif
             }
@@ -4356,40 +4053,23 @@ sm90_fp8_mega_moe_impl(void* y,
 #endif
         };
 
-        if constexpr (kSplitPhaseHotPath) {
-            auto process_static_math_block = [&]<
-                sched::BlockPhase kBlockPhase,
-                uint32_t kNumBlockKs>(
-                    const uint32_t& local_expert_idx,
-                    const uint32_t& m_block_idx,
-                    const uint32_t& n_block_idx) {
-                process_math_block(
-                    std::integral_constant<
-                        sched::BlockPhase, kBlockPhase>{},
-                    local_expert_idx,
-                    std::integral_constant<uint32_t, kNumBlockKs>{},
-                    m_block_idx, n_block_idx);
-            };
-            sm90_fp8_mega_moe_for_each_static_block<
-                kUseSchedulerCountCache>(
-                scheduler, process_static_math_block,
-                cached_recv_counts);
-        } else {
-            sm90_fp8_mega_moe_for_each_cached_block<
-                kUseSchedulerCountCache,
-                kNumExpertsPerRank, kNumExpertsPerLane,
-                kNumL1BlockKs, kNumL2BlockKs>(
-                scheduler,
-                [&](const sched::BlockPhase& block_phase,
-                    const uint32_t& local_expert_idx,
-                    const uint32_t& num_k_blocks,
-                    const uint32_t& m_block_idx,
-                    const uint32_t& n_block_idx) {
-                    process_math_block(
-                        block_phase, local_expert_idx, num_k_blocks,
-                        m_block_idx, n_block_idx);
-                }, cached_recv_counts);
-        }
+        auto process_static_math_block = [&]<
+            sched::BlockPhase kBlockPhase,
+            uint32_t kNumBlockKs>(
+                const uint32_t& local_expert_idx,
+                const uint32_t& m_block_idx,
+                const uint32_t& n_block_idx) {
+            process_math_block(
+                std::integral_constant<
+                    sched::BlockPhase, kBlockPhase>{},
+                local_expert_idx,
+                std::integral_constant<uint32_t, kNumBlockKs>{},
+                m_block_idx, n_block_idx);
+        };
+        sm90_fp8_mega_moe_for_each_static_block<
+            kUseSchedulerCountCache>(
+            scheduler, process_static_math_block,
+            cached_recv_counts);
 
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
         if (profile_math_leader) {
@@ -4403,34 +4083,16 @@ sm90_fp8_mega_moe_impl(void* y,
             phase_profile[kProfileL1AWait] = profile_l1_a_wait_cycles;
             phase_profile[kProfileL2AWait] = profile_l2_a_wait_cycles;
             phase_profile[kProfileScatter] = profile_scatter_cycles;
-            phase_profile[kProfileScatterPublish] =
-                profile_scatter_publish_cycles;
             phase_profile[kProfileScatterStaging] =
                 profile_scatter_staging_cycles;
-            phase_profile[kProfileScatterArrival] =
-                profile_scatter_arrival_cycles;
-            phase_profile[kProfileScatterWQE] =
-                profile_scatter_wqe_cycles;
-            phase_profile[kProfileScatterReady] =
-                profile_scatter_ready_cycles;
-            phase_profile[kProfileScatterReadyMask] =
-                profile_scatter_ready_mask_cycles;
-            phase_profile[kProfileScatterReadyAtomic] =
-                profile_scatter_ready_atomic_cycles;
-            phase_profile[kProfileScatterReadyFence] =
-                profile_scatter_ready_fence_cycles;
-            phase_profile[kProfileScatterReadyNotify] =
-                profile_scatter_ready_notify_cycles;
-            phase_profile[kProfileScatterReadySync] =
-                profile_scatter_ready_sync_cycles;
             phase_profile[kProfileL1BlockCount] = profile_l1_block_count;
             phase_profile[kProfileL2BlockCount] = profile_l2_block_count;
         }
 #endif
 
-        // Publish same-node NVLink stores at system scope.  In expert-ready
-        // mode, final per-expert producers also issue an ordered ready store;
-        // legacy mode still relies on the global barrier below.
+        // Publish same-node NVLink stores at system scope. Final per-expert
+        // producers also issue an ordered ready store; combine below waits
+        // for the exact source-expert epoch rather than a global barrier.
         __threadfence_system();
 
         // ---------------- COMBINE ----------------
@@ -4678,29 +4340,20 @@ sm90_fp8_mega_moe_impl(void* y,
             });
 
         // Silent mode keeps every profile counter in the symmetric buffer but
-        // skips the device-side printf aggregation, which costs ~1.5 ms per
-        // launch and drops most lines under a real benchmark loop.  The host
-        // reads the buffer's tail after the run instead.
+        // skips device-side printf aggregation. Its cost and possible output
+        // loss depend on the workload and profiling run; it is not a fixed
+        // per-launch overhead. A diagnostic reader can consume the buffer
+        // after the run; silent mode does not itself arrange a host readback.
 #ifndef DG_MEGA_MOE_PHASE_PROFILE_SILENT
         if (sm_idx == 0 and epilogue_thread_idx == 0) {
             unsigned long long max_cycles[kPhaseProfileSlots] = {};
             unsigned long long remote_read_count = 0;
             unsigned long long l1_block_count = 0;
             unsigned long long l2_block_count = 0;
-            unsigned long long scatter_write_count = 0;
             unsigned long long combine_ready_wait_cycles = 0;
             uint32_t scatter_critical_sm = 0;
             unsigned long long scatter_critical_cycles = 0;
-            unsigned long long scatter_critical_publish_cycles = 0;
             unsigned long long scatter_critical_staging_cycles = 0;
-            unsigned long long scatter_critical_arrival_cycles = 0;
-            unsigned long long scatter_critical_wqe_cycles = 0;
-            unsigned long long scatter_critical_ready_cycles = 0;
-            unsigned long long scatter_critical_ready_mask_cycles = 0;
-            unsigned long long scatter_critical_ready_atomic_cycles = 0;
-            unsigned long long scatter_critical_ready_fence_cycles = 0;
-            unsigned long long scatter_critical_ready_notify_cycles = 0;
-            unsigned long long scatter_critical_ready_sync_cycles = 0;
             for (uint32_t sm = 0; sm < kNumSMs; ++ sm) {
                 const auto row = phase_profile_buffer.get_data_buffer(sm)
                     .get_base_ptr<unsigned long long>();
@@ -4711,84 +4364,40 @@ sm90_fp8_mega_moe_impl(void* y,
                 remote_read_count += row[kProfileRemoteReadCount];
                 l1_block_count += row[kProfileL1BlockCount];
                 l2_block_count += row[kProfileL2BlockCount];
-                scatter_write_count += row[kProfileScatterWriteCount];
                 combine_ready_wait_cycles =
                     combine_ready_wait_cycles > row[kProfileCombineReadyWait] ?
                     combine_ready_wait_cycles : row[kProfileCombineReadyWait];
                 if (row[kProfileScatter] > scatter_critical_cycles) {
                     scatter_critical_sm = sm;
                     scatter_critical_cycles = row[kProfileScatter];
-                    scatter_critical_publish_cycles =
-                        row[kProfileScatterPublish];
                     scatter_critical_staging_cycles =
                         row[kProfileScatterStaging];
-                    scatter_critical_arrival_cycles =
-                        row[kProfileScatterArrival];
-                    scatter_critical_wqe_cycles = row[kProfileScatterWQE];
-                    scatter_critical_ready_cycles = row[kProfileScatterReady];
-                    scatter_critical_ready_mask_cycles =
-                        row[kProfileScatterReadyMask];
-                    scatter_critical_ready_atomic_cycles =
-                        row[kProfileScatterReadyAtomic];
-                    scatter_critical_ready_fence_cycles =
-                        row[kProfileScatterReadyFence];
-                    scatter_critical_ready_notify_cycles =
-                        row[kProfileScatterReadyNotify];
-                    scatter_critical_ready_sync_cycles =
-                        row[kProfileScatterReadySync];
                 }
             }
-            // Device printf packs at most 32 arguments; this line needs 34.
-            // Emit as two same-thread printfs (ordered, no interleaving risk:
-            // only one thread on the rank prints) so the output line format
-            // stays byte-identical for host-side parsers.
+            // Keep only live metrics; retired publisher fields are omitted,
+            // not emitted as measured zeros. This printf uses 24 arguments.
             printf(
                 "MEGA_MOE_PHASE_PROFILE rank=%u tokens=%u block_m=%u block_n=%u wg_n=%u "
                 "metadata_cycles=%llu dispatch_barrier_cycles=%llu dispatch_pull_cycles=%llu "
                 "remote_read_cycles=%llu cleanup_barrier_cycles=%llu l1_cycles=%llu "
-                "l2_cycles=%llu scatter_cycles=%llu scatter_publish_cycles=%llu "
-                "scatter_critical_publish_cycles=%llu "
-                "scatter_staging_cycles=%llu scatter_arrival_cycles=%llu "
-                "scatter_wqe_cycles=%llu scatter_ready_cycles=%llu "
-                "scatter_ready_mask_cycles=%llu scatter_ready_atomic_cycles=%llu "
-                "scatter_ready_fence_cycles=%llu scatter_ready_notify_cycles=%llu "
-                "scatter_ready_sync_cycles=%llu scatter_critical_sm=%u ",
+                "l2_cycles=%llu scatter_cycles=%llu scatter_staging_cycles=%llu "
+                "scatter_critical_sm=%u combine_barrier_cycles=%llu combine_ready_wait_cycles=%llu "
+                "combine_reduce_cycles=%llu a_wait_cycles=%llu "
+                "loader_pool_wait_cycles=%llu total_cycles=%llu "
+                "remote_reads=%llu l1_blocks=%llu l2_blocks=%llu\n",
                 sym_buffer.rank_idx, num_tokens, BLOCK_M, BLOCK_N, WG_BLOCK_N,
                 max_cycles[kProfileMetadata], max_cycles[kProfileDispatchBarrier],
                 max_cycles[kProfileDispatchPull], max_cycles[kProfileRemoteRead],
                 max_cycles[kProfileCleanupBarrier], max_cycles[kProfileL1],
                 max_cycles[kProfileL2], max_cycles[kProfileScatter],
-                max_cycles[kProfileScatterPublish],
-                scatter_critical_publish_cycles,
-                scatter_critical_staging_cycles,
-                scatter_critical_arrival_cycles,
-                scatter_critical_wqe_cycles,
-                scatter_critical_ready_cycles,
-                scatter_critical_ready_mask_cycles,
-                scatter_critical_ready_atomic_cycles,
-                scatter_critical_ready_fence_cycles,
-                scatter_critical_ready_notify_cycles,
-                scatter_critical_ready_sync_cycles,
-                scatter_critical_sm);
-            printf(
-                "combine_barrier_cycles=%llu combine_ready_wait_cycles=%llu "
-                "combine_reduce_cycles=%llu a_wait_cycles=%llu "
-                "loader_pool_wait_cycles=%llu total_cycles=%llu "
-                "remote_reads=%llu l1_blocks=%llu l2_blocks=%llu\n",
-                max_cycles[kProfileCombineBarrier],
-                combine_ready_wait_cycles, max_cycles[kProfileCombineReduce],
-                max_cycles[kProfileAWait],
-                max_cycles[kProfileLoaderPoolWait],
-                max_cycles[kProfileTotal],
+                scatter_critical_staging_cycles, scatter_critical_sm,
+                max_cycles[kProfileCombineBarrier], combine_ready_wait_cycles,
+                max_cycles[kProfileCombineReduce], max_cycles[kProfileAWait],
+                max_cycles[kProfileLoaderPoolWait], max_cycles[kProfileTotal],
                 remote_read_count, l1_block_count, l2_block_count);
-            // Keep the main device printf at CUDA's 32-argument limit.
-            printf(
-                "MEGA_MOE_SCATTER_COUNT_PROFILE rank=%u tokens=%u "
-                "scatter_writes=%llu\n",
-                sym_buffer.rank_idx, num_tokens, scatter_write_count);
-            // Absolute SM-0 stamps.  Comparing the entry stamps across ranks
-            // separates launch skew from protocol serialization; comparing
-            // counts_sent to counts_ready gives the negotiation's own cost.
+            // Absolute SM-0 stamps. The local counts_sent-to-counts_ready
+            // delta measures negotiation time. Comparing entries across GPUs
+            // requires clock alignment established outside this profiler.
             printf(
                 "MEGA_MOE_SYNC_PROFILE rank=%u tokens=%u entry_ns=%llu "
                 "counts_sent_ns=%llu counts_ready_ns=%llu\n",
@@ -4822,80 +4431,9 @@ sm90_fp8_mega_moe_impl(void* y,
                 longest_ready_expert % kNumExpertsPerRank,
                 static_cast<uint32_t>(longest_ready_dependency & 0xffffull));
 
-            // Globaltimer is comparable only within one GPU.  Its delta from
-            // the first local expert publication exposes producer-side skew;
-            // receiver wait cycles above identify the dependency that saw the
-            // largest ready delay on each destination rank.
-            unsigned long long first_expert_publish = ~0ull;
-            for (uint32_t local_expert_idx = 0;
-                 local_expert_idx < kNumExpertsPerRank; ++ local_expert_idx) {
-                const auto expert_profile = phase_profile_buffer
-                    .get_data_buffer(kExpertProfileRowBase + local_expert_idx)
-                    .get_base_ptr<uint64_t>();
-                if (ptx::ld_acq_sys(expert_profile + kExpertProfileEpoch) !=
-                    launch_epoch)
-                    continue;
-                const auto publish_globaltimer =
-                    expert_profile[kExpertProfilePublishGlobaltimer];
-                first_expert_publish = first_expert_publish < publish_globaltimer ?
-                    first_expert_publish : publish_globaltimer;
-            }
-            for (uint32_t local_expert_idx = 0;
-                 local_expert_idx < kNumExpertsPerRank; ++ local_expert_idx) {
-                const auto expert_profile = phase_profile_buffer
-                    .get_data_buffer(kExpertProfileRowBase + local_expert_idx)
-                    .get_base_ptr<uint64_t>();
-                if (ptx::ld_acq_sys(expert_profile + kExpertProfileEpoch) !=
-                    launch_epoch)
-                    continue;
-                const auto publish_globaltimer =
-                    expert_profile[kExpertProfilePublishGlobaltimer];
-                const uint32_t expert_tokens = static_cast<uint32_t>(
-                    expert_profile[kExpertProfileNumTokens]);
-                const uint32_t first_pool_token = static_cast<uint32_t>(
-                    expert_profile[kExpertProfilePoolBlockOffset]) * BLOCK_M;
-                uint32_t same_rank_rows = 0;
-                uint32_t nvl_rows = 0;
-                uint32_t rdma_rows = 0;
-                for (uint32_t row = 0; row < expert_tokens; ++ row) {
-                    const auto src_metadata =
-                        *workspace.get_token_src_metadata_ptr(
-                            first_pool_token + row);
-                    if (src_metadata.rank_idx == sym_buffer.rank_idx) {
-                        ++ same_rank_rows;
-                    } else if (
-                        src_metadata.rank_idx / DG_MEGA_MOE_NVL_PEERS ==
-                        sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS) {
-                        ++ nvl_rows;
-                    } else {
-                        ++ rdma_rows;
-                    }
-                }
-                printf(
-                    "MEGA_MOE_EXPERT_READY_PROFILE producer_rank=%u tokens=%u "
-                    "launch_epoch=%llu global_expert=%u local_expert=%u "
-                    "expert_tokens=%llu same_rank_rows=%u nvl_rows=%u "
-                    "rdma_rows=%u m_blocks=%llu dst_mask=0x%llx "
-                    "final_scatter_cycles=%llu final_wqe_cycles=%llu "
-                    "ready_notify_cycles=%llu publish_globaltimer=%llu "
-                    "publish_delta_ns=%llu producer_sm=%llu\n",
-                    sym_buffer.rank_idx, num_tokens, launch_epoch,
-                    sym_buffer.rank_idx * kNumExpertsPerRank + local_expert_idx,
-                    local_expert_idx,
-                    expert_profile[kExpertProfileNumTokens],
-                    same_rank_rows, nvl_rows, rdma_rows,
-                    expert_profile[kExpertProfileNumMBlocks],
-                    expert_profile[kExpertProfileDstRankMask],
-                    expert_profile[kExpertProfileFinalScatter],
-                    expert_profile[kExpertProfileFinalWQE],
-                    expert_profile[kExpertProfileReadyNotify],
-                    publish_globaltimer,
-                    publish_globaltimer - first_expert_publish,
-                    expert_profile[kExpertProfileSM]);
-            }
         }
-#endif
 #endif  // DG_MEGA_MOE_PHASE_PROFILE_SILENT
+#endif  // DG_MEGA_MOE_PHASE_PROFILE
     }
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)

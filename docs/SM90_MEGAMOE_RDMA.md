@@ -56,12 +56,30 @@ GLM5.3 在本项目使用用户确认的同一组 MoE 维度。小 batch 常用�
   publisher。FP4 decode helpers 从该区域的
   warp 2 开始；math warpgroups 处理 WGMMA 和 epilogue。FP8 无 decode helpers，
   weight scale 由 math 路径加载。线程数和配额由形状决定，不能把示例拓扑当作常量。
+- FP4 的 helper-only decode 是固定分工，不再提供 math 参与 decode 或改变
+  helper 起始 warp 的内部参数。FP8 的 loader/math 均使用编译期 L1/L2 phase
+  与 K 长度分派；split-phase 不是可关闭的特化。两者均保留原 scheduler 顺序、
+  decode-ready 等待和 stage credit，未改变有效形状策略或同步协议。
 - 基础 FP4 publisher backoff 默认 `MODE=0`，由密度策略决定是否退避；启用时
   初始 64 ns、上限 512 ns。不是所有 batch 都无条件 sleep。
 - `DG_MEGA_MOE_PHASE_PROFILE=1` 会插入时钟读取、计数和写回。
   `DG_MEGA_MOE_PHASE_PROFILE_SILENT=1` 仅关闭 profile 打印，不能消除这些开销。
   主性能测试必须关闭 phase profiling 和 device diagnostics；Kineto 本身也并非
   零扰动，比较时应使用相同采样和跨 rank 对齐方法。
+- FP8 profiling 仅保留有效采集：metadata、dispatch、L1/L2、A-wait、
+  loader-pool wait、math scatter/staging 和 combine 等指标。专用 publisher
+  的 publish/arrival/WQE/ready 子阶段没有对应有效打点，相关输出字段已删除；
+  `MEGA_MOE_SCATTER_COUNT_PROFILE` 和生产者 `MEGA_MOE_EXPERT_READY_PROFILE`
+  也不再输出。接收端 `MEGA_MOE_LAST_READY_PROFILE` 仍保留。
+  读取日志的工具应将缺失字段视为“未采集”，不能补零当作测量结果。
+  原缓冲区大小、有效字段编号不变，slot 8、15、19–26 为 reserved；直接读取
+  symmetric buffer 时应忽略这些槽及 active SM 范围外的旧 expert 记录。
+  `scatter_staging_cycles` 保持原口径：取 scatter 总耗时最大的 SM 的 staging
+  累计值，不是 publisher 耗时，也不是各 SM staging 的独立最大值。
+  globaltimer 的跨 GPU 比较需要另行确认时钟对齐，不能仅凭绝对时间戳推断。
+
+旧 [FP8 分支记录](../SM90_FP8_MEGAMOE_RDMA_BRANCHES.md) 仅作为历史归档；
+其中单机路径、旧开关和按历史 shape 限制 split-phase 的描述不适用于当前版本。
 
 ## 构建与运行前提
 
@@ -97,6 +115,34 @@ FP8 普通 RDC 不需要这些 LTO 产物，仍需要普通 NVSHMEM device archi
 两条编译路径可以在同一 wheel 中共存。缓存键包含源码标记，但目前不包含外部
 LTO linker/archive 的内容：更换依赖时使用新的 JIT 缓存目录并重新验证，避免
 误用旧 cubin。需要验证动态寄存器时应检查实际 SASS，而不是只看环境变量。
+
+### RoCE QoS：显式配置 NVSHMEM 的 traffic class
+
+RoCE 环境应在所有 rank 初始化 NVSHMEM **之前**，按实际网络配置设置
+`NVSHMEM_IB_TRAFFIC_CLASS`，并核对两端所有 rail 的 DSCP→priority 映射和
+PFC/ECN 策略。这个值是网络属性，不是模型、batch 或 FP4/FP8 的优化参数；
+不要在 kernel 或库中硬编码，也不要将本节的 RoCE 设置照搬到 InfiniBand。
+
+NVSHMEM 3.4.5 的 IBGDA RC 路径通过 DEVX 直接将
+`IB_TRAFFIC_CLASS >> 2` 写入 QP 的 DSCP 字段，未设置时默认为 0。
+主机显示 `Global tclass=236` **不保证**这个 GPU 直发路径使用相同 DSCP；
+仅设置 `NCCL_IB_TC` 也不能代替 NVSHMEM 的配置。
+参见 [对应版本的 QP 初始化](https://github.com/NVIDIA/nvshmem/blob/v3.4.5-0/src/modules/transport/ibgda/ibgda.cpp)
+和 [环境变量默认值](https://github.com/NVIDIA/nvshmem/blob/v3.4.5-0/src/modules/transport/common/env_defs.h)。
+
+COMM5/COMM6 的已核验映射为 DSCP 59→priority 5，仅 priority 5 开启 PFC，
+因此本环境使用 `NVSHMEM_IB_TRAFFIC_CLASS=236`（`59 << 2`）。迁移机器时，
+先在 host 用 `mlnx_qos -i <netdev>` 只读检查实际配置，再选择该值。
+测试前后保存 `ethtool -S <netdev>`，以 priority 收发字节、buffer discard
+和 pause **增量**确认流量分类；累计历史值不能说明当前测试发生丢包。
+不要仅为消除长尾而降低重试超时或改动共享网络的 QoS。
+与 DeepEP 等实现比较时，也要核验对方流量的实际 QoS；不能只修正 MegaMoE
+的流量分类，再与旧网络配置下的基线数值比较。
+
+注意：此版本 IBGDA 的 DEVX QP 未连接常规 counter set，因此 sysfs 中
+`local_ack_timeout_err` 等计数为零，不能用于排除该路径的重传。
+若要进一步区分具体交换机拥塞、丢包和重传，仍需对应交换机遥测或针对
+DEVX QP 的计数支持；正确进入 PFC 队列本身也不是“永不丢包”的保证。
 
 ## 推荐配置（opt-in，不修改源码默认值）
 
@@ -191,6 +237,9 @@ export NCCL_NET=IB NCCL_IB_DISABLE=0 NCCL_IB_GID_INDEX=3
 export NCCL_IB_QPS_PER_CONNECTION=8 NCCL_DEBUG=WARN
 export NCCL_IB_HCA=mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8
 export NVSHMEM_IB_GID_INDEX=3 NVSHMEM_ENABLE_NIC_PE_MAPPING=1
+# 仅为 COMM5/COMM6 已核验的 RoCE 配置：DSCP59 -> priority5/PFC。
+# 其他网络必须先核对映射；不能依赖主机 Global tclass 或 NCCL_IB_TC。
+export NVSHMEM_IB_TRAFFIC_CLASS=236
 export NVSHMEM_HCA_PE_MAPPING=mlx5_1:1:1,mlx5_2:1:1,mlx5_3:1:1,mlx5_4:1:1,mlx5_5:1:1,mlx5_6:1:1,mlx5_7:1:1,mlx5_8:1:1
 export NVSHMEM_IB_ENABLE_IBGDA=1 NVSHMEM_DISABLE_P2P=0
 export NVSHMEM_IB_ENABLE_RELAXED_ORDERING=0 NVSHMEM_QP_DEPTH=4096

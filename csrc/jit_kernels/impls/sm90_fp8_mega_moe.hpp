@@ -47,7 +47,6 @@ public:
         bool reuse_accum_as_final;
         bool l2_arrival_counter;
         bool l2_epilogue_requires_full_sync;
-        bool split_phase_hot_path;
         bool use_swap_ab;
         bool use_activation_row_buckets;
         MegaMoESM90Config config;
@@ -101,7 +100,7 @@ public:
         const int skip_inactive_m_wg = get_env<int>("DG_MEGA_MOE_FP8_SKIP_INACTIVE_M_WG", 0);
         DG_HOST_ASSERT(skip_inactive_m_wg == 0 or skip_inactive_m_wg == 1);
         // The validated split-M layout is disjoint from the M64 hybrid path.
-        // Do not silently enable this on experimental two-WG M128 shapes.
+        // Keep the four-WG split-M/N requirement explicit.
         if (skip_inactive_m_wg and args.config.block_m == 128 and
             args.config.block_n == 256 and args.config.num_epilogue_threads == 512 and
             not args.use_swap_ab)
@@ -243,7 +242,6 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {},
         {}
     >);
 }};
@@ -271,7 +269,6 @@ static void __instantiate_kernel() {{
     args.reuse_accum_as_final ? "true" : "false",
     args.l2_arrival_counter ? "true" : "false",
     args.l2_epilogue_requires_full_sync ? "true" : "false",
-    args.split_phase_hot_path ? "true" : "false",
     args.use_swap_ab ? "true" : "false");
     }
 
@@ -377,10 +374,6 @@ static void sm90_fp8_mega_moe(
     const bool default_split_mn_barrier_opt =
         config.block_m == 128 and config.block_n == 256 and
         config.num_epilogue_threads == 512;
-    // L1/L2 K extents are JIT constants for every generated shape.  Keep a
-    // single statically unrolled implementation; the former Pro b1/b2 runtime
-    // loop exception no longer helps after the N256 internal-N64 path.
-    const bool split_phase_hot_path = true;
     const bool decode_split_n_path =
         config.block_m == 64 and config.num_epilogue_threads == 256;
     const bool decode_split_n_bn256 =
@@ -514,7 +507,6 @@ static void sm90_fp8_mega_moe(
         .reuse_accum_as_final = reuse_accum_as_final,
         .l2_arrival_counter = l2_arrival_counter,
         .l2_epilogue_requires_full_sync = l2_epilogue_requires_full_sync,
-        .split_phase_hot_path = split_phase_hot_path,
         .use_swap_ab = use_swap_ab,
         .use_activation_row_buckets = use_activation_row_buckets,
         .config = config,

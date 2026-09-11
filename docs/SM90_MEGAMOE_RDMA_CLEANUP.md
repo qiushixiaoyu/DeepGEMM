@@ -6,6 +6,62 @@
 本文保留 2026-09-09 的清理记录。当前发布使用说明、运行条件和双机命令统一见
 [SM90 MegaMoE RDMA](SM90_MEGAMOE_RDMA.md)，不要把下方历史证据目录当作随仓库发布的依赖。
 
+## 2026-09-11：固定路径与历史说明整理
+
+- FP8 删除恒为 true 的 split-phase 选择参数、未实例化的动态 phase 分支及
+  仅服务该分支的遍历 helper；保留静态 phase/K 分派和原 scheduler 顺序。
+- FP4 删除公开调用链恒为 false/0 的 math-decode 选择参数及不可达实现；
+  helper 起始位置由参数改为固定的 non-epilogue warp 2，保留现有 helper
+  数量、decode-ready、math 等待和 stage credit。
+- FP8 dispatch QP 固定使用 local expert，删除不可达的 per-warp QP 表达式。
+- 旧分支说明明确标为历史归档，修正当前 warp 分工和 profiling 注释。
+- 本轮不修改 LTO、公开接口校验、资源生命周期、workspace 布局、通信协议、
+  环境变量默认值或有效优化的启用范围。内部模板参数减少不改变 Python 调用
+  签名；修改后仍需重建 wheel，静态检查不代表已完成 GPU 性能回归。
+
+## 2026-09-11：发布前冗余与诊断修正
+
+- FP8 NVSHMEM 状态打印按实际 `npes` 遍历远端 heap 表，检查空表；仅首个
+  epoch 的各 NVLink domain leader 打印，避免 EP16 的固定下标越界。
+- 删除 FP8 scatter 的无效共享 remote-row/last-producer 标记，将最后生产者
+  判断留在同一个 leader 的局部变量中；原有 CTA/WG 同步、arrival、release
+  和 ring credit 保留。FP4 同步删除恒 false 的 remote-row 标记分支。
+- 删除强制定义的 IDE 宏、固定协议 bool 和固定关闭的 SFA loader 选择项；
+  固定的 full-row/arrival/reserved 区域仍保持相同大小和偏移。
+- 删除仓库内无调用的 IBGDA `put_inline`、`put_nbi_warp`、`get_thread`、
+  `get_batch_warp`。带 credit 的通知、批量 READ/WRITE、精确完成等待以及
+  SM100 仍使用的共享 barrier 保留，不改变底层 CQ/WQE 实现。
+- 修正旧 metadata/global-barrier、NVSHMEM 历史故障范围和已验证 opt-in
+  配置的注释。README 明确 `DG_COMM_KERNEL_DEBUG` 是 kernel 后清空整个
+  symmetric buffer 的破坏性诊断，不是仅打印日志。
+
+本轮不调整有效优化开关、形状/密度阈值、LTO、公开 API 或内存布局。
+新增 CPU 源码契约和边界测试不代替重建 wheel 后的双机精度验证。
+
+## 2026-09-11：失效 profiling 与剩余固定路径清理
+
+- FP8 删除没有有效赋值的 publisher 子阶段计时、scatter-write 计数，以及
+  恒 false 的生产者 expert-ready 记录及其读取/输出代码。保留有效指标和
+  接收端 longest-ready 诊断；profiling 默认值与 SILENT 开关语义不变。
+- 保留 profiling 缓冲区大小及有效 slot 编号，旧 slot 8、15、19–26 只作
+  reserved。删除仅服务于失效 expert 记录的行重叠断言，保留有效的 SM 数量
+  边界检查。日志消费者不得把删除的字段补零当作真实测量值。
+- 两种精度删除 packed/dense-V3 配置下不可达的旧 metadata 发布块，保留
+  其外部 dispatch rendezvous 和当前 gateway 发布/转发顺序。
+- FP8 删除无正常 JIT 入口的 sparse-stakeout、idle-nanosleep 分支；保留
+  原 dense stake-out 原子操作。FP4 自适应退避及其所有有效控制不变。
+- FP8 固定为当前两条公开路径共有的 64 dispatch / 64 non-epilogue 线程，
+  删除无调用的额外 idle-warp 分支；静态检查同步约束为当前受支持拓扑。
+  保留 math 的 256/512 线程选择及现有寄存器请求，未修改 setmaxnreg/LTO。
+- 删除未引用的局部常量、FP4 combine 的无消费者 shuffle、两个内部 helper
+  的未使用形参；不改变公开 API、容量计算或 ring sizing。
+- 统一在线 FP4 decode、线程配额、已验证 opt-in 配置和 profiling 的说明。
+
+本轮不修改有效优化、环境默认值、形状阈值、workspace 布局或 RDMA 生命周期。
+本地源码契约/等价性检查不能替代 Linux wheel 重建和双机数值/性能验证。
+
+以下为 2026-09-09 的历史清理记录。
+
 ## 保留的实现
 
 - FP4：V38 完整有效路径，包括在线 FP4 decode、paired PRMT、packed GMMA

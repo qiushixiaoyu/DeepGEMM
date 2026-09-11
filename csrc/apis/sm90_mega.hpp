@@ -67,9 +67,6 @@ static void check_sm90_fp4_sfb_layout(const torch::Tensor& sf,
 }
 
 struct FP4SM90APIDefaults {
-    bool math_wg_participates_in_decode;
-    int num_math_wg_decode_warps;
-    int first_decode_assist_warp;
     bool wide_load_decode;
     bool early_b_decode;
     bool decode_done_mbarrier;
@@ -80,7 +77,7 @@ struct FP4SM90APIDefaults {
 
 static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
-    const int& hidden, const int& intermediate_hidden) {
+    const int& intermediate_hidden) {
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
     const float rows = expected_tokens_per_expert;
@@ -103,11 +100,6 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     const bool default_swap_ab =
         (fp4_flash_shape or fp4_pro_shape) and below_m128_crossover;
 
-    // Keep math warpgroups dedicated to WGMMA, matching the FP8 execution
-    // model. Packed-FP4 weight decode is owned exclusively by the
-    // non-epilogue decode-assist warps.
-    constexpr bool math_wg_participates_in_decode = false;
-
     // Wide loads are validated for this M64 swapAB topology. Do not expand
     // them into M128 or the middle-shape non-swap kernels.
     const bool default_wide_load_decode = default_swap_ab;
@@ -126,9 +118,8 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
     // stage mbarrier lets them advance without a rendezvous with math
     // consumers; no model or density window is needed for this topology.
     const bool default_decode_done_mbarrier =
-        has_rows and not math_wg_participates_in_decode;
+        has_rows;
 
-    (void)hidden;
     // Warp-cooperative amax avoids the FP32 full-tile staging and serial
     // per-token row scan in the swapAB L1 epilogue.  The 16--32 row window
     // amortizes its two CTA reductions for both light and streaming-weight
@@ -137,12 +128,6 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
         fp4_pro_shape and
         rows >= 16.0f and rows <= 32.0f;
     return {
-        math_wg_participates_in_decode,
-        0,
-        // Non-epilogue warp 0 loads A/SFA and B/SFB; warp 1 runs the RDMA
-        // publisher. Dedicated FP4 decode assistants start at warp 2 of
-        // the same non-epilogue region.
-        2,
         default_wide_load_decode,
         default_ss_early_b_decode,
         default_decode_done_mbarrier,
@@ -558,7 +543,7 @@ static void fp8_fp4_mega_moe_sm90(
 
     auto fp4_defaults = get_fp4_sm90_api_defaults(
         num_experts_per_rank, num_tokens, num_topk,
-        hidden, intermediate_hidden);
+        intermediate_hidden);
     // Expert-ready dispatch and full-row async combine use one extra gateway QP.
     const auto num_rc_per_pe = get_env<int>("NVSHMEM_IBGDA_NUM_RC_PER_PE", 0);
     DG_HOST_ASSERT(num_rc_per_pe >= num_experts_per_rank + 1);
@@ -575,9 +560,6 @@ static void fp8_fp4_mega_moe_sm90(
                           num_tokens, num_topk,
                           hidden, intermediate_hidden,
                           activation_clamp, fast_math,
-                          fp4_defaults.math_wg_participates_in_decode,
-                          fp4_defaults.num_math_wg_decode_warps,
-                          fp4_defaults.first_decode_assist_warp,
                           fp4_defaults.wide_load_decode,
                           fp4_defaults.early_b_decode,
                           fp4_defaults.decode_done_mbarrier,

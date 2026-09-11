@@ -79,8 +79,8 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
     if (sm_idx == 0) {
 #ifdef DG_MEGA_MOE_INTERNODE
         // Inter-node: 先逐 (远端 pe, qp) 等待本 rank 经 IBGDA verbs 发出的所有 WQE 完成
-        // (与 DeepEP 同源的 per-QP quiet；每个 (pe,qp) 恰好由一个线程 poll，满足 poll_cq
-        // 的并发约束——调用侧保证此刻没有其他 warp 在用这些 QP)。公开 nvshmem_quiet()
+        // (per-QP quiet；本循环每个 (pe,qp) 由一个线程 poll，调用侧保证此刻没有
+        // 新的 WQE 提交到这些 QP)。公开 nvshmem_quiet()
         // 只兜底非 verbs 路径(如 sync_all 内部)。到达语义仍由 NVSHMEM collective
         // sync 承担(单线程 PE 级 barrier)。
         {
@@ -93,7 +93,8 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
         }
         // The explicit per-(pe, qp) ibgda::quiet loop above already drains
         // every verbs-path QP; this global quiet only backstops the non-verbs
-        // paths, and measured ~450 us/launch (63% of the b1 kernel).
+        // paths. Current SM90 expert-ready kernels do not call this shared
+        // barrier; they wait on exact completions in their protocol instead.
         nvshmem_quiet();
         if (thread_idx == 0)
             nvshmem_sync_all();

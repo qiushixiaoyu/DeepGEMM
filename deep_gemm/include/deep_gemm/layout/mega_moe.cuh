@@ -995,14 +995,14 @@ struct Buffer {
     }
 };
 
-// Optional SM90 phase-profiler storage. The allocation is always present on
-// the diagnostic branch, so toggling the JIT-only profiler does not change the
+// Optional SM90 phase-profiler storage. The allocation is always present in
+// the RDMA workspace, so toggling the JIT-only profiler does not change the
 // public API or any tensor slice.
 static constexpr uint32_t kSM90MegaMoEProfileMaxSMs = 256;
 // Phase slots include absolute globaltimer stamps plus an L1/L2 split of the
-// math mainloop and its input-arrival wait.  The latter is diagnostic-only and
-// lets a matched no-RDMA/RDMA A/B distinguish WGMMA/codegen regression from
-// delayed TMA input arrival.
+// math mainloop and its input-arrival wait. These diagnose where the fused
+// kernel waits; attribution to a specific cause requires separate evidence.
+// Keep the allocation fixed when retiring individual diagnostic slots.
 static constexpr uint32_t kSM90MegaMoEProfileSlots = 40;
 
 } // namespace deep_gemm::layout

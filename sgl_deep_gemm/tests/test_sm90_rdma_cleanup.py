@@ -93,7 +93,7 @@ class RetainedOptimizationsTest(unittest.TestCase):
     def test_hybrid_keeps_full_math_entry_rendezvous(self):
         source = (KERNELS / "sm90_fp8_mega_moe.cuh").read_text()
         start = source.index("auto process_math_block =")
-        block = source[start:source.index("if constexpr (kSplitPhaseHotPath)", start)]
+        block = source[start:source.index("auto process_static_math_block =", start)]
         barrier = "ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);"
         self.assertLess(block.index(barrier), block.index("scheduler.template get_valid_m<false>()"))
         self.assertIn("not kReuseAccumAsFinal", block)

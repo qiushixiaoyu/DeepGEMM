@@ -41,8 +41,8 @@ static int get_sm90_fp4_dispatch_gateway(const int& requested_capacity) {
 //     L2 (filled by the L1 epilogue's per-token SwiGLU+quant).
 //   * The kernel applies the per-32 SFB on the fly during dequant through a
 //     constant-memory UE8M0->E4M3 LUT, so the only SF that the promote loop
-//     still applies is SFA. There is no `weight_sf` ldg in the math warpgroup
-//     beyond the SFB UE8M0 word.
+//     still applies is SFA. Weight/SFB loading and decode stay outside the
+//     math warpgroup.
 // ============================================================================
 
 class SM90FP8FP4MegaMoERuntime final : public LaunchRuntime<SM90FP8FP4MegaMoERuntime> {
@@ -61,18 +61,6 @@ public:
         // Read the four packed FP4 words for one K/32 group with a
         // single wide shared load while keeping the default work partition.
         bool use_wide_load_decode;
-        // Overlap FP4 decode with WGMMA. When false, the math
-        // warpgroup only waits on the decode barrier; non-epilogue warps do the
-        // decode work and can run ahead through pipeline stages.
-        bool math_wg_participates_in_fp4_decode;
-        // Limit how many warps inside the math warpgroup help decode.
-        // This keeps CTA size fixed while reducing math-side non-tensor-core
-        // work that can interfere with WGMMA issue.
-        int num_math_wg_decode_warps;
-        // Skip early non-epilogue warps as FP4 decode helpers.
-        // 0 keeps the existing 4 assist warps; 2 skips the two TMA loader
-        // warps; 4 leaves all decode work to the math warpgroup.
-        int first_fp4_decode_assist_warp;
         // Split packed-B readiness from the A+B full barrier so the
         // assist warps can start FP4 decode while A/SFA TMA is still in flight.
         bool use_early_b_decode;
@@ -124,6 +112,9 @@ public:
         // `nvshmem` mention in the comment also makes the JIT compiler
         // device-link libnvshmem_device.
         constexpr int kNvlPeers = 8;
+        // Non-epilogue warp 0 loads operands; warp 1 publishes RDMA.
+        // All remaining non-epilogue warps own decode; math never decodes.
+        constexpr int kFirstFP4DecodeAssistWarp = 2;
         check_sm90_mega_moe_rdma_topology(args.num_ranks);
         // Keep the NVSHMEM marker in every generated RDMA specialization so
         // JIT compilation supplies the device include/link dependencies.
@@ -146,10 +137,8 @@ public:
                 args.config.block_m, args.config.block_n,
                 args.config.num_epilogue_threads / 128,
                 args.use_swap_ab, args.use_decode_done_mbarrier)) {
-            DG_HOST_ASSERT(args.num_math_wg_decode_warps == 0 and
-                           not args.math_wg_participates_in_fp4_decode);
             const int helper_warps = args.config.num_non_epilogue_threads / 32 -
-                                     args.first_fp4_decode_assist_warp;
+                                     kFirstFP4DecodeAssistWarp;
             DG_HOST_ASSERT(helper_warps > 0 and helper_warps % 2 == 0);
             internode_prefix += "#define DG_MEGA_MOE_FP4_N64_DECODE_READY 1\n";
             const int skip_math_b_input_wait = get_env<int>(
@@ -175,7 +164,6 @@ public:
                 args.config.block_m == 64 and args.config.block_n == 128 and
                 args.config.block_k == 128 and args.config.num_dispatch_threads == 64 and
                 args.config.num_epilogue_threads == 256 and
-                args.first_fp4_decode_assist_warp == 2 and
                 ((helper_warps == 4 and cta_threads == 512) or
                  (helper_warps == 8 and cta_threads == 640))) {
                 internode_prefix +=
@@ -451,7 +439,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {}, {},
-        {}, {}, {}, {},
+        {},
         {}, {}, {}, {}, {}
     >);
 }};
@@ -475,9 +463,6 @@ static void __instantiate_kernel() {{
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
     args.use_wide_load_decode ? "true" : "false",
-    args.math_wg_participates_in_fp4_decode ? "true" : "false",
-    args.num_math_wg_decode_warps,
-    args.first_fp4_decode_assist_warp,
     args.use_early_b_decode ? "true" : "false",
     args.use_decode_done_mbarrier ? "true" : "false",
     args.use_ss_nsplit ? "true" : "false",
@@ -544,9 +529,6 @@ static void sm90_fp8_fp4_mega_moe(
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
     const bool& fast_math,
-    const bool& math_wg_participates_in_fp4_decode = false,
-    const int& num_math_wg_decode_warps = 0,
-    const int& first_fp4_decode_assist_warp = 0,
     const bool& use_wide_load_decode = false,
     const bool& use_early_b_decode = false,
     const bool& use_decode_done_mbarrier = false,
@@ -578,9 +560,6 @@ static void sm90_fp8_fp4_mega_moe(
     // must use byte-addressable packed FP4 storage (1 byte = 2 nibbles).
     DG_HOST_ASSERT(l1_weights_sf.scalar_type() == torch::kInt);
     DG_HOST_ASSERT(l2_weights_sf.scalar_type() == torch::kInt);
-    DG_HOST_ASSERT(num_math_wg_decode_warps >= 0 and num_math_wg_decode_warps <= 4);
-    DG_HOST_ASSERT(math_wg_participates_in_fp4_decode or num_math_wg_decode_warps == 0);
-    DG_HOST_ASSERT(first_fp4_decode_assist_warp >= 0 and first_fp4_decode_assist_warp <= 4);
 
     // Heuristics
     const auto config = get_mega_moe_config_sm90_fp4(
@@ -718,9 +697,6 @@ static void sm90_fp8_fp4_mega_moe(
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
         .use_wide_load_decode = use_wide_load_decode,
-        .math_wg_participates_in_fp4_decode = math_wg_participates_in_fp4_decode,
-        .num_math_wg_decode_warps = num_math_wg_decode_warps,
-        .first_fp4_decode_assist_warp = first_fp4_decode_assist_warp,
         .use_early_b_decode = use_early_b_decode,
         .use_decode_done_mbarrier = use_decode_done_mbarrier,
         .use_ss_nsplit = use_ss_nsplit,

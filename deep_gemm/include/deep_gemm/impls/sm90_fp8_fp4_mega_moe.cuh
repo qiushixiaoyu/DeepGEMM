@@ -418,15 +418,15 @@ __device__ __forceinline__ void dequant_fp4_b_tile_to_e4m3_smem_dispatch(
 // ============================================================================
 // SM90 (Hopper) FP8 x FP4 MegaMoE - software-dequant path.
 // ----------------------------------------------------------------------------
-// Variant of `sm90_fp8_mega_moe_impl` for DSV4-style packed FP4 expert weights.
-// The dispatch / scheduler / SwiGLU / combine machinery is identical to the
-// FP8 implementation; the only differences are confined to:
+// Variant of `sm90_fp8_mega_moe_impl` for packed FP4 expert weights.
+// It shares the FP8 dispatch/combine protocol, with its own compute tiling,
+// decode pipeline and epilogue policies. Weight handling differs as follows:
 //
 //   1. Weight TMA load:  shape changes from (LOAD_BLOCK_N, BLOCK_K) of e4m3
 //      to (LOAD_BLOCK_N, BLOCK_K/2) of packed int8 (each byte = 2 nibbles).
 //   2. SFB:              loaded as UE8M0 packed int32 (per-32 K granularity)
-//      via `cp.async`, since TMA does not natively stride FP4 layouts.
-//   3. Mainloop decode:  the host path uses the UE8M0 LUT decoder to dequant
+//      via shared staging; the N-contiguous layout also supports SFB TMA.
+//   3. Mainloop decode: dedicated GPU helper warps use the UE8M0 LUT to dequant
 //      the packed FP4 weight tile into an E4M3 shared-memory tile. SS-mode WGMMA
 //      then consumes that tile exactly like the FP8 path, preserving the existing
 //      per-token SwiGLU amax / quantize epilogue.
@@ -451,9 +451,6 @@ template <
     float kActivationClamp,
     bool kFastMath,
     bool kUseWideLoadDecode        = false,  // Read one K-group's packed FP4 words as uint4
-    bool kMathWGParticipatesInFP4Decode = false,
-    uint32_t kNumMathWGDecodeWarps = 0,
-    uint32_t kFirstFP4DecodeAssistWarp = 0,  // Skip early non-epilogue warps as decode helpers
     bool kEarlyBDecode            = false,  // Overlap assist decode with A/SFA TMA
     bool kDecodeDoneMBarrier      = false,  // One-way decode-done mbarrier instead of rendezvous sync
     bool kFP4SSNSplit             = false,  // Split SS N=128 WGMMA into 2x N=64 to reduce accum pressure
@@ -497,9 +494,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900) and (__CUDA_ARCH__ < 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
-    constexpr bool kDispatchExpertReady = true;
-    constexpr bool kCombineFullRow = true;
-    constexpr bool kCombineExpertReady = true;
+    // Non-epilogue warp 0 loads operands and warp 1 publishes RDMA.
+    // Decode is owned exclusively by the remaining non-epilogue warps.
+    constexpr uint32_t kFirstFP4DecodeAssistWarp = 2;
 #ifdef DG_MEGA_MOE_NUM_METADATA_SMS
     constexpr uint32_t kNumMetadataSMs =
         DG_MEGA_MOE_NUM_METADATA_SMS;
@@ -522,20 +519,14 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                      "Math warps must start on a warpgroup boundary");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of math/epilogue threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
-    DG_STATIC_ASSERT(not kCombineExpertReady or kCombineFullRow,
-                     "Per-expert ready requires full-row combine staging");
-    DG_STATIC_ASSERT(not kCombineExpertReady or kNumRanks <= 64,
+    DG_STATIC_ASSERT(kNumRanks <= 64,
                      "Per-expert destination mask supports at most 64 ranks");
     DG_STATIC_ASSERT(kNumMetadataSMs >= 1 and kNumMetadataSMs <= kNumSMs,
                      "Invalid number of metadata producer CTAs");
     DG_STATIC_ASSERT(kNumCombineStageTokens <= kNumMaxPoolTokens,
                      "Combine staging cannot exceed the logical full pool");
-    DG_STATIC_ASSERT(not kCombineExpertReady or
-                         kNumCombineStageTokens >=
-                             kNumRanks * kNumMaxTokensPerRank,
+    DG_STATIC_ASSERT(kNumCombineStageTokens >= kNumRanks * kNumMaxTokensPerRank,
                      "Combine ring must fit one maximum-fan-in expert");
-    DG_STATIC_ASSERT(kDispatchExpertReady,
-                     "FP4 inter-node requires expert-ready dispatch");
 #if !defined(DG_MEGA_MOE_DISPATCH_GATEWAY_PACKED) && \
     !defined(DG_MEGA_MOE_DISPATCH_GATEWAY_DENSE_V3)
 #error "Inter-node SM90 FP4 MegaMoE requires packed or dense-V3 metadata"
@@ -549,10 +540,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(BLOCK_M % 64 == 0, "BLOCK_M must be a multiple of WGMMA::M (64)");
     DG_STATIC_ASSERT(BLOCK_N % 8 == 0, "BLOCK_N must be compatible with SM90 FP8 WGMMA shapes");
     DG_STATIC_ASSERT(BLOCK_K == 128, "BLOCK_K is fixed to 128 (per-128 SF)");
-    DG_STATIC_ASSERT(kNumMathWGDecodeWarps <= kNumEpilogueWarps,
-                     "Math decode warps cannot exceed epilogue warps");
-    DG_STATIC_ASSERT(kMathWGParticipatesInFP4Decode or kNumMathWGDecodeWarps == 0,
-                     "Math decode warp count requires math WG decode participation");
     DG_STATIC_ASSERT(kFirstFP4DecodeAssistWarp <= kNumMMANonEpilogueWarps,
                      "First FP4 decode assist warp is out of range");
     // =====================================================================
@@ -679,7 +666,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         dispatch_staging_layout, 1, kNumMaxPoolTokens,
         combine_token_buffer.get_end_ptr());
 
-    // Full-row combine keeps one registered BF16 row per pool token.  A
+    // Full-row combine keeps registered BF16 rows in full-pool or ring storage. A
     // separate per-pool-block arrival counter lets the last L2 N-block CTA
     // hand the completed rows to the publisher warp.
     constexpr uint32_t kNumMaxPoolBlocks =
@@ -689,42 +676,34 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // No mask reads, writes, or cleanup remain.
     constexpr uint32_t kPublishReservedWordsPerRank = 4;
     constexpr auto combine_full_row_arrival_layout = SM90FP8FP4MegaMoEData(
-        kCombineFullRow ? sizeof(uint32_t) : 0u, false);
+        sizeof(uint32_t), false);
     const auto combine_full_row_arrival_buffer = SM90FP8FP4MegaMoEBuffer(
         combine_full_row_arrival_layout, 1, kNumMaxPoolBlocks,
         dispatch_staging_buffer.get_end_ptr());
     constexpr auto combine_full_row_ready_timestamp_layout =
         SM90FP8FP4MegaMoEData(
-            kCombineFullRow ? sizeof(uint64_t) : 0u, false);
+            sizeof(uint64_t), false);
     const auto combine_full_row_ready_timestamp_buffer =
         SM90FP8FP4MegaMoEBuffer(
-            combine_full_row_ready_timestamp_layout, 1,
-            kNumMaxPoolBlocks,
+            combine_full_row_ready_timestamp_layout, 1, kNumMaxPoolBlocks,
             combine_full_row_arrival_buffer.get_end_ptr());
     constexpr auto combine_publish_reserved_layout =
         SM90FP8FP4MegaMoEData(
-            kCombineFullRow ?
-                kNumRanks * kPublishReservedWordsPerRank *
-                    sizeof(uint32_t) :
-                0u,
+            kNumRanks * kPublishReservedWordsPerRank * sizeof(uint32_t),
             false);
     const auto combine_publish_reserved_buffer = SM90FP8FP4MegaMoEBuffer(
         combine_publish_reserved_layout, 1, kNumMaxPoolBlocks,
         combine_full_row_ready_timestamp_buffer.get_end_ptr());
     const auto combine_full_row_staging_base = reinterpret_cast<void*>(
-        kCombineFullRow ? math::align(
+        math::align(
             reinterpret_cast<uint64_t>(combine_publish_reserved_buffer.get_end_ptr()),
-            static_cast<uint64_t>(128)) :
-            reinterpret_cast<uint64_t>(dispatch_staging_buffer.get_end_ptr()));
+            static_cast<uint64_t>(128)));
     constexpr auto combine_full_row_staging_layout = SM90FP8FP4MegaMoEData(
-        kCombineFullRow ? kHidden * sizeof(nv_bfloat16) : 0u);
+        kHidden * sizeof(nv_bfloat16));
     const auto combine_full_row_staging_buffer = SM90FP8FP4MegaMoEBuffer(
         combine_full_row_staging_layout, 1, kNumCombineStageTokens,
         combine_full_row_staging_base);
-
-
     constexpr bool kCombineStageRing =
-        kCombineFullRow and kCombineExpertReady and
         kNumCombineStageTokens < kNumMaxPoolTokens;
     const auto combine_stage_ring = SM90CombineStageRing<
         kCombineStageRing, kNumCombineStageTokens,
@@ -865,10 +844,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // The decoded E4M3 B tile uses 128B swizzle to match the SS WGMMA
     // descriptor. The packed FP4 source tile is linear in the default
     // decode-to-SMEM path because only the dequant code reads it by (row, col).
-    constexpr uint32_t kSwizzleBMode        = BLOCK_K * sizeof(b_dtype_t);  // 128
     constexpr uint32_t kSwizzleBPackedMode  = 0;
-    constexpr uint32_t kSwizzleCDMode  = 128;
-    constexpr uint32_t kGranK          = 128;          // L1 acts SF base granularity
     constexpr uint32_t kNumL2SFAPerBlockK = BLOCK_K / kL2ActsSFGranK;
     // SFB granularity for FP4 weights: per-32 K (DSV4 standard, UE8M0).
     // BLOCK_K=128 has 4 SFB groups along K, exactly one per WGMMA::K tile.
@@ -1016,8 +992,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kDecodeReadyGroups = 2;
     DG_STATIC_ASSERT(BLOCK_M == 64 and LOAD_BLOCK_N == 128 and
                      kSplitNWarpgroups and kNumEpilogueWarpgroups == 2 and
-                     kSwapABEligible and kUseDecodeDoneMBarrier and
-                     kNumMathWGDecodeWarps == 0,
+                     kSwapABEligible and kUseDecodeDoneMBarrier,
                      "N64 ready requires independent split-N consumers and helper-only decode");
     DG_STATIC_ASSERT((kNumMMANonEpilogueWarps - kFirstFP4DecodeAssistWarp) > 0 and
                      (kNumMMANonEpilogueWarps - kFirstFP4DecodeAssistWarp) % 2 == 0,
@@ -1091,16 +1066,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     // decode_done is a one-way producer->consumer mbarrier:
                     // only the warps that actually run `decode_fp4_b_stage`
                     // arrive on it (via `arrive_or_sync_fp4_decode_done`).
-                    // Those are the decode-assist warps -- i.e.
-                    // `kNumMMANonEpilogueWarps` minus the leading loader warps
-                    // that skip decode-assist when `kFirstFP4DecodeAssistWarp`
-                    // > 0 -- plus the optional math-WG decode warps. Counting
-                    // all `kNumMMANonEpilogueWarps` here over-counts arrivals
-                    // by `kFirstFP4DecodeAssistWarp`, so the consumer `wait()`
-                    // would never complete.
+                    // Exclude the operand loader and RDMA publisher. Math
+                    // warps only wait; counting any of these non-producers
+                    // would prevent the barrier from completing.
                     constexpr uint32_t kDecodeDoneArrivers =
-                        (kNumMMANonEpilogueWarps - kFirstFP4DecodeAssistWarp) +
-                        kNumMathWGDecodeWarps;
+                        kNumMMANonEpilogueWarps - kFirstFP4DecodeAssistWarp;
                     #pragma unroll
                     for (uint32_t group = 0; group < kDecodeReadyGroups; ++ group)
                         decode_done_barriers[i * kDecodeReadyGroups + group]->init(
@@ -1154,7 +1124,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         kNumL1BlockKs, kNumL2BlockKs,
         layout::SM90Workspace>(
             workspace,
-            kDispatchExpertReady ? kernel_launch_epoch : 0,
+            kernel_launch_epoch,
             sym_buffer.rank_idx);
     // Pipeline state shared by TMA loaders and math warpgroups
     uint32_t stage_idx = 0, phase = 0;
@@ -1206,16 +1176,15 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(BLOCK_M == 64 and BLOCK_N == 128 and BLOCK_K == 128 and
                      kNumDispatchThreads == 64 and kNumEpilogueThreads == 256 and
                      (kNumThreads == 512 or kNumThreads == 640) and
-                     kFirstFP4DecodeAssistWarp == 2 and kSplitNWarpgroups and
-                     kDecodeReadyGroups == 2 and kNumMathWGDecodeWarps == 0,
-                     "Balanced register experiment requires aligned M64 roles");
+                     kSplitNWarpgroups and kDecodeReadyGroups == 2,
+                     "Balanced register profile requires aligned M64 roles");
 #ifdef DG_MEGA_MOE_FP4_EIGHT_MATH_REGISTERS
     constexpr uint32_t kBalancedCommRegisters = 96;
 #else
     constexpr uint32_t kBalancedCommRegisters = 128;
 #endif
     // Use only the remaining CTA register pool; communication/math quotas
-    // stay fixed so the experiment isolates the helper register limit.
+    // stay fixed while the helper register limit selects the validated profile.
     constexpr uint32_t kBalancedDecodeRegisters =
         DG_MEGA_MOE_FP4_BALANCED_WG_DECODE_REGISTERS;
     DG_STATIC_ASSERT(kBalancedDecodeRegisters == 40 or
@@ -1258,24 +1227,21 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kNumFP4DecodeAssistWarps =
         kNumMMANonEpilogueWarps - kFirstFP4DecodeAssistWarp;
     constexpr uint32_t kNumFP4DecodeAssistThreads = kNumFP4DecodeAssistWarps * 32;
-    constexpr uint32_t kNumFP4DecodeWorkerThreads = kNumFP4DecodeAssistThreads +
-        kNumMathWGDecodeWarps * 32;
+    constexpr uint32_t kNumFP4DecodeWorkerThreads = kNumFP4DecodeAssistThreads;
 #ifdef DG_MEGA_MOE_FP4_SKIP_MATH_B_INPUT_WAIT
     DG_STATIC_ASSERT(kUseEarlyBDecode and kUseDecodeDoneMBarrier and
-                     kDecodeReadyGroups == 2 and kNumMathWGDecodeWarps == 0 and
+                     kDecodeReadyGroups == 2 and
                      kNumFP4DecodeAssistWarps > 0,
                      "Skipping math B-input wait requires helper-owned N64 decode-ready");
 #endif
 #ifdef DG_MEGA_MOE_FP4_SFB_SHARED_LOOKAHEAD
     DG_STATIC_ASSERT(kDecodeReadyGroups == 2 and
-                     kNumFP4DecodeWorkerThreads == 128 and
-                     kNumMathWGDecodeWarps == 0,
+                     kNumFP4DecodeWorkerThreads == 128,
                      "SFB lookahead requires two 64-helper decode halves");
 #endif
 #ifdef DG_MEGA_MOE_FP4_SFB_SHARED_LOOKAHEAD_8W
     DG_STATIC_ASSERT(kDecodeReadyGroups == 2 and
-                     kNumFP4DecodeWorkerThreads == 256 and
-                     kNumMathWGDecodeWarps == 0,
+                     kNumFP4DecodeWorkerThreads == 256,
                      "Eight-warp SFB lookahead requires two 128-helper halves");
 #endif
     constexpr uint32_t kNumFP4DecodeBarrierThreads =
@@ -1522,97 +1488,9 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 }
             }
         }
-#else
-        comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
-            workspace, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
-        );
 #endif
 
-#if (defined(DG_MEGA_MOE_DISPATCH_GATEWAY_PACKED) || \
-     defined(DG_MEGA_MOE_DISPATCH_GATEWAY_DENSE_V3)) && \
-    defined(DG_MEGA_MOE_INTERNODE)
-        if constexpr (false) {
-#else
-        if (sm_idx == 0) {
-#endif
-            #pragma unroll
-            for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-                const auto dst_rank_idx = i / kNumExpertsPerRank;
-                const auto dst_local_expert_idx = i % kNumExpertsPerRank;
-                const auto expert_status = *workspace.get_expert_send_count_ptr(i);
-                const auto recv_count_ptr =
-#if (defined(DG_MEGA_MOE_DISPATCH_GATEWAY_PACKED) || \
-     defined(DG_MEGA_MOE_DISPATCH_GATEWAY_DENSE_V3)) && \
-    defined(DG_MEGA_MOE_INTERNODE)
-                    workspace.get_dispatch_epoch_count_ptr(
-                        static_cast<uint32_t>(kernel_launch_epoch) & 1u,
-                        sym_buffer.rank_idx, dst_local_expert_idx);
-#else
-                    workspace.get_expert_recv_count_ptr(
-                        sym_buffer.rank_idx, dst_local_expert_idx);
-#endif
-                uint64_t ready_status = expert_status;
-                {
-                    const auto dispatch_epoch =
-                        static_cast<uint32_t>(kernel_launch_epoch);
-                    ready_status =
-                        (static_cast<uint64_t>(dispatch_epoch) << 32) |
-                        static_cast<uint32_t>(expert_status);
-                }
-                if (dst_rank_idx / DG_MEGA_MOE_NVL_PEERS !=
-                    sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS) {
-                    const auto gateway_rank_idx =
-                        sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS *
-                            DG_MEGA_MOE_NVL_PEERS +
-                        dst_rank_idx % DG_MEGA_MOE_NVL_PEERS;
-                    *sym_buffer.map(
-                        workspace.get_gateway_manifest_ptr(
-                            sym_buffer.rank_idx % DG_MEGA_MOE_NVL_PEERS,
-                            dst_local_expert_idx,
-                            layout::gateway_rel_node(
-                                dst_rank_idx / DG_MEGA_MOE_NVL_PEERS,
-                                sym_buffer.rank_idx / DG_MEGA_MOE_NVL_PEERS),
-                            gateway_epoch_slot),
-                        gateway_rank_idx) = ready_status;
-                } else {
-                    ptx::st_relaxed_sys(
-                        sym_buffer.map(recv_count_ptr, dst_rank_idx),
-                        ready_status);
-                }
-            }
-#if (defined(DG_MEGA_MOE_DISPATCH_GATEWAY_PACKED) || \
-     defined(DG_MEGA_MOE_DISPATCH_GATEWAY_DENSE_V3)) && \
-    defined(DG_MEGA_MOE_INTERNODE)
-            {
-                ptx::sync_aligned(
-                    kNumDispatchThreads, kDispatchBarrierIdx);
-                __threadfence_system();
-                constexpr uint32_t kNumNodes =
-                    kNumRanks / DG_MEGA_MOE_NVL_PEERS;
-                constexpr uint32_t kNumRemoteNodes = kNumNodes - 1;
-                for (uint32_t task = thread_idx;
-                     task < kNumRemoteNodes * DG_MEGA_MOE_NVL_PEERS;
-                     task += kNumDispatchThreads) {
-                    const auto node_base = sym_buffer.rank_idx /
-                        DG_MEGA_MOE_NVL_PEERS * DG_MEGA_MOE_NVL_PEERS;
-                    const auto flag_epoch = kernel_launch_epoch;
-                    const uint32_t rel_dst =
-                        task / DG_MEGA_MOE_NVL_PEERS;
-                    const uint32_t gateway_nvl =
-                        task % DG_MEGA_MOE_NVL_PEERS;
-                    ptx::st_release_sys(
-                        sym_buffer.map(
-                            workspace.get_gateway_flag_ptr(
-                                sym_buffer.rank_idx % DG_MEGA_MOE_NVL_PEERS,
-                                rel_dst,
-                                static_cast<uint32_t>(flag_epoch) & 1u),
-                            node_base + gateway_nvl),
-                        flag_epoch);
-                }
-            }
-#endif
-        }
+        // All dispatch threads rendezvous before gateway forwarding.
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
 #if defined(DG_MEGA_MOE_DISPATCH_GATEWAY_DENSE_V3) and \
@@ -2571,13 +2449,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
                 __syncwarp();
-
-                if constexpr (kFirstFP4DecodeAssistWarp == 0) {
-                    const uint32_t decode_thread_idx =
-                        (warp_idx - kNumDispatchWarps) * 32 + lane_idx;
-                    wait_fp4_decode_input_ready(stage_idx, phase);
-                    decode_fp4_b_stage(stage_idx, decode_thread_idx);
-                }
             }
         }, cached_recv_counts);
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
@@ -2595,8 +2466,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
         // B/SFB moved into loader warp 0, leaving warp 1 as the persistent
         // async publisher.  It participates in the two communication-role
         // rendezvous but stays outside FP4 decode-done barriers.
-        DG_STATIC_ASSERT(kFirstFP4DecodeAssistWarp >= 2 or kNumMMANonEpilogueWarps < 2,
-                         "Merged loader frees warp 1, so decode assist must skip it");
         ptx::sync_unaligned(
             kNumDispatchEpilogueSyncThreads,
             kDispatchWithEpilogueBarrierIdx);
@@ -3010,8 +2879,8 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     } // WG0: dispatch, loader and publisher share one allocation instruction.
 #endif
     else if (warp_idx < kNumDispatchWarps + kNumMMANonEpilogueWarps) {
-        // Remaining non-epilogue warps keep the non-epilogue register allocation
-        // and, when selected by kFirstFP4DecodeAssistWarp, assist FP4 decode.
+        // Remaining non-epilogue warps keep the helper register allocation
+        // and exclusively own FP4 decode.
         // They still participate in the warpgroup-collective
         // `setmaxnreg.dec.sync.aligned` so the math warpgroup's
         // `warpgroup_reg_alloc` can succeed.
@@ -3024,23 +2893,21 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
         {
             const uint32_t non_epilogue_warp_idx = warp_idx - kNumDispatchWarps;
-            if (non_epilogue_warp_idx >= kFirstFP4DecodeAssistWarp) {
-                const uint32_t decode_thread_idx =
-                    (non_epilogue_warp_idx - kFirstFP4DecodeAssistWarp) * 32 + lane_idx;
+            const uint32_t decode_thread_idx =
+                (non_epilogue_warp_idx - kFirstFP4DecodeAssistWarp) * 32 + lane_idx;
 
-                sm90_fp8_fp4_mega_moe_for_each_cached_block<
-                    kNumExpertsPerRank, kNumExpertsPerLane, L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K>(
-                    scheduler, [&]<sched::BlockPhase kBlockPhase, uint32_t kNumBlockKs>(
-                                   const uint32_t& local_expert_idx,
-                                   const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-                    constexpr auto block_phase = kBlockPhase;
-                    constexpr uint32_t num_k_blocks = kNumBlockKs;
-                    for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
-                        wait_fp4_decode_input_ready(stage_idx, phase);
-                        decode_fp4_b_stage(stage_idx, decode_thread_idx);
-                    }
-                }, cached_recv_counts);
-            }
+            sm90_fp8_fp4_mega_moe_for_each_cached_block<
+                kNumExpertsPerRank, kNumExpertsPerLane, L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K>(
+                scheduler, [&]<sched::BlockPhase kBlockPhase, uint32_t kNumBlockKs>(
+                               const uint32_t& local_expert_idx,
+                               const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+                constexpr auto block_phase = kBlockPhase;
+                constexpr uint32_t num_k_blocks = kNumBlockKs;
+                for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                    wait_fp4_decode_input_ready(stage_idx, phase);
+                    decode_fp4_b_stage(stage_idx, decode_thread_idx);
+                }
+            }, cached_recv_counts);
         }
 
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
@@ -3238,10 +3105,10 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 // accumulator already includes SFB, and only SFA needs to be
                 // applied in the promote loop below.
                 //
-                // Non-epilogue warps assist the math warpgroup. Decode work
-                // is partitioned over the assist threads plus the
-                // epilogue/math threads, then all participants rendezvous
-                // before WGMMA reads the decoded shared tile.
+                // Only non-epilogue helper warps decode. Math waits for their
+                // decode-done publication before WGMMA reads the shared tile.
+                // The selected mbarrier/rendezvous and stage credits are
+                // unchanged by this fixed ownership.
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
                 const uint64_t profile_decode_wait_start =
                     profile_math_leader ? clock64() : 0;
@@ -3254,32 +3121,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                 if constexpr (kUseEarlyBDecode)
                     wait_fp4_decode_input_ready(stage_idx, phase);
 #endif
-                const bool math_warp_decodes =
-                    epilogue_warp_idx < kNumMathWGDecodeWarps;
-                if constexpr (kNumMathWGDecodeWarps > 0) {
-                    if (math_warp_decodes) {
-                        const uint32_t decode_thread_idx =
-                            kNumFP4DecodeAssistThreads + epilogue_thread_idx;
-                        dequant_fp4_b_tile_to_e4m3_smem_dispatch<
-                            LOAD_BLOCK_N, BLOCK_K, kScaleBGranK, kNumSFBPerBlockK,
-                            kUseWideLoadDecode>(
-                            decode_thread_idx, kNumFP4DecodeWorkerThreads,
-                            smem_b_packed[stage_idx], smem_b[stage_idx],
-                            smem_sfb[stage_idx]);
-                    }
-                }
-                if constexpr (kNumMathWGDecodeWarps > 0) {
-                    if (math_warp_decodes)
-                        arrive_or_sync_fp4_decode_done(stage_idx);
-                    if constexpr (kUseDecodeDoneMBarrier) {
-                        wait_fp4_decode_done(stage_idx, phase);
-                    } else {
-                        if (!math_warp_decodes)
-                            wait_fp4_decode_done(stage_idx, phase);
-                    }
-                } else {
-                    wait_fp4_decode_done(stage_idx, phase);
-                }
+                wait_fp4_decode_done(stage_idx, phase);
 #ifdef DG_MEGA_MOE_PHASE_PROFILE
                 if (profile_math_leader)
                     profile_decode_wait_cycles +=
@@ -3921,7 +3763,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     // 64-column activation-SF group, so quantization and the
                     // TMA store can remain WG-local.
                     DG_STATIC_ASSERT(not kSwapABFastAmaxActive,
-                                     "N256 A/B starts with the proven FP32 staging epilogue");
+                                     "N256 requires the FP32 staging epilogue");
                     auto silu = [](float x) -> float {
                         const float e = kFastMath ? __expf(-x) : expf(-x);
                         const float sig = kFastMath
@@ -4771,9 +4613,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                         (n_idx + wg_n_offset) * sizeof(nv_bfloat16) +
                                             lane_in_row * sizeof(uint4));
                                     *staging_ptr = packed;
-                                    if (lane_in_row == 0 and
-                                        not kCombineExpertReady)
-                                        atomicExch(smem_expert_count, 1u);
                                 } else {
                                     *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
                                 }
@@ -4800,9 +4639,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                         (n_idx + wg_n_offset) * sizeof(nv_bfloat16) +
                                             lane_in_row * sizeof(uint2));
                                     *staging_ptr = packed;
-                                    if (lane_in_row == 0 and
-                                        not kCombineExpertReady)
-                                        atomicExch(smem_expert_count, 1u);
                                 } else {
                                     *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
                                 }
@@ -4826,8 +4662,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     // cumulative acq_rel RMW releases them to the dedicated
                     // async publisher warp.
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
-                    if (lane_idx == 0 and warp_idx_in_wg == 0 and
-                        (smem_expert_count[0] != 0 or kCombineExpertReady)) {
+                    if (lane_idx == 0 and warp_idx_in_wg == 0) {
                         const auto arrival_ptr = combine_full_row_arrival_buffer
                             .get_data_buffer(m_idx / BLOCK_M)
                             .get_base_ptr<uint32_t>();
@@ -5001,9 +4836,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                     if (mask) {
                         const uint32_t slot_idx = __ffs(mask) - 1;
                         mask ^= 1 << slot_idx;
-                        const int selected_global_expert_idx =
-                            __shfl_sync(
-                                0xffffffff, stored_topk_slot_idx, slot_idx);
                         if (cute::elect_one_sync()) {
                             const auto src_base_ptr =
                                 combine_token_buffer
