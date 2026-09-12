@@ -120,7 +120,15 @@ class FixedPathsTest(unittest.TestCase):
         self.assertIn("ptx::sync_aligned(kNumFP4DecodeBarrierThreads, kFP4DecodeBarrierIdx);", device)
         self.assertIn("empty_barriers[i]->init(kNumEpilogueWarps);", device)
         self.assertNotIn("math_warp_decodes", device)
-        self.assertNotIn("if (non_epilogue_warp_idx >= kFirstFP4DecodeAssistWarp)", device)
+        # Preserve the explicit helper predicate without restoring retired
+        # role parameters or allowing math warps to decode.
+        helper = device[device.index("const uint32_t non_epilogue_warp_idx ="):]
+        helper = helper[:helper.index("// ROLE 3: MATH WARPGROUPS")]
+        self.assertEqual(helper.count(
+            "if (non_epilogue_warp_idx >= kFirstFP4DecodeAssistWarp)"), 1)
+        self.assertLess(helper.index("if (non_epilogue_warp_idx >="),
+                        helper.index("sm90_fp8_fp4_mega_moe_for_each_cached_block<"))
+        self.assertIn("decode_fp4_b_stage(stage_idx, decode_thread_idx);", helper)
         math_wait = device[device.index("// Only non-epilogue helper warps decode."):]
         math_wait = math_wait[:math_wait.index("if (not wg_has_valid_rows)")]
         self.assertEqual(math_wait.count("wait_fp4_decode_done(stage_idx, phase);"), 1)

@@ -2895,21 +2895,24 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
 
         {
             const uint32_t non_epilogue_warp_idx = warp_idx - kNumDispatchWarps;
-            const uint32_t decode_thread_idx =
-                (non_epilogue_warp_idx - kFirstFP4DecodeAssistWarp) * 32 + lane_idx;
+            // Keep the explicit warp-uniform predicate around the decode loop.
+            if (non_epilogue_warp_idx >= kFirstFP4DecodeAssistWarp) {
+                const uint32_t decode_thread_idx =
+                    (non_epilogue_warp_idx - kFirstFP4DecodeAssistWarp) * 32 + lane_idx;
 
-            sm90_fp8_fp4_mega_moe_for_each_cached_block<
-                kNumExpertsPerRank, kNumExpertsPerLane, L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K>(
-                scheduler, [&]<sched::BlockPhase kBlockPhase, uint32_t kNumBlockKs>(
-                               const uint32_t& local_expert_idx,
-                               const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-                constexpr auto block_phase = kBlockPhase;
-                constexpr uint32_t num_k_blocks = kNumBlockKs;
-                for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
-                    wait_fp4_decode_input_ready(stage_idx, phase);
-                    decode_fp4_b_stage(stage_idx, decode_thread_idx);
-                }
-            }, cached_recv_counts);
+                sm90_fp8_fp4_mega_moe_for_each_cached_block<
+                    kNumExpertsPerRank, kNumExpertsPerLane, L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K>(
+                    scheduler, [&]<sched::BlockPhase kBlockPhase, uint32_t kNumBlockKs>(
+                                   const uint32_t& local_expert_idx,
+                                   const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
+                    constexpr auto block_phase = kBlockPhase;
+                    constexpr uint32_t num_k_blocks = kNumBlockKs;
+                    for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                        wait_fp4_decode_input_ready(stage_idx, phase);
+                        decode_fp4_b_stage(stage_idx, decode_thread_idx);
+                    }
+                }, cached_recv_counts);
+            }
         }
 
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
